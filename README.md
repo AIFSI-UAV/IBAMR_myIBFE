@@ -1,0 +1,2 @@
+# IBAMR_myIBFE
+STUDYING IBAMR EXAMPLE/IBFE AND  implantation my idea
