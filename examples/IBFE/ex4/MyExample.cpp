@@ -67,7 +67,7 @@ coordinate_mapping_function(libMesh::Point& X, const libMesh::Point& s, void* /*
     X(0) = s(0) + 0.6;
     X(1) = s(1) + 0.5;
 #if (NDIM == 3)
-    X(2) = s(2) + 0.5;
+    X(2) = s(2) + 0.
 #endif
     return;
 } // coordinate_mapping_function
@@ -227,11 +227,34 @@ main(int argc, char* argv[])
         if (use_external_mesh)
         {
         #ifdef LIBMESH_HAVE_EXODUS_API
-            const std::string mesh_filename = input_db->getString("MESH_FILENAME");
-            plog << "Reading FE mesh from ExodusII file: " << mesh_filename << "\n";
+            if (!input_db->keyExists("MESH_FILENAME"))
+            {
+                TBOX_ERROR("ERROR: USE_EXTERNAL_MESH=TRUE but MESH_FILENAME is not provided.\n");
+            }
 
-            // libMesh 支持通过文件扩展名分派 IO，ExodusII 默认扩展名 .e/.exd:contentReference[oaicite:1]{index=1}
-            mesh.read(mesh_filename);
+            const std::string mesh_filename = input_db->getString("MESH_FILENAME");
+            plog << "Reading FE mesh from ExodusII file (rank0 only): " << mesh_filename << "\n";
+
+            libMesh::ExodusII_IO exo_io(mesh);
+
+            // 只让 rank0 读
+            if (mesh.comm().rank() == 0)
+            {
+                exo_io.read(mesh_filename);
+            }
+
+            // libMesh 1.7.8：MeshCommunication 只有默认构造
+            libMesh::MeshCommunication mesh_comm;
+            mesh_comm.broadcast(mesh);
+
+            // 可选一致性检查
+            if (mesh.mesh_dimension() != NDIM)
+            {
+                TBOX_ERROR("ERROR: Mesh dimension (" << mesh.mesh_dimension()
+                        << ") does not match NDIM (" << NDIM << ").\n");
+            }
+
+            // 广播后统一整理
             mesh.prepare_for_use();
         #else
             TBOX_ERROR("ERROR: libMesh was compiled without Exodus support, cannot read .e mesh.\n");
@@ -275,7 +298,7 @@ main(int argc, char* argv[])
                 MeshTools::Generation::build_sphere(mesh, R, r, Utility::string_to_enum<ElemType>(elem_type));
             }
 
-            // 只对“内部生成的圆/球”做解析边界投影
+            // 只对内部生成的圆/球做解析边界投影
             for (auto el = mesh.elements_begin(); el != mesh.elements_end(); ++el)
             {
                 Elem* const elem = *el;
@@ -293,7 +316,6 @@ main(int argc, char* argv[])
 
             mesh.prepare_for_use();
         }
-
 
         // ---- 从 input 读入材料参数（对应上面 static 变量）----
         c1_s = input_db->getDouble("C1_S");
