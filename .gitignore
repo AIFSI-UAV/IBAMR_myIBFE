@@ -1,0 +1,25 @@
+# --- CMake / build outputs ---
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# --- meshes / generated data (按你的目录名调整) ---
+solid_mesh/
+*.e
+*.exo
+*.vtk
+*.vtu
+*.pvtu
+*.h5
+*.dat
+*.csv
+*.txt
+*.msh
+*.geo
+
+# --- editor / OS ---
+*.swp
+.DS_Store
+
