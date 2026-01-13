@@ -184,7 +184,12 @@ main(int argc, char* argv[])
         // and enable file logging.
         Pointer<AppInitializer> app_initializer = new AppInitializer(argc, argv, "IB.log");
         Pointer<Database> input_db = app_initializer->getInputDatabase();
-
+        // --- read mapping translation from input (keep defaults if not provided) ---
+        ModelData::X_shift[0] = input_db->getDoubleWithDefault("MAPPING_SHIFT_X", ModelData::X_shift[0]);
+        ModelData::X_shift[1] = input_db->getDoubleWithDefault("MAPPING_SHIFT_Y", ModelData::X_shift[1]);
+        #if (NDIM == 3)
+        ModelData::X_shift[2] = input_db->getDoubleWithDefault("MAPPING_SHIFT_Z", ModelData::X_shift[2]);
+        #endif
         // Get various standard options set in the input file.// ---- 可视化输出：VisIt（Eulerian） + Exodus（FE mesh） ----
         const bool dump_viz_data = app_initializer->dumpVizData();
         const int viz_dump_interval = app_initializer->getVizDumpInterval();
@@ -403,18 +408,17 @@ main(int argc, char* argv[])
         //    注意：这里的 registerPK1StressFunction() 可以被调用多次
         //    所以未来你加 active stress 时，可再 register 一次 P_active。
         // =========================================================================
-        // --- read mapping translation from input (keep defaults if not provided) ---
-
         ib_method_ops->registerInitialCoordinateMappingFunction(coordinate_mapping_function);
+        
         IBFEMethod::PK1StressFcnData PK1_dev_stress_data(PK1_dev_stress_function);
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
         PK1_dev_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
-
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
+
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
         {
             ib_method_ops->registerStressNormalizationPart();
@@ -422,16 +426,11 @@ main(int argc, char* argv[])
         ib_method_ops->initializeFEEquationSystems();
         EquationSystems* equation_systems = ib_method_ops->getFEDataManager()->getEquationSystems();
         
-        ModelData::X_shift[0] = input_db->getDoubleWithDefault("MAPPING_SHIFT_X", ModelData::X_shift[0]);
-        ModelData::X_shift[1] = input_db->getDoubleWithDefault("MAPPING_SHIFT_Y", ModelData::X_shift[1]);
-        #if (NDIM == 3)
-        ModelData::X_shift[2] = input_db->getDoubleWithDefault("MAPPING_SHIFT_Z", ModelData::X_shift[2]);
-        #endif
         // Set up post processor to recover computed stresses.
         // =========================================================================
         // 8) 后处理：在 FE 单元质心输出张量/标量（如 FF、Cauchy stress、插值到 FE 的压力等）
         // =========================================================================
-        ib_method_ops->initializeFEEquationSystems();
+        //ib_method_ops->initializeFEEquationSystems();
         FEDataManager* fe_data_manager = ib_method_ops->getFEDataManager();
 
         Pointer<IBFEPostProcessor> ib_post_processor =
