@@ -50,6 +50,11 @@
 
 // Set up application namespace declarations
 #include <ibamr/app_namespaces.h>
+//add new file
+#include <array>
+#include <algorithm>
+#include <cmath>
+#include <libmesh/mesh_communication.h>
 
 // Elasticity model data.  ModelData 命名空间：几何映射（初始位置）+ 两个 PK1 stress（dev/dil）
 namespace ModelData
@@ -61,7 +66,6 @@ namespace ModelData
 //     注意：s 是 reference coordinates（参考构型坐标）
 //           X 是 current/physical coordinates（当前/物理坐标）
 // ------------------------------
-{
 // 默认值保持与你现在一致：2D (0.6,0.5), 3D (0.6,0.5,0.5)
 static std::array<double, NDIM> X_shift = []{
     std::array<double, NDIM> a{};
@@ -79,7 +83,6 @@ coordinate_mapping_function(libMesh::Point& X, const libMesh::Point& s, void* /*
     X = s;
     for (unsigned int d = 0; d < NDIM; ++d) X(d) += X_shift[d];
     return;
-}
 }
 // coordinate_mapping_function
 // ------------------------------
@@ -208,15 +211,15 @@ static inline double activation_time(double time, const ActiveStressCtx& a)
 }
 
 // 额外注册的第三个 PK1：只返回“主动项”P_active
-void PK1_active_stress_function(TensorValue& PP,
-                                const TensorValue& FF,
+void PK1_active_stress_function(TensorValue<double>& PP,
+                                const TensorValue<double>& FF,
                                 const libMesh::Point& /*X*/,
                                 const libMesh::Point& s,
                                 Elem* const /*elem*/,
-                                const std::vector<const std::vector<double>*>& /*var_data*/,
-                                const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*grad_var_data*/,
-                                double time,
-                                void* ctx)
+                                const vector<const vector<double>*>& /*var_data*/,
+                                const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
+                                double /*time*/,
+                                void* /*ctx*/)
 {
     const ActiveStressCtx& a = *static_cast<ActiveStressCtx*>(ctx);
 
@@ -549,7 +552,8 @@ main(int argc, char* argv[])
             IBFEMethod::PK1StressFcnData PK1_act_stress_data(PK1_active_stress_function);
             PK1_act_stress_data.ctx = &active_ctx;
             PK1_act_stress_data.quad_order =
-                Utility::string_to_enum(input_db->getStringWithDefault("PK1_ACT_QUAD_ORDER", "THIRD"));
+                Utility::string_to_enum<libMesh::Order>(
+                    input_db->getStringWithDefault("PK1_ACT_QUAD_ORDER", "THIRD"));
             ib_method_ops->registerPK1StressFunction(PK1_act_stress_data);
         }
 
