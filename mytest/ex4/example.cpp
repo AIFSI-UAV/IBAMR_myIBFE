@@ -51,6 +51,7 @@
 // Set up application namespace declarations
 #include <ibamr/app_namespaces.h>
 
+#include <libmesh/mesh_communication.h>
 // Elasticity model data.  ModelData 命名空间：几何映射（初始位置）+ 两个 PK1 stress（dev/dil）
 namespace ModelData
 {
@@ -61,7 +62,6 @@ namespace ModelData
 //     注意：s 是 reference coordinates（参考构型坐标）
 //           X 是 current/physical coordinates（当前/物理坐标）
 // ------------------------------
-{
 // 默认值保持与你现在一致：2D (0.6,0.5), 3D (0.6,0.5,0.5)
 static std::array<double, NDIM> X_shift = []{
     std::array<double, NDIM> a{};
@@ -79,7 +79,6 @@ coordinate_mapping_function(libMesh::Point& X, const libMesh::Point& s, void* /*
     X = s;
     for (unsigned int d = 0; d < NDIM; ++d) X(d) += X_shift[d];
     return;
-}
 }
 // coordinate_mapping_function
 // ------------------------------

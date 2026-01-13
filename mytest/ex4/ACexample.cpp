@@ -137,8 +137,8 @@ PK1_dil_stress_function(TensorValue<double>& PP,
                         Elem* const /*elem*/,
                         const vector<const vector<double>*>& /*var_data*/,
                         const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                        double time,
-                        void* ctx)
+                        double /*time*/,
+                        void* /*ctx*/)
 {
     PP = 2.0 * (-p0_s + beta_s * log(FF.det())) * tensor_inverse_transpose(FF, NDIM);
     return;
@@ -218,8 +218,8 @@ void PK1_active_stress_function(TensorValue<double>& PP,
                                 Elem* const /*elem*/,
                                 const vector<const vector<double>*>& /*var_data*/,
                                 const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                                double /*time*/,
-                                void* /*ctx*/)
+                                double time,
+                                void* ctx)
 {
     const ActiveStressCtx& a = *static_cast<ActiveStressCtx*>(ctx);
 
