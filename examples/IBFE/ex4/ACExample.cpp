@@ -92,6 +92,7 @@ coordinate_mapping_function(libMesh::Point& X, const libMesh::Point& s, void* /*
 static double c1_s = 0.05;
 static double p0_s = 0.0;
 static double beta_s = 0.0;
+
 // ------------------------------
 // 1.3 PK1 dev（偏）应力：P_dev = 2*c1*F
 //     FF = F = ∂X/∂s（变形梯度）
@@ -139,9 +140,121 @@ PK1_dil_stress_function(TensorValue<double>& PP,
     PP = 2.0 * (-p0_s + beta_s * log(FF.det())) * tensor_inverse_transpose(FF, NDIM);
     return;
 } // PK1_dil_stress_function
-} // namespace ModelData
-using namespace ModelData;
 
+// ------------------------------
+// Active stress: 外环 + 环向纤维 + 周期激活
+// ------------------------------
+struct ActiveStressCtx
+{
+    bool   enable      = false;
+
+    // 时间激活
+    double T_max       = 0.0;   // 主动张力幅值
+    double period      = 1.0;   // 周期
+    double t_on        = 0.0;   // 周期内激活起点
+    double t_off       = 0.5;   // 周期内激活终点（t_off > t_on）
+    double phase       = 0.0;   // 相位偏移（可选）
+    double ramp_time   = 0.0;   // 前 ramp_time 内线性爬升到满幅（可选，避免瞬时冲击）
+
+    // 空间激活：外环带 [r_in, r_out]
+    double r_in        = 0.16;  // 外环内半径（参考构型）
+    double r_out       = 0.20;  // 外环外半径（参考构型）
+    double eps_r       = 0.005; // 平滑宽度（tanh 平滑）
+};
+
+static ActiveStressCtx active_ctx;
+
+static inline double smooth_step_tanh(double x, double eps)
+{
+    if (eps <= 0.0) return (x >= 0.0) ? 1.0 : 0.0;
+    return 0.5 * (1.0 + std::tanh(x / eps));
+}
+
+static inline double band_mask(double r, double r_in, double r_out, double eps)
+{
+    // 1 for r in [r_in, r_out], 0 outside, with smooth transitions
+    const double m1 = smooth_step_tanh(r - r_in, eps);
+    const double m2 = smooth_step_tanh(r_out - r, eps);
+    return m1 * m2;
+}
+
+static inline double activation_time(double time, const ActiveStressCtx& a)
+{
+    if (!a.enable || a.T_max == 0.0) return 0.0;
+    if (a.period <= 0.0) return 0.0;
+
+    // 相位
+    double t = time + a.phase;
+
+    // 周期内相位
+    double tau = std::fmod(t, a.period);
+    if (tau < 0.0) tau += a.period;
+
+    if (!(a.t_off > a.t_on)) return 0.0;
+    if (tau < a.t_on || tau > a.t_off) return 0.0;
+
+    // 平滑激活：sin^2(pi*xi) in [0,1]
+    const double xi = (tau - a.t_on) / (a.t_off - a.t_on);
+    double alpha = std::sin(M_PI * xi);
+    alpha = alpha * alpha;
+
+    // 可选 ramp（前 ramp_time 内从 0 -> 1）
+    if (a.ramp_time > 0.0)
+    {
+        const double rfac = std::min(1.0, std::max(0.0, time / a.ramp_time));
+        alpha *= rfac;
+    }
+    return alpha;
+}
+
+// 额外注册的第三个 PK1：只返回“主动项”P_active
+void PK1_active_stress_function(TensorValue& PP,
+                                const TensorValue& FF,
+                                const libMesh::Point& /*X*/,
+                                const libMesh::Point& s,
+                                Elem* const /*elem*/,
+                                const std::vector<const std::vector<double>*>& /*var_data*/,
+                                const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*grad_var_data*/,
+                                double time,
+                                void* ctx)
+{
+    const ActiveStressCtx& a = *static_cast<ActiveStressCtx*>(ctx);
+
+    // 默认 0（注意：该函数只贡献 active 部分）
+    PP = 0.0;
+
+    if (!a.enable) return;
+
+    // reference radius
+    const double x = s(0);
+    const double y = s(1);
+    const double r = std::sqrt(x*x + y*y);
+    if (r < 1.0e-12) return;
+
+    // 外环带 mask
+    const double m_space = band_mask(r, a.r_in, a.r_out, a.eps_r);
+    if (m_space <= 0.0) return;
+
+    // 周期激活
+    const double alpha = activation_time(time, a);
+    if (alpha <= 0.0) return;
+
+    const double Tact = a.T_max * alpha * m_space;
+
+    // 环向纤维（reference）：a0 = (-y, x)/r
+    libMesh::VectorValue<double> a0(-y / r, x / r);
+    // current fiber direction ~ F * a0
+    libMesh::VectorValue<double> Fa = FF * a0;
+
+    // P_active = T * (F a0) ⊗ a0
+    for (unsigned int i = 0; i < NDIM; ++i)
+        for (unsigned int j = 0; j < NDIM; ++j)
+            PP(i,j) = Tact * Fa(i) * a0(j);
+}
+
+} // namespace ModelData
+
+using namespace ModelData;
 // Function prototypes
 // ============================================================================
 // 2) 输出函数原型：用于“后处理数据 dump”（HDF + xda + equation systems）
@@ -338,6 +451,18 @@ main(int argc, char* argv[])
         p0_s = input_db->getDouble("P0_S");
         beta_s = input_db->getDouble("BETA_S");
 
+        // ---- active stress params (optional) ----
+        active_ctx.enable    = input_db->getBoolWithDefault("USE_ACTIVE_STRESS", false);
+        active_ctx.T_max     = input_db->getDoubleWithDefault("ACTIVE_T_MAX", 0.0);
+        active_ctx.period    = input_db->getDoubleWithDefault("ACTIVE_PERIOD", 1.0);
+        active_ctx.t_on      = input_db->getDoubleWithDefault("ACTIVE_T_ON", 0.0);
+        active_ctx.t_off     = input_db->getDoubleWithDefault("ACTIVE_T_OFF", 0.5);
+        active_ctx.phase     = input_db->getDoubleWithDefault("ACTIVE_PHASE", 0.0);
+        active_ctx.ramp_time = input_db->getDoubleWithDefault("ACTIVE_RAMP_TIME", 0.0);
+        active_ctx.r_in      = input_db->getDoubleWithDefault("ACTIVE_R_IN", 0.16);
+        active_ctx.r_out     = input_db->getDoubleWithDefault("ACTIVE_R_OUT", 0.20);
+        active_ctx.eps_r     = input_db->getDoubleWithDefault("ACTIVE_EPS_R", 0.005);
+
         // Create major algorithm and data objects that comprise the
         // application.  These objects are configured from the input database
         // and, if this is a restarted run, from the restart database.
@@ -419,10 +544,20 @@ main(int argc, char* argv[])
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
 
+        if (active_ctx.enable)
+        {
+            IBFEMethod::PK1StressFcnData PK1_act_stress_data(PK1_active_stress_function);
+            PK1_act_stress_data.ctx = &active_ctx;
+            PK1_act_stress_data.quad_order =
+                Utility::string_to_enum(input_db->getStringWithDefault("PK1_ACT_QUAD_ORDER", "THIRD"));
+            ib_method_ops->registerPK1StressFunction(PK1_act_stress_data);
+        }
+
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
         {
             ib_method_ops->registerStressNormalizationPart();
         }
+
         ib_method_ops->initializeFEEquationSystems();
         EquationSystems* equation_systems = ib_method_ops->getFEDataManager()->getEquationSystems();
         
