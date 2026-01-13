@@ -61,16 +61,27 @@ namespace ModelData
 //     注意：s 是 reference coordinates（参考构型坐标）
 //           X 是 current/physical coordinates（当前/物理坐标）
 // ------------------------------
-void
+{
+// 默认值保持与你现在一致：2D (0.6,0.5), 3D (0.6,0.5,0.0)
+static std::array<double, NDIM> X_shift = []{
+    std::array<double, NDIM> a{};
+    a[0] = 0.6;
+    a[1] = 0.5;
+#if (NDIM == 3)
+    a[2] = 0.5;
+#endif
+    return a;
+}();
+
+void 
 coordinate_mapping_function(libMesh::Point& X, const libMesh::Point& s, void* /*ctx*/)
 {
-    X(0) = s(0) + 0.6;
-    X(1) = s(1) + 0.5;
-#if (NDIM == 3)
-    X(2) = s(2) + 0.
-#endif
+    X = s;
+    for (unsigned int d = 0; d < NDIM; ++d) X(d) += X_shift[d];
     return;
-} // coordinate_mapping_function
+}
+}
+// coordinate_mapping_function
 // ------------------------------
 // 1.2 材料参数（示例用 static 全局变量 + 从 input 读入）
 //     c1_s   ：剪切相关系数（dev 部分）
@@ -81,7 +92,6 @@ coordinate_mapping_function(libMesh::Point& X, const libMesh::Point& s, void* /*
 static double c1_s = 0.05;
 static double p0_s = 0.0;
 static double beta_s = 0.0;
-void
 // ------------------------------
 // 1.3 PK1 dev（偏）应力：P_dev = 2*c1*F
 //     FF = F = ∂X/∂s（变形梯度）
@@ -91,6 +101,7 @@ void
 //     未来你加入 active stress 时，通常会：
 //        P_total = P_dev + P_dil + P_active
 // ------------------------------
+void
 PK1_dev_stress_function(TensorValue<double>& PP,
                         const TensorValue<double>& FF,
                         const libMesh::Point& /*X*/,
@@ -392,6 +403,8 @@ main(int argc, char* argv[])
         //    注意：这里的 registerPK1StressFunction() 可以被调用多次
         //    所以未来你加 active stress 时，可再 register 一次 P_active。
         // =========================================================================
+        // --- read mapping translation from input (keep defaults if not provided) ---
+
         ib_method_ops->registerInitialCoordinateMappingFunction(coordinate_mapping_function);
         IBFEMethod::PK1StressFcnData PK1_dev_stress_data(PK1_dev_stress_function);
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
@@ -399,6 +412,7 @@ main(int argc, char* argv[])
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
+
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
@@ -407,7 +421,12 @@ main(int argc, char* argv[])
         }
         ib_method_ops->initializeFEEquationSystems();
         EquationSystems* equation_systems = ib_method_ops->getFEDataManager()->getEquationSystems();
-
+        
+        ModelData::X_shift[0] = input_db->getDoubleWithDefault("MAPPING_SHIFT_X", ModelData::X_shift[0]);
+        ModelData::X_shift[1] = input_db->getDoubleWithDefault("MAPPING_SHIFT_Y", ModelData::X_shift[1]);
+        #if (NDIM == 3)
+        ModelData::X_shift[2] = input_db->getDoubleWithDefault("MAPPING_SHIFT_Z", ModelData::X_shift[2]);
+        #endif
         // Set up post processor to recover computed stresses.
         // =========================================================================
         // 8) 后处理：在 FE 单元质心输出张量/标量（如 FF、Cauchy stress、插值到 FE 的压力等）

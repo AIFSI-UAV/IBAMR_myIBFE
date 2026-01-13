@@ -6,6 +6,10 @@ L   = 1.0
 //外部读取solid mesh
 USE_EXTERNAL_MESH = TRUE			    //FALSE or TRUE
 MESH_FILENAME = "Solid2D.e"			    //xxx.e文件格式
+//对solid mesh进平移
+MAPPING_SHIFT_X = 0.6
+MAPPING_SHIFT_Y = 0.5
+// MAPPING_SHIFT_Z = 0.0   // 3D 时再启用
 
 // grid spacing parameters
 MAX_LEVELS = 1                                      // maximum number of levels in locally refined grid
