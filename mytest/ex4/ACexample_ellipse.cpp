@@ -175,9 +175,48 @@ struct ActiveStressCtx
 
 static ActiveStressCtx active_ctx;
 
+static inline double smooth_step_tanh(double x, double eps)
+{
+    if (eps <= 0.0) return (x >= 0.0) ? 1.0 : 0.0;
+    return 0.5 * (1.0 + std::tanh(x / eps));
+}
+
+static inline double band_mask(double rho, double r_in, double r_out, double eps)
+{
+    // 1 for r in [r_in, r_out], 0 outside, with smooth transitions
+    const double m1 = smooth_step_tanh(rho - r_in, eps);
+    const double m2 = smooth_step_tanh(r_out - rho, eps);
+    return m1 * m2;
+}
+
 static inline double rho_ellipse(double x, double y, double a, double b)
 {
     return std::sqrt((x*x)/(a*a) + (y*y)/(b*b));
+}
+
+// 声明/定义放在 PK1_active_stress_function 前
+static inline double activation_time(double time, const ActiveStressCtx& a)
+{
+    if (!a.enable || a.T_max == 0.0) return 0.0;
+    if (a.period <= 0.0) return 0.0;
+
+    double t = time + a.phase;
+    double tau = std::fmod(t, a.period);
+    if (tau < 0.0) tau += a.period;
+
+    if (!(a.t_off > a.t_on)) return 0.0;
+    if (tau < a.t_on || tau > a.t_off) return 0.0;
+
+    const double xi = (tau - a.t_on) / (a.t_off - a.t_on);
+    double alpha = std::sin(M_PI * xi);
+    alpha *= alpha;
+
+    if (a.ramp_time > 0.0)
+    {
+        const double rfac = std::min(1.0, std::max(0.0, time / a.ramp_time));
+        alpha *= rfac;
+    }
+    return alpha;
 }
 
 static inline libMesh::VectorValue<double> ellipse_tangent(double x, double y, double a, double b)
@@ -206,7 +245,7 @@ PK1_active_stress_function(TensorValue<double>& PP,
                                 void* ctx)
 {
     const ActiveStressCtx& a = *static_cast<ActiveStressCtx*>(ctx);
-    PP = 0.0;
+    PP.zero();
     if (!a.enable) return;
 
     const double x = s(0);
@@ -227,7 +266,7 @@ PK1_active_stress_function(TensorValue<double>& PP,
 
     // (3) circumferential fiber = ellipse tangent (reference)
     const auto t0 = ellipse_tangent(x, y, a.a, a.b);
-    if (t0.size() < 1e-14) return;
+    if (t0.norm() < 1e-14) return;
 
     const auto Ft = FF * t0;
 

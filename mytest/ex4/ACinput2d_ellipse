@@ -5,7 +5,7 @@ L   = 1.0
 
 //外部读取solid mesh
 USE_EXTERNAL_MESH = TRUE			    //FALSE or TRUE
-MESH_FILENAME = "disk_R02.e"			    //xxx.e文件格式
+MESH_FILENAME = "epllise_R02.e"			    //xxx.e文件格式
 //对solid mesh进平移
 MAPPING_SHIFT_X = 0.6
 MAPPING_SHIFT_Y = 0.5
@@ -13,12 +13,7 @@ MAPPING_SHIFT_Y = 0.5
 
 // geometry (reference ellipse)
 ACTIVE_A = 1.02
-ACTIVE_B = 0.98
-
-// ring band in elliptic radius rho
-ACTIVE_RHO_IN  = 0.90
-ACTIVE_RHO_OUT = 1.00
-ACTIVE_EPS_R   = 0.02
+ACTIVE_B = 0.68
 
 // --- active stress switch ---
 USE_ACTIVE_STRESS = TRUE
@@ -27,11 +22,12 @@ ACTIVE_T_MAX   = 0.5
 ACTIVE_PERIOD  = 1.0
 ACTIVE_T_ON    = 0.0
 ACTIVE_T_OFF   = 0.5
+ACTIVE_PHASE   = 0   //周期激活时间
 ACTIVE_RAMP_TIME = 0.5
-// 外环带（基于参考构型半径；你的圆盘 R=0.2）
-ACTIVE_R_IN  = 0.16
-ACTIVE_R_OUT = 0.20
-ACTIVE_EPS_R = 0.005
+// ring band in elliptic radius rho
+ACTIVE_RHO_IN  = 0.90   //[0.9 1.0]只激活最外层0.1
+ACTIVE_RHO_OUT = 1.00
+ACTIVE_EPS_RHO = 0.02
 // quad order（可选）
 PK1_ACT_QUAD_ORDER = "THIRD"
 
