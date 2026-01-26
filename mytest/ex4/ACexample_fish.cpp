@@ -220,18 +220,22 @@ static libMesh::Point tuna_target_point(const libMesh::Point& Xref,
 }
 
 void tuna_penalty_body_force(libMesh::VectorValue<double>& F,
-                             const libMesh::TensorValue<double>& /*FF*/,
-                             const libMesh::Point& X,     // reference
-                             const libMesh::Point& s,     // current physical location
-                             libMesh::Elem* const /*elem*/,
-                             const std::vector<const std::vector<double>*>& /*var_data*/,
-                             const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*grad_var_data*/,
-                             double time,
-                             void* ctx)
+                                const libMesh::TensorValue<double>& /*FF*/,
+                                const libMesh::Point& x,   // current position
+                                const libMesh::Point& X,   // reference position
+                                libMesh::Elem* const /*elem*/,
+                                const std::vector<const std::vector<double>*>& /*var_data*/,
+                                const std::vector<const std::vector<libMesh::VectorValue<double>>*>& /*grad_var_data*/,
+                                double time,
+                                void* ctx)
 {
-    const auto& p = *static_cast<TunaKinematicsData*>(ctx);
-    const libMesh::Point Xtar = tuna_target_point(X, time, p);
-    F = p.kappa * (Xtar - s); // simplest stable starting point
+    const auto* p = static_cast<const TunaKinematicsData*>(ctx);
+
+    libMesh::Point x_tar;
+    tuna_kinematics_map(X, time, x_tar, *p);   // target from reference X
+
+    const libMesh::VectorValue<double> dx = x - x_tar;
+    F = (-p->kappa) * dx;
 }
 
 // ------------------------------
@@ -595,21 +599,21 @@ main(int argc, char* argv[])
         tuna.phi           = input_db->getDoubleWithDefault("TUNA_PHI", 0.0);
         tuna.kappa         = input_db->getDoubleWithDefault("TUNA_KAPPA", 1.0e6);
         // compute x_head/x_tail from mesh nodes (reference configuration)
-        double xmin=1e300, xmax=-1e300;
-        for (auto it = mesh.nodes_begin(); it != mesh.nodes_end(); ++it)
+        double xmin =  1e20, xmax = -1e20;
+
+        for (auto node_it = mesh.nodes_begin(); node_it != mesh.nodes_end(); ++node_it)
         {
-            const libMesh::Point& X = **it;
-            xmin = std::min(xmin, (double)X(0));
-            xmax = std::max(xmax, (double)X(0));
+            const libMesh::Point& s = **node_it;  // mesh coordinates
+            libMesh::Point Xref;
+            coordinate_mapping_function(Xref, s, nullptr); // same mapping as IBAMR uses
+
+            xmin = std::min(xmin, Xref(0));
+            xmax = std::max(xmax, Xref(0));
         }
+
         tuna.x_head = xmin;
         tuna.x_tail = xmax;
         tuna.L      = xmax - xmin;
-
-        // register body force
-        IBAMR::FEMechanicsBase::LagBodyForceFcnData body_fcn_data(tuna_penalty_body_force, &tuna);
-        ib_method_ops->registerLagBodyForceFunction(body_fcn_data);
-
 
         // Create major algorithm and data objects that comprise the
         // application.  These objects are configured from the input database
@@ -687,6 +691,7 @@ main(int argc, char* argv[])
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
         PK1_dev_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
+            
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
@@ -706,6 +711,10 @@ main(int argc, char* argv[])
         {
             ib_method_ops->registerStressNormalizationPart();
         }
+
+        // register body force
+        IBAMR::FEMechanicsBase::LagBodyForceFcnData body_fcn_data(tuna_penalty_body_force, &tuna);
+        ib_method_ops->registerLagBodyForceFunction(body_fcn_data);
 
         ib_method_ops->initializeFEEquationSystems();
         EquationSystems* equation_systems = ib_method_ops->getFEDataManager()->getEquationSystems();
