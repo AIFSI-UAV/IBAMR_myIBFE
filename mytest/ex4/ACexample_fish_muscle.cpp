@@ -144,108 +144,6 @@ PK1_dil_stress_function(TensorValue<double>& PP,
     return;
 } // PK1_dil_stress_function
 
-//fish
-struct TunaKinematicsData
-{
-    // geometry
-    double x_head = 0.0, x_tail = 1.0, L = 1.0;
-
-    // midline wave
-    double f = 1.0;                 // Hz
-    double lambda_over_L = 1.25;    // λ/L
-    double phi0 = 0.0;              // phase shift
-    double c0 = 0.0, c1 = 0.0, c2 = 0.0; // A(ξ)=c0+c1 ξ + c2 ξ^2 (dimensionless)
-
-    // hinge + caudal fin extra pitch
-    double xi_hinge = 0.88;
-    double theta_m = 0.0;           // rad
-    double phi = 0.0;               // rad
-
-    // penalty
-    double kappa = 1.0e6;           // tune
-};
-
-static inline double Ahat(const TunaKinematicsData& p, double xi)
-{
-    return p.c0 + p.c1*xi + p.c2*xi*xi; // dimensionless
-}
-
-static libMesh::Point tuna_target_point(const libMesh::Point& Xref,
-                                        double time,
-                                        const TunaKinematicsData& p)
-
-static inline void tuna_kinematics_map(const libMesh::Point& X,
-                                       double time,
-                                       libMesh::Point& x_tar,
-                                       const TunaKinematicsData& p)
-{
-    x_tar = tuna_target_point(X, time, p);
-}
-                                    
-{
-    const double x = Xref(0), y = Xref(1), z = Xref(2);
-    const double xi = (x - p.x_head)/p.L;           // 0=head, 1=tail
-    const double omega = 2.0*M_PI*p.f;
-    const double k = 2.0*M_PI / p.lambda_over_L;    // phase per xi
-    const double phase = omega*time - k*xi + p.phi0;
-
-    // midline and slope
-    const double A = p.L * Ahat(p, xi);
-    const double y_mid = A * std::sin(phase);
-
-    const double dAhat_dxi = p.c1 + 2.0*p.c2*xi;
-    const double dy_mid_dx =
-        (dAhat_dxi * std::sin(phase)) + (Ahat(p,xi) * std::cos(phase) * (-k)); // since dy/dx = dy/dxi / L
-
-    // hinge handling
-    if (xi >= p.xi_hinge)
-    {
-        const double xh = p.x_head + p.xi_hinge * p.L;
-        const double phase_h = omega*time - k*p.xi_hinge + p.phi0;
-
-        const double Ah = p.L * Ahat(p, p.xi_hinge);
-        const double y_h = Ah * std::sin(phase_h);
-
-        const double dAhat_h = p.c1 + 2.0*p.c2*p.xi_hinge;
-        const double dyh_dx = (dAhat_h * std::sin(phase_h)) + (Ahat(p,p.xi_hinge) * std::cos(phase_h) * (-k));
-
-        const double theta_body = std::atan(dyh_dx);
-        const double theta_fin  = p.theta_m * std::sin(omega*time - p.phi);
-        const double theta = theta_body + theta_fin;
-
-        const double dx = x - xh;
-        const double xr = xh + dx*std::cos(theta) - y*std::sin(theta);
-        const double yr = y_h + dx*std::sin(theta) + y*std::cos(theta);
-        return libMesh::Point(xr, yr, z);
-    }
-    else
-    {
-        const double theta = std::atan(dy_mid_dx);
-        const double xt = x - y*std::sin(theta);
-        const double yt = y_mid + y*std::cos(theta);
-        return libMesh::Point(xt, yt, z);
-    }
-}
-
-void tuna_penalty_body_force(libMesh::VectorValue<double>& F,
-                                const libMesh::TensorValue<double>& /*FF*/,
-                                const libMesh::Point& x,   // current position
-                                const libMesh::Point& X,   // reference position
-                                libMesh::Elem* const /*elem*/,
-                                const std::vector<const std::vector<double>*>& /*var_data*/,
-                                const std::vector<const std::vector<libMesh::VectorValue<double>>*>& /*grad_var_data*/,
-                                double time,
-                                void* ctx)
-{
-    const auto* p = static_cast<const TunaKinematicsData*>(ctx);
-
-    libMesh::Point x_tar;
-    tuna_kinematics_map(X, time, x_tar, *p);   // target from reference X
-
-    const libMesh::VectorValue<double> dx = x - x_tar;
-    F = (-p->kappa) * dx;
-}
-
 // ------------------------------
 // Active stress: 外环 + 环向纤维 + 周期激活
 // ------------------------------
@@ -503,11 +401,11 @@ main(int argc, char* argv[])
             mesh_comm.broadcast(mesh);
 
             // 可选一致性检查
-            if (mesh.spatial_dimension() != NDIM)
-            TBOX_ERROR("ERROR: spatial_dimension mismatch ...\n");
-
-            if (!(mesh.mesh_dimension() == NDIM || mesh.mesh_dimension() == NDIM-1))
-            TBOX_ERROR("ERROR: unexpected mesh_dimension ...\n");
+            if (mesh.mesh_dimension() != NDIM)
+            {
+                TBOX_ERROR("ERROR: Mesh dimension (" << mesh.mesh_dimension()
+                        << ") does not match NDIM (" << NDIM << ").\n");
+            }
 
             // 广播后统一整理
             mesh.prepare_for_use();
@@ -595,33 +493,7 @@ main(int argc, char* argv[])
         active_ctx.rho_in    = input_db->getDoubleWithDefault("ACTIVE_RHO_IN", 0.80);
         active_ctx.rho_out   = input_db->getDoubleWithDefault("ACTIVE_RHO_OUT", 1.00);
         active_ctx.eps_rho   = input_db->getDoubleWithDefault("ACTIVE_EPS_RHO", 0.02);
-        //fish
-        static TunaKinematicsData tuna;
-        tuna.f             = input_db->getDoubleWithDefault("TUNA_F", 1.0);
-        tuna.lambda_over_L = input_db->getDoubleWithDefault("TUNA_LAMBDA_OVER_L", 1.25);
-        tuna.c0            = input_db->getDouble("TUNA_C0");
-        tuna.c1            = input_db->getDouble("TUNA_C1");
-        tuna.c2            = input_db->getDouble("TUNA_C2");
-        tuna.xi_hinge      = input_db->getDoubleWithDefault("TUNA_XI_HINGE", 0.88);
-        tuna.theta_m       = input_db->getDoubleWithDefault("TUNA_THETA_M", 0.0);
-        tuna.phi           = input_db->getDoubleWithDefault("TUNA_PHI", 0.0);
-        tuna.kappa         = input_db->getDoubleWithDefault("TUNA_KAPPA", 1.0e6);
-        // compute x_head/x_tail from mesh nodes (reference configuration)
-        double xmin =  1e20, xmax = -1e20;
 
-        for (auto node_it = mesh.nodes_begin(); node_it != mesh.nodes_end(); ++node_it)
-        {
-            const libMesh::Point& s = **node_it;  // mesh coordinates
-            libMesh::Point Xref;
-            coordinate_mapping_function(Xref, s, nullptr); // same mapping as IBAMR uses
-
-            xmin = std::min(xmin, Xref(0));
-            xmax = std::max(xmax, Xref(0));
-        }
-
-        tuna.x_head = xmin;
-        tuna.x_tail = xmax;
-        tuna.L      = xmax - xmin;
 
         // Create major algorithm and data objects that comprise the
         // application.  These objects are configured from the input database
@@ -699,7 +571,6 @@ main(int argc, char* argv[])
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
         PK1_dev_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
-
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
@@ -719,13 +590,6 @@ main(int argc, char* argv[])
         {
             ib_method_ops->registerStressNormalizationPart();
         }
-
-        // register body force
-        IBFEMethod::LagBodyForceFcnData body_fcn_data(
-                    tuna_penalty_body_force,
-                    std::vector<IBTK::SystemData>(),
-                    &tuna);
-        ib_method_ops->registerLagBodyForceFunction(body_fcn_data, /*part*/ 0);
 
         ib_method_ops->initializeFEEquationSystems();
         EquationSystems* equation_systems = ib_method_ops->getFEDataManager()->getEquationSystems();
