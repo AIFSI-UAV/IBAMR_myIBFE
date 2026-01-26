@@ -116,7 +116,7 @@ PK1_dev_stress_function(TensorValue<double>& PP,
                         double /*time*/,
                         void* /*ctx*/)
 {
-    PP = 2.0 * c1_s * FF;
+    PP = 2.0 * c1_s * (FF - tensor_inverse_transpose(FF, NDIM));
     return;
 } // PK1_dev_stress_function
 
@@ -140,40 +140,44 @@ PK1_dil_stress_function(TensorValue<double>& PP,
                         double /*time*/,
                         void* /*ctx*/)
 {
-    PP = 2.0 * (-p0_s + beta_s * log(FF.det())) * tensor_inverse_transpose(FF, NDIM);
+    const double J = FF.det();
+    PP = 2.0 * (beta_s * std::log(J)) * tensor_inverse_transpose(FF, NDIM);
     return;
 } // PK1_dil_stress_function
 
+/// ------------------------------
+// Muscle active stress: traveling wave + left/right alternation (tension-only)
 // ------------------------------
-// Active stress: 外环 + 环向纤维 + 周期激活
-// ------------------------------
-struct ActiveStressCtx
+struct MuscleCtx
 {
     bool enable = false;
 
-    // ---- time activation ----
-    double T_max     = 0.0;
-    double period    = 1.0;
-    double t_on      = 0.0;
-    double t_off     = 0.5;
-    double phase     = 0.0;
-    double ramp_time = 0.0;
+    // peak active tension (same unit as stress, e.g. Pa if dimensional)
+    double T_max = 0.0;
 
-    // ---- ellipse geometry in reference coordinates s ----
-    double a = 0.2;   // semi-axis in x (reference)
-    double b = 0.2;   // semi-axis in y (reference)
+    // kinematics (traveling wave)
+    double f = 1.0;                 // frequency [1/time]
+    double lambda_over_L = 1.0;     // wavelength / body length
+    double phase0 = 0.0;            // global phase shift [rad]
+    double ramp_time = 0.0;         // ramp-up time
 
-    // ---- spatial band near rim: rho in [rho_in, rho_out] ----
-    // rho = sqrt((x/a)^2 + (y/b)^2), rim is rho=1
-    double rho_in  = 0.80;
-    double rho_out = 1.00;
-    double eps_rho = 0.02;
+    // muscle region along body axis (xi in [0,1])
+    double xi_start = 0.0;          // activate only for xi >= xi_start
+    double xi_end   = 1.0;          // and xi <= xi_end
+    double eps_xi   = 0.02;         // smoothing width for spatial mask
 
-    // (可选) 若以后做破对称/行波，再加 mode/theta 参数
-    // std::string mode = "AXIS"; ...
+    // left/right split (reference coordinate)
+    double y_split = 0.0;           // y>=y_split => "right"; y<y_split => "left"
+
+    // activation shaping
+    bool half_wave_rectify = true;  // tension-only: max(0, sin)
+    double power = 1.0;             // raise activation to sharpen (>=1)
+
+    // geometry extents (computed from mesh after read)
+    double x_min = 0.0, x_max = 1.0, L = 1.0;
 };
 
-static ActiveStressCtx active_ctx;
+static MuscleCtx muscle_ctx;
 
 static inline double smooth_step_tanh(double x, double eps)
 {
@@ -181,99 +185,95 @@ static inline double smooth_step_tanh(double x, double eps)
     return 0.5 * (1.0 + std::tanh(x / eps));
 }
 
-static inline double band_mask(double rho, double r_in, double r_out, double eps)
+static inline double mask_interval(double xi, double a, double b, double eps)
 {
-    // 1 for r in [r_in, r_out], 0 outside, with smooth transitions
-    const double m1 = smooth_step_tanh(rho - r_in, eps);
-    const double m2 = smooth_step_tanh(r_out - rho, eps);
+    // 1 on [a,b], 0 outside, smooth transitions
+    const double m1 = smooth_step_tanh(xi - a, eps);
+    const double m2 = smooth_step_tanh(b - xi, eps);
     return m1 * m2;
 }
 
-static inline double rho_ellipse(double x, double y, double a, double b)
+static inline double ramp_factor(double time, double ramp_time)
 {
-    return std::sqrt((x*x)/(a*a) + (y*y)/(b*b));
+    if (ramp_time <= 0.0) return 1.0;
+    return std::min(1.0, std::max(0.0, time / ramp_time));
 }
 
-// 声明/定义放在 PK1_active_stress_function 前
-static inline double activation_time(double time, const ActiveStressCtx& a)
-{
-    if (!a.enable || a.T_max == 0.0) return 0.0;
-    if (a.period <= 0.0) return 0.0;
-
-    double t = time + a.phase;
-    double tau = std::fmod(t, a.period);
-    if (tau < 0.0) tau += a.period;
-
-    if (!(a.t_off > a.t_on)) return 0.0;
-    if (tau < a.t_on || tau > a.t_off) return 0.0;
-
-    const double xi = (tau - a.t_on) / (a.t_off - a.t_on);
-    double alpha = std::sin(M_PI * xi);
-    alpha *= alpha;
-
-    if (a.ramp_time > 0.0)
-    {
-        const double rfac = std::min(1.0, std::max(0.0, time / a.ramp_time));
-        alpha *= rfac;
-    }
-    return alpha;
-}
-
-static inline libMesh::VectorValue<double> ellipse_tangent(double x, double y, double a, double b)
-{
-    // n ~ grad(phi) = (2x/a^2, 2y/b^2)
-    double nx = (2.0*x)/(a*a);
-    double ny = (2.0*y)/(b*b);
-    const double nn = std::sqrt(nx*nx + ny*ny);
-    if (nn < 1e-14) return libMesh::VectorValue<double>(0.0, 0.0);
-    nx /= nn; ny /= nn;
-
-    // t = (-ny, nx)
-    libMesh::VectorValue<double> t0(-ny, nx);
-    return t0; // 已单位化
-}
-
-void 
-PK1_active_stress_function(TensorValue<double>& PP,
+void PK1_muscle_stress_function(TensorValue<double>& PP,
                                 const TensorValue<double>& FF,
                                 const libMesh::Point& /*X*/,
                                 const libMesh::Point& s,
                                 Elem* const /*elem*/,
                                 const std::vector<const std::vector<double>*>& /*var_data*/,
-                                const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*grad_var_data*/,
+                                const std::vector<const std::vector<VectorValue<double> >*>& /*grad_var_data*/,
                                 double time,
                                 void* ctx)
 {
-    const ActiveStressCtx& a = *static_cast<ActiveStressCtx*>(ctx);
+    const MuscleCtx& m = *static_cast<MuscleCtx*>(ctx);
+
     PP.zero();
-    if (!a.enable) return;
+    if (!m.enable || m.T_max == 0.0) return;
 
     const double x = s(0);
     const double y = s(1);
 
-    // (1) rim-band mask in elliptic radius rho
-    const double rho = rho_ellipse(x, y, a.a, a.b);
-    if (rho < 1e-12) return;
+    const double L = (m.L > 0.0) ? m.L : (m.x_max - m.x_min);
+    if (L <= 0.0) return;
 
-    const double m_space = band_mask(rho, a.rho_in, a.rho_out, a.eps_rho);
+    // body coordinate xi in [0,1] (head->tail along +x in reference)
+    double xi = (x - m.x_min) / L;
+
+    // spatial mask (muscle only in [xi_start, xi_end])
+    const double m_space = mask_interval(xi, m.xi_start, m.xi_end, m.eps_xi);
     if (m_space <= 0.0) return;
 
-    // (2) time activation
-    const double alpha = activation_time(time, a);
-    if (alpha <= 0.0) return;
+    // traveling wave phase: phi = 2π f t - 2π xi / (lambda/L) + phase0
+    const double lambda = std::max(1e-8, m.lambda_over_L);
+    const double phi = 2.0 * M_PI * m.f * time - 2.0 * M_PI * xi / lambda + m.phase0;
 
-    const double Tact = a.T_max * alpha * m_space;
+    // left/right alternation: phase shift π
+    double act_right = std::sin(phi);
+    double act_left  = std::sin(phi + M_PI);
 
-    // (3) circumferential fiber = ellipse tangent (reference)
-    const auto t0 = ellipse_tangent(x, y, a.a, a.b);
-    if (t0.norm() < 1e-14) return;
+    if (m.half_wave_rectify)
+    {
+        act_right = std::max(0.0, act_right);
+        act_left  = std::max(0.0, act_left);
+    }
+    else
+    {
+        // if you ever want bidirectional (not recommended for muscle):
+        act_right = 0.5 * (1.0 + act_right);
+        act_left  = 0.5 * (1.0 + act_left);
+    }
 
-    const auto Ft = FF * t0;
+    if (m.power > 1.0)
+    {
+        act_right = std::pow(act_right, m.power);
+        act_left  = std::pow(act_left,  m.power);
+    }
 
-    // (4) PK1 active stress
+    const bool is_right = (y >= m.y_split);
+    const double act = is_right ? act_right : act_left;
+    if (act <= 0.0) return;
+
+    const double ramp = ramp_factor(time, m.ramp_time);
+    const double Tact = m.T_max * act * m_space * ramp;
+
+    // fiber direction a0 in reference: simplest = body axis ex
+    libMesh::VectorValue<double> a0;
+    a0(0) = 1.0;
+    a0(1) = 0.0;
+#if (NDIM == 3)
+    a0(2) = 0.0;
+#endif
+
+    const auto Fa0 = FF * a0; // push-forward
+
+    // PK1 active stress: P = T * (F a0) ⊗ a0
     for (unsigned int i = 0; i < NDIM; ++i)
         for (unsigned int j = 0; j < NDIM; ++j)
-            PP(i,j) = Tact * Ft(i) * t0(j);
+            PP(i,j) = Tact * Fa0(i) * a0(j);
 }
 
 } // namespace ModelData
@@ -475,25 +475,41 @@ main(int argc, char* argv[])
         p0_s = input_db->getDouble("P0_S");
         beta_s = input_db->getDouble("BETA_S");
 
-        // ---- active stress params (optional) ----
-        active_ctx.enable    = input_db->getBoolWithDefault("USE_ACTIVE_STRESS", false);
+        // ---- muscle params (optional) ----
+        muscle_ctx.enable = input_db->getBoolWithDefault("USE_MUSCLE", false);
+        muscle_ctx.T_max  = input_db->getDoubleWithDefault("MUSCLE_T_MAX", 0.0);
+        muscle_ctx.f      = input_db->getDoubleWithDefault("MUSCLE_F", 1.0);
+        muscle_ctx.lambda_over_L = input_db->getDoubleWithDefault("MUSCLE_LAMBDA_OVER_L", 1.0);
+        muscle_ctx.phase0 = input_db->getDoubleWithDefault("MUSCLE_PHASE0", 0.0);
+        muscle_ctx.ramp_time = input_db->getDoubleWithDefault("MUSCLE_RAMP_TIME", 0.0);
 
-        active_ctx.T_max     = input_db->getDoubleWithDefault("ACTIVE_T_MAX", 0.0);
-        active_ctx.period    = input_db->getDoubleWithDefault("ACTIVE_PERIOD", 1.0);
-        active_ctx.t_on      = input_db->getDoubleWithDefault("ACTIVE_T_ON", 0.0);
-        active_ctx.t_off     = input_db->getDoubleWithDefault("ACTIVE_T_OFF", 0.5);
-        active_ctx.phase     = input_db->getDoubleWithDefault("ACTIVE_PHASE", 0.0);
-        active_ctx.ramp_time = input_db->getDoubleWithDefault("ACTIVE_RAMP_TIME", 0.0);
+        muscle_ctx.xi_start = input_db->getDoubleWithDefault("MUSCLE_XI_START", 0.0);
+        muscle_ctx.xi_end   = input_db->getDoubleWithDefault("MUSCLE_XI_END",   1.0);
+        muscle_ctx.eps_xi   = input_db->getDoubleWithDefault("MUSCLE_EPS_XI",   0.02);
 
-        // ellipse semi-axes (reference)
-        active_ctx.a         = input_db->getDoubleWithDefault("ACTIVE_A", 0.2);
-        active_ctx.b         = input_db->getDoubleWithDefault("ACTIVE_B", 0.2);
+        muscle_ctx.y_split  = input_db->getDoubleWithDefault("MUSCLE_Y_SPLIT",  0.0);
+        muscle_ctx.half_wave_rectify = input_db->getBoolWithDefault("MUSCLE_HALF_WAVE", true);
+        muscle_ctx.power    = input_db->getDoubleWithDefault("MUSCLE_POWER", 1.0);
 
-        // rim band in rho
-        active_ctx.rho_in    = input_db->getDoubleWithDefault("ACTIVE_RHO_IN", 0.80);
-        active_ctx.rho_out   = input_db->getDoubleWithDefault("ACTIVE_RHO_OUT", 1.00);
-        active_ctx.eps_rho   = input_db->getDoubleWithDefault("ACTIVE_EPS_RHO", 0.02);
+        // compute x-range from mesh reference coordinates (s)
+        if (muscle_ctx.enable)
+        {
+            double xmin =  1e300;
+            double xmax = -1e300;
+            for (auto it = mesh.nodes_begin(); it != mesh.nodes_end(); ++it)
+            {
+                const libMesh::Point& p = **it;
+                xmin = std::min(xmin, p(0));
+                xmax = std::max(xmax, p(0));
+            }
+            muscle_ctx.x_min = xmin;
+            muscle_ctx.x_max = xmax;
+            muscle_ctx.L = xmax - xmin;
 
+            plog << "Muscle geometry extents: x_min=" << muscle_ctx.x_min
+                << " x_max=" << muscle_ctx.x_max
+                << " L=" << muscle_ctx.L << "\n";
+        }
 
         // Create major algorithm and data objects that comprise the
         // application.  These objects are configured from the input database
@@ -576,14 +592,13 @@ main(int argc, char* argv[])
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
 
-        if (active_ctx.enable)
+        if (muscle_ctx.enable)
         {
-            IBFEMethod::PK1StressFcnData PK1_act_stress_data(PK1_active_stress_function);
-            PK1_act_stress_data.ctx = &active_ctx;
-            PK1_act_stress_data.quad_order =
-                Utility::string_to_enum<libMesh::Order>(
-                    input_db->getStringWithDefault("PK1_ACT_QUAD_ORDER", "THIRD"));
-            ib_method_ops->registerPK1StressFunction(PK1_act_stress_data);
+            IBFEMethod::PK1StressFcnData PK1_muscle_data(PK1_muscle_stress_function);
+            PK1_muscle_data.ctx = &muscle_ctx;
+            PK1_muscle_data.quad_order =
+                Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_MUSCLE_QUAD_ORDER", "THIRD"));
+            ib_method_ops->registerPK1StressFunction(PK1_muscle_data);
         }
 
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
