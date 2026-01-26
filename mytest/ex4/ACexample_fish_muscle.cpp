@@ -141,6 +141,7 @@ PK1_dil_stress_function(TensorValue<double>& PP,
                         void* /*ctx*/)
 {
     const double J = FF.det();
+    if (J <= 0.0) { PP.zero(); return; }  // 或者 clamp 到一个小正数
     PP = 2.0 * (beta_s * std::log(J)) * tensor_inverse_transpose(FF, NDIM);
     return;
 } // PK1_dil_stress_function
@@ -221,7 +222,9 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
     if (L <= 0.0) return;
 
     // body coordinate xi in [0,1] (head->tail along +x in reference)
+    bool reverse_xi = input_db->getBoolWithDefault("MUSCLE_REVERSE_XI", false);
     double xi = (x - m.x_min) / L;
+    if (reverse_xi) xi = 1.0 - xi;
 
     // spatial mask (muscle only in [xi_start, xi_end])
     const double m_space = mask_interval(xi, m.xi_start, m.xi_end, m.eps_xi);
@@ -253,7 +256,9 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
         act_left  = std::pow(act_left,  m.power);
     }
 
-    const bool is_right = (y >= m.y_split);
+    int split_axis = input_db->getIntegerWithDefault("MUSCLE_SPLIT_AXIS", 2); // 3D默认用z
+    double coord = s(split_axis);
+    const bool is_right = (coord >= m.split_value);
     const double act = is_right ? act_right : act_left;
     if (act <= 0.0) return;
 
@@ -636,6 +641,19 @@ main(int argc, char* argv[])
                                                   IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
                                                   vector<SystemData>(),
                                                   &PK1_dil_stress_fcn_data);
+
+        // --- after sigma_dil registration ---
+        if (muscle_ctx.enable)
+        {
+            pair<IBTK::TensorMeshFcnPtr, void*> PK1_muscle_stress_fcn_data(PK1_muscle_stress_function, &muscle_ctx);
+
+            ib_post_processor->registerTensorVariable("sigma_muscle",
+                                                    MONOMIAL,
+                                                    CONSTANT,
+                                                    IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
+                                                    vector<SystemData>(),
+                                                    &PK1_muscle_stress_fcn_data);
+        }
 
         Pointer<hier::Variable<NDIM> > p_var = navier_stokes_integrator->getPressureVariable();
         Pointer<VariableContext> p_current_ctx = navier_stokes_integrator->getCurrentContext();
