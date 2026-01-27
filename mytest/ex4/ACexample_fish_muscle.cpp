@@ -141,9 +141,14 @@ PK1_dil_stress_function(TensorValue<double>& PP,
                         void* /*ctx*/)
 {
     const double J = FF.det();
-    if (J <= 0.0) { PP.zero(); return; }  // 或者 clamp 到一个小正数
-    PP = 2.0 * (-p0_s + beta_s * std::log(J)) * tensor_inverse_transpose(FF, NDIM);
-    return;
+    const double J_eps = 1e-12;
+    if (J <= 0.0)
+    {
+        // 可选：只在 rank0 打一次告警（略）
+    }
+    const double Jc = std::max(J, J_eps);
+    PP = 2.0 * (-p0_s + beta_s * std::log(Jc)) * tensor_inverse_transpose(FF, NDIM);
+
 } // PK1_dil_stress_function
 
 /// ------------------------------
@@ -481,7 +486,8 @@ main(int argc, char* argv[])
         beta_s = input_db->getDouble("BETA_S");
 
         // ---- muscle params (optional) ----
-        muscle_ctx.enable = input_db->getBoolWithDefault("USE_MUSCLE", false);
+        //muscle_ctx.enable = input_db->getBoolWithDefault("USE_MUSCLE", false);
+        // muscle_ctx.enable already set by USE_MUSCLE
         muscle_ctx.T_max  = input_db->getDoubleWithDefault("MUSCLE_T_MAX", 0.0);
         muscle_ctx.f      = input_db->getDoubleWithDefault("MUSCLE_F", 1.0);
         muscle_ctx.lambda_over_L = input_db->getDoubleWithDefault("MUSCLE_LAMBDA_OVER_L", 1.0);
