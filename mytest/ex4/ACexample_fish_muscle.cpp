@@ -142,7 +142,7 @@ PK1_dil_stress_function(TensorValue<double>& PP,
 {
     const double J = FF.det();
     if (J <= 0.0) { PP.zero(); return; }  // 或者 clamp 到一个小正数
-    PP = 2.0 * (beta_s * std::log(J)) * tensor_inverse_transpose(FF, NDIM);
+    PP = 2.0 * (-p0_s + beta_s * std::log(J)) * tensor_inverse_transpose(FF, NDIM);
     return;
 } // PK1_dil_stress_function
 
@@ -218,7 +218,6 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
     if (!m.enable || m.T_max == 0.0) return;
 
     const double x = s(0);
-    const double y = s(1);
 
     const double L = (m.L > 0.0) ? m.L : (m.x_max - m.x_min);
     if (L <= 0.0) return;
@@ -510,9 +509,7 @@ main(int argc, char* argv[])
 
         // 兼容旧参数：若你还在用 MUSCLE_Y_SPLIT，则把它作为默认值
         const double y_split_legacy = input_db->getDoubleWithDefault("MUSCLE_Y_SPLIT", 0.0);
-        muscle_ctx.split_value = input_db->getDoubleWithDefault("MUSCLE_SPLIT_VALUE", y_split_legacy);
-                muscle_ctx.enable = input_db->getBoolWithDefault("MUSCLE_ENABLE", false);       
-
+        muscle_ctx.split_value = input_db->getDoubleWithDefault("MUSCLE_SPLIT_VALUE", y_split_legacy); 
 
         // compute x-range from mesh reference coordinates (s)
         if (muscle_ctx.enable)
