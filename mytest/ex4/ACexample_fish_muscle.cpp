@@ -153,6 +153,11 @@ struct MuscleCtx
 {
     bool enable = false;
 
+    // --- add in MuscleCtx ---
+    bool reverse_xi = false;   // 对应 MUSCLE_REVERSE_XI
+    int  split_axis = 1;       // 2D 默认 y(1), 3D 默认 z(2)
+    double split_value = 0.0;  // 分割平面坐标（旧的 MUSCLE_Y_SPLIT 可映射到它）
+
     // peak active tension (same unit as stress, e.g. Pa if dimensional)
     double T_max = 0.0;
 
@@ -166,9 +171,6 @@ struct MuscleCtx
     double xi_start = 0.0;          // activate only for xi >= xi_start
     double xi_end   = 1.0;          // and xi <= xi_end
     double eps_xi   = 0.02;         // smoothing width for spatial mask
-
-    // left/right split (reference coordinate)
-    double y_split = 0.0;           // y>=y_split => "right"; y<y_split => "left"
 
     // activation shaping
     bool half_wave_rectify = true;  // tension-only: max(0, sin)
@@ -210,7 +212,7 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
                                 double time,
                                 void* ctx)
 {
-    const MuscleCtx& m = *static_cast<MuscleCtx*>(ctx);
+    const MuscleCtx& m = *static_cast<const MuscleCtx*>(ctx);
 
     PP.zero();
     if (!m.enable || m.T_max == 0.0) return;
@@ -222,9 +224,8 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
     if (L <= 0.0) return;
 
     // body coordinate xi in [0,1] (head->tail along +x in reference)
-    bool reverse_xi = input_db->getBoolWithDefault("MUSCLE_REVERSE_XI", false);
     double xi = (x - m.x_min) / L;
-    if (reverse_xi) xi = 1.0 - xi;
+    if (m.reverse_xi) xi = 1.0 - xi;
 
     // spatial mask (muscle only in [xi_start, xi_end])
     const double m_space = mask_interval(xi, m.xi_start, m.xi_end, m.eps_xi);
@@ -256,8 +257,8 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
         act_left  = std::pow(act_left,  m.power);
     }
 
-    int split_axis = input_db->getIntegerWithDefault("MUSCLE_SPLIT_AXIS", 2); // 3D默认用z
-    double coord = s(split_axis);
+    const int axis = std::max(0, std::min((int)NDIM - 1, m.split_axis));
+    const double coord = s(axis);
     const bool is_right = (coord >= m.split_value);
     const double act = is_right ? act_right : act_left;
     if (act <= 0.0) return;
@@ -492,9 +493,26 @@ main(int argc, char* argv[])
         muscle_ctx.xi_end   = input_db->getDoubleWithDefault("MUSCLE_XI_END",   1.0);
         muscle_ctx.eps_xi   = input_db->getDoubleWithDefault("MUSCLE_EPS_XI",   0.02);
 
-        muscle_ctx.y_split  = input_db->getDoubleWithDefault("MUSCLE_Y_SPLIT",  0.0);
         muscle_ctx.half_wave_rectify = input_db->getBoolWithDefault("MUSCLE_HALF_WAVE", true);
         muscle_ctx.power    = input_db->getDoubleWithDefault("MUSCLE_POWER", 1.0);
+
+        muscle_ctx.reverse_xi = input_db->getBoolWithDefault("MUSCLE_REVERSE_XI", false);
+
+        #if (NDIM == 3)
+        const int split_axis_default = 2; // z
+        #else
+        const int split_axis_default = 1; // y
+        #endif
+        muscle_ctx.split_axis = input_db->getIntegerWithDefault("MUSCLE_SPLIT_AXIS", split_axis_default);
+
+        // clamp to valid range
+        muscle_ctx.split_axis = std::max(0, std::min((int)NDIM - 1, muscle_ctx.split_axis));
+
+        // 兼容旧参数：若你还在用 MUSCLE_Y_SPLIT，则把它作为默认值
+        const double y_split_legacy = input_db->getDoubleWithDefault("MUSCLE_Y_SPLIT", 0.0);
+        muscle_ctx.split_value = input_db->getDoubleWithDefault("MUSCLE_SPLIT_VALUE", y_split_legacy);
+                muscle_ctx.enable = input_db->getBoolWithDefault("MUSCLE_ENABLE", false);       
+
 
         // compute x-range from mesh reference coordinates (s)
         if (muscle_ctx.enable)
