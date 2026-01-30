@@ -183,6 +183,9 @@ struct MuscleCtx
 
     // geometry extents (computed from mesh after read)
     double x_min = 0.0, x_max = 1.0, L = 1.0;
+
+    // 尾部幅值增强系数（建议 >=1.0 或者 0~1 的线性系数二选一）
+    double amp_tail = 1.0;   // 默认不增强（=1）
 };
 
 static MuscleCtx muscle_ctx;
@@ -268,7 +271,9 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
     if (act <= 0.0) return;
 
     const double ramp = ramp_factor(time, m.ramp_time);
-    const double Tact = m.T_max * act * m_space * ramp;
+    
+    const double amp = 1.0 + (m.amp_tail - 1.0) * xi;   // head=1, tail=amp_tail
+    const double Tact = m.T_max * amp * act * m_space * ramp;
 
     // fiber direction a0 in reference: simplest = body axis ex
     libMesh::VectorValue<double> a0;
@@ -486,7 +491,7 @@ main(int argc, char* argv[])
         beta_s = input_db->getDouble("BETA_S");
 
         // ---- muscle params (optional) ----
-        //muscle_ctx.enable = input_db->getBoolWithDefault("USE_MUSCLE", false);
+        muscle_ctx.enable = input_db->getBoolWithDefault("USE_MUSCLE", false);
         // muscle_ctx.enable already set by USE_MUSCLE
         muscle_ctx.T_max  = input_db->getDoubleWithDefault("MUSCLE_T_MAX", 0.0);
         muscle_ctx.f      = input_db->getDoubleWithDefault("MUSCLE_F", 1.0);
@@ -502,6 +507,7 @@ main(int argc, char* argv[])
         muscle_ctx.power    = input_db->getDoubleWithDefault("MUSCLE_POWER", 1.0);
 
         muscle_ctx.reverse_xi = input_db->getBoolWithDefault("MUSCLE_REVERSE_XI", false);
+        muscle_ctx.amp_tail = input_db->getDoubleWithDefault("MUSCLE_AMP_TAIL", 1.0);
 
         #if (NDIM == 3)
         const int split_axis_default = 2; // z

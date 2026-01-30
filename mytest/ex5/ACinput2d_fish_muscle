@@ -1,15 +1,16 @@
 // physical parameters
-MU  = 0.01
-RHO = 1.0
+MU  = 0.001         // Pa·s
+RHO = 1000.0        // kg/m^3
 L   = 2.0
-
+UINF   = 0.1	//m/s 入口速度
+	
 //外部读取solid mesh
 USE_EXTERNAL_MESH = TRUE			    //FALSE or TRUE
-MESH_FILENAME = "fish28.e"		//xxx.e文件格式
+MESH_FILENAME = "fish3.e"		//xxx.e文件格式
 //对solid mesh进平移
-MAPPING_SHIFT_X = 0.0
-MAPPING_SHIFT_Y = 0.0
-MAPPING_SHIFT_Z = 0.0   // 3D 时再启用
+MAPPING_SHIFT_X = 0.5
+MAPPING_SHIFT_Y = 0.5
+MAPPING_SHIFT_Z = 0.5   // 3D 时再启用
 
 // --- muscle activation ---
 USE_MUSCLE = TRUE
@@ -18,6 +19,7 @@ MUSCLE_F = 2.0                 // 频率
 MUSCLE_LAMBDA_OVER_L = 1.0     // 一条波长覆盖全身（按目标文献改）
 MUSCLE_PHASE0 = 0.0
 MUSCLE_RAMP_TIME = 0.5
+MUSCLE_AMP_TAIL = 1.0         // 或 2.0 也行（你也可用多项式参数）
 
 // muscle region (avoid head, optionally avoid caudal fin)
 MUSCLE_XI_START = 0.05
@@ -25,7 +27,7 @@ MUSCLE_XI_END   = 0.85
 MUSCLE_EPS_XI   = 0.02
 
 // left/right split in reference y
-MUSCLE_Y_SPLIT = 0.0
+MUSCLE_Y_SPLIT = 2.0
 MUSCLE_HALF_WAVE = TRUE
 MUSCLE_POWER = 2.0
 
@@ -45,10 +47,10 @@ PK1_DEV_QUAD_ORDER = "THIRD"
 PK1_DIL_QUAD_ORDER = "FIRST"
 
 // model parameters
-U_MAX = 2.0
-C1_S = 0.05
+U_MAX = 1.0
+C1_S = 3000.0      // Pa（被动“剪切强度”量级，偏软，利于出现可见摆动）0.05
 P0_S = C1_S
-BETA_S = 1.0*(NFINEST/64.0)
+BETA_S = 100000.0    // Pa（体积惩罚，保证接近不可压缩）1.0*(NFINEST/64.0)
 
 // solver parameters
 IB_DELTA_FUNCTION          = "IB_4"                 // the type of smoothed delta function to use for Lagrangian-Eulerian interaction
@@ -87,7 +89,7 @@ VelocityBcCoefs_0 {
   // x_lo inlet
   acoef_function_0 = "1.0"
   bcoef_function_0 = "0.0"
-  gcoef_function_0 = "1.0"
+  gcoef_function_0 = UINF
 
   // x_hi outlet (Neumann)
   acoef_function_1 = "0.0"
@@ -98,12 +100,15 @@ VelocityBcCoefs_0 {
   acoef_function_2 = "1.0"
   bcoef_function_2 = "0.0"
   gcoef_function_2 = "0.0"
+  
   acoef_function_3 = "1.0"
   bcoef_function_3 = "0.0"
   gcoef_function_3 = "0.0"
+  
   acoef_function_4 = "1.0"
   bcoef_function_4 = "0.0"
   gcoef_function_4 = "0.0"
+  
   acoef_function_5 = "1.0"
   bcoef_function_5 = "0.0"
   gcoef_function_5 = "0.0"
