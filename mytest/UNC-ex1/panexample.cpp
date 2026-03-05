@@ -53,34 +53,35 @@ namespace ModelData
 
 static double kappa_s = 1.0e6;
 
-void target_force_function(VectorValue& F,
-                           const TensorValue& /*FF*/,
+void target_force_function(libMesh::VectorValue<double>& F,
+                           const libMesh::TensorValue<double>& /*FF*/,
+                           const libMesh::Point& x,
                            const libMesh::Point& X,
-                           const libMesh::Point& s,
-                           Elem* const /*elem*/,
-                           const std::vector<NumericVector<double>*>& /*var_data*/,
-                           const std::vector<std::vector<VectorValue<double> >*>& /*grad_var_data*/,
+                           libMesh::Elem* const /*elem*/,
+                           const std::vector<const std::vector<double>*>& /*system_var_data*/,
+                           const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*system_grad_var_data*/,
                            double time,
                            void* /*ctx*/)
 {
-    libMesh::Point s_dump;
+    libMesh::Point X_target;
     if (time < 1.0)
     {
-        s_dump(0) = s(0);
-        s_dump(1) = s(1) + 0.5 * time;
+        X_target(0) = X(0);
+        X_target(1) = X(1) + 0.5 * time;
     }
     else if (time < 3.0)
     {
-        s_dump(0) = s(0);
-        s_dump(1) = s(1) + 0.5 + 0.5 * (1.0 - time);
+        X_target(0) = X(0);
+        X_target(1) = X(1) + 0.5 + 0.5 * (1.0 - time);
     }
     else
     {
-        s_dump(0) = X(0);
-        s_dump(1) = X(1);
+        // 让力消失：目标点=当前位置
+        X_target(0) = x(0);
+        X_target(1) = x(1);
     }
 
-    F = kappa_s * (s_dump - X);
+    F = kappa_s * (X_target - x);
 }
     
 // Stress tensor functions.
@@ -261,15 +262,17 @@ main(int argc, char* argv[])
         // Configure the IBFE solver.
         IBFEMethod::PK1StressFcnData PK1_dev_stress_data(PK1_dev_stress_function);
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
+        IBFEMethod::LagBodyForceFcnData target_force_data(target_force_function);   // target force function
+
         PK1_dev_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
+        ib_method_ops->registerLagBodyForceFunction(target_force_data);         // Configure target forces.
+        
         ib_method_ops->initializeFEEquationSystems();
-        // Configure target forces.
-        ib_method_ops->initializeFEEquationSystems();   
 
         FEDataManager* fe_data_manager = ib_method_ops->getFEDataManager();
         EquationSystems* equation_systems = fe_data_manager->getEquationSystems();
