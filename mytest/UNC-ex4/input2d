@@ -15,6 +15,15 @@ ELEM_TYPE = "TRI3"                            // type of element to use for stru
 PK1_DEV_QUAD_ORDER = "FIFTH"
 PK1_DIL_QUAD_ORDER = "THIRD"
 
+// fiber stress parameters (ported from legacy main.C)
+USE_FIBER_STRESS = TRUE
+FIBER_PEAK_STRESS = 30.0
+FIBER_WAVE_PERIOD = 1.0
+FIBER_WAVE_CENTER0 = -0.5
+FIBER_WAVE_WIDTH = 0.1
+FIBER_Y_THRESHOLD = 0.0
+PK1_FIBER_QUAD_ORDER = "THIRD"
+
 // solver parameters
 USE_IB_DELTA_FUNCTIONS     = TRUE              // whether to use smoothed delta functions to mediate Lagrangian-Eulerian interaction
 IB_DELTA_FUNCTION          = "IB_4"            // the type of smoothed delta function to use for Lagrangian-Eulerian interaction

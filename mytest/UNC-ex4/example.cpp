@@ -56,8 +56,47 @@ static double kappa_s = 1.0e6;
 static double c1_s = 0.05;
 static double p0_s = 0.0;
 static double beta_s = 0.0;
+static const VectorValue<double> f_0(-1.0, 0.0);
 
-void 
+struct FiberStressCtx
+{
+    bool enable = false;
+    double peak_stress = 30.0;
+    double wave_speed = 1.0;
+    double wave_center0 = -0.5;
+    double wave_width = 0.1;
+    double y_threshold = 0.0;
+};
+
+static FiberStressCtx fiber_ctx;
+
+void
+PK1_fiber_stress_function(TensorValue<double>& PP,
+                          const TensorValue<double>& FF,
+                          const libMesh::Point& /*X*/,
+                          const libMesh::Point& s,
+                          Elem* const /*elem*/,
+                          const std::vector<const std::vector<double>*>& /*var_data*/,
+                          const std::vector<const std::vector<VectorValue<double> >*>& /*grad_var_data*/,
+                          double time,
+                          void* ctx)
+{
+    const FiberStressCtx& fctx = *static_cast<FiberStressCtx*>(ctx);
+    PP.zero();
+    if (!fctx.enable || s(1) >= fctx.y_threshold) return;
+
+    if (fctx.wave_speed <= 0.0 || fctx.wave_width <= 0.0) return;
+    const double t_cycle = time - std::floor(time / fctx.wave_speed) * fctx.wave_speed;
+    const double wave_center = fctx.wave_center0 + t_cycle;
+    const double xi = (s(0) - wave_center) / fctx.wave_width;
+    const double T = fctx.peak_stress * std::exp(-xi * xi);
+
+    TensorValue<double> f_f;
+    outer_product(f_f, f_0, f_0);
+    PP = FF.det() * T * FF * f_f;
+}
+
+void
 target_force_function(libMesh::VectorValue<double>& F,
                            const libMesh::TensorValue<double>& /*FF*/,
                            const libMesh::Point& x,
@@ -239,6 +278,12 @@ main(int argc, char* argv[])
         p0_s = input_db->getDouble("P0_S");
         beta_s = input_db->getDouble("BETA_S");
         kappa_s = input_db->getDouble("Kappa_S");
+        fiber_ctx.enable = input_db->getBoolWithDefault("USE_FIBER_STRESS", true);
+        fiber_ctx.peak_stress = input_db->getDoubleWithDefault("FIBER_PEAK_STRESS", 30.0);
+        fiber_ctx.wave_speed = input_db->getDoubleWithDefault("FIBER_WAVE_PERIOD", 1.0);
+        fiber_ctx.wave_center0 = input_db->getDoubleWithDefault("FIBER_WAVE_CENTER0", -0.5);
+        fiber_ctx.wave_width = input_db->getDoubleWithDefault("FIBER_WAVE_WIDTH", 0.1);
+        fiber_ctx.y_threshold = input_db->getDoubleWithDefault("FIBER_Y_THRESHOLD", 0.0);
 
         // Create major algorithm and data objects that comprise the
         // application.  These objects are configured from the input database
@@ -295,14 +340,19 @@ main(int argc, char* argv[])
         // Configure the IBFE solver.
         IBFEMethod::PK1StressFcnData PK1_dev_stress_data(PK1_dev_stress_function);
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
+        IBFEMethod::PK1StressFcnData PK1_fiber_stress_data(PK1_fiber_stress_function);
         IBFEMethod::LagBodyForceFcnData target_force_data(target_force_function);   // target force function
 
         PK1_dev_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
+        PK1_fiber_stress_data.ctx = &fiber_ctx;
+        PK1_fiber_stress_data.quad_order =
+            Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_FIBER_QUAD_ORDER", "THIRD"));
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
+        if (fiber_ctx.enable) ib_method_ops->registerPK1StressFunction(PK1_fiber_stress_data);
         ib_method_ops->registerLagBodyForceFunction(target_force_data);         // Configure target forces.
         
         ib_method_ops->initializeFEEquationSystems();
