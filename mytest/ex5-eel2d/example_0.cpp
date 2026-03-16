@@ -24,6 +24,8 @@
 #include <StandardTagAndInitialize.h>
 
 // Headers for basic libMesh objects
+#include <libmesh/boundary_info.h>
+#include <libmesh/boundary_mesh.h>
 #include <libmesh/equation_systems.h>
 #include <libmesh/exodusII_io.h>
 #include <libmesh/mesh.h>
@@ -33,6 +35,7 @@
 // Headers for application-specific algorithm/data structure objects
 #include <ibamr/IBExplicitHierarchyIntegrator.h>
 #include <ibamr/IBFEMethod.h>
+#include <ibamr/IBFESurfaceMethod.h>
 #include <ibamr/INSCollocatedHierarchyIntegrator.h>
 #include <ibamr/INSStaggeredHierarchyIntegrator.h>
 
@@ -45,7 +48,6 @@
 #include <ibtk/muParserRobinBcCoefs.h>
 
 #include <boost/multi_array.hpp>
-#include <set>
 
 // Set up application namespace declarations
 #include <ibamr/app_namespaces.h>
@@ -168,7 +170,7 @@ inline double eel_centerline_v(double s, double t, const Eel2DData& d)
 void compute_com_and_orientation(
     EquationSystems* equation_systems,
     const std::string& coords_system_name,
-    MeshBase& mesh,
+    Mesh& mesh,
     double& xcom,
     double& ycom,
     double& theta);
@@ -182,93 +184,6 @@ inline void compute_eel_target(
     double& utar_x,
     double& utar_y);
 
-void
-compute_com_and_orientation(EquationSystems* equation_systems,
-                            const std::string& coords_system_name,
-                            MeshBase& mesh,
-                            double& xcom,
-                            double& ycom,
-                            double& theta)
-{
-    System& X_system = equation_systems->get_system<System>(coords_system_name);
-    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
-    const DofMap& dof_map = X_system.get_dof_map();
-
-    std::set<dof_id_type> visited_nodes;
-    double xsum = 0.0, ysum = 0.0;
-    int npts = 0;
-
-    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
-    {
-        const Elem* elem = *el_it;
-        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
-        {
-            const Node* node = elem->node_ptr(k);
-            if (!visited_nodes.insert(node->id()).second) continue;
-            std::vector<dof_id_type> dof_idx_x, dof_idx_y;
-            dof_map.dof_indices(node, dof_idx_x, 0);
-            dof_map.dof_indices(node, dof_idx_y, 1);
-            xsum += (*X_ghost_vec)(dof_idx_x[0]);
-            ysum += (*X_ghost_vec)(dof_idx_y[0]);
-            ++npts;
-        }
-    }
-
-    double local[3] = { xsum, ysum, static_cast<double>(npts) };
-    IBTK_MPI::sumReduction(local, 3);
-    xcom = local[0] / std::max(1.0, local[2]);
-    ycom = local[1] / std::max(1.0, local[2]);
-
-    double cxx = 0.0, cyy = 0.0, cxy = 0.0;
-    visited_nodes.clear();
-    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
-    {
-        const Elem* elem = *el_it;
-        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
-        {
-            const Node* node = elem->node_ptr(k);
-            if (!visited_nodes.insert(node->id()).second) continue;
-            std::vector<dof_id_type> dof_idx_x, dof_idx_y;
-            dof_map.dof_indices(node, dof_idx_x, 0);
-            dof_map.dof_indices(node, dof_idx_y, 1);
-            const double dx = (*X_ghost_vec)(dof_idx_x[0]) - xcom;
-            const double dy = (*X_ghost_vec)(dof_idx_y[0]) - ycom;
-            cxx += dx * dx;
-            cxy += dx * dy;
-            cyy += dy * dy;
-        }
-    }
-
-    double local_cov[3] = { cxx, cyy, cxy };
-    IBTK_MPI::sumReduction(local_cov, 3);
-    theta = 0.5 * std::atan2(2.0 * local_cov[2], local_cov[0] - local_cov[1]);
-}
-
-inline void
-compute_eel_target(const libMesh::Point& X,
-                   double time,
-                   const Eel2DData& d,
-                   double& xtar,
-                   double& ytar,
-                   double& utar_x,
-                   double& utar_y)
-{
-    const double s = X(0) - d.x_leading;
-    const double yc = eel_centerline_y(s, time, d);
-    const double vc = eel_centerline_v(s, time, d);
-
-    const double xb = X(0) - d.xcom_ref;
-    const double yb = (X(1) - d.ycom_ref) + yc;
-
-    const double ct = std::cos(d.theta_cur);
-    const double st = std::sin(d.theta_cur);
-    xtar = d.xcom_cur + ct * xb - st * yb;
-    ytar = d.ycom_cur + st * xb + ct * yb;
-
-    utar_x = -st * vc;
-    utar_y = ct * vc;
-}
-
 // Tether (penalty) stress function.
 void
 PK1_stress_function(TensorValue<double>& PP,
@@ -281,28 +196,20 @@ PK1_stress_function(TensorValue<double>& PP,
                     double /*time*/,
                     void* ctx)
 {
-    const Eel2DData* const d = reinterpret_cast<Eel2DData*>(ctx);
+    const TetherData* const tether_data = reinterpret_cast<TetherData*>(ctx);
 
-    PP = 2.0 * d->c1_s * (FF - tensor_inverse_transpose(FF, NDIM));
+    PP = 2.0 * tether_data->c1_s * (FF - tensor_inverse_transpose(FF, NDIM));
     return;
 } // PK1_stress_function
 
 // Tether (penalty) force functions.
-void
-eel_body_force_function(libMesh::VectorValue<double>& F,
-                        const libMesh::TensorValue<double>& /*FF*/,
-                        const libMesh::Point& x,
-                        const libMesh::Point& X,
-                        libMesh::Elem* const /*elem*/,
-                        const std::vector<const std::vector<double>*>& var_data,
-                        const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*grad_var_data*/,
-                        double time,
-                        void* ctx)
+void eel_body_force_function(...)
 {
     const Eel2DData* d = reinterpret_cast<Eel2DData*>(ctx);
     const std::vector<double>& U = *var_data[0];
 
     const double s = X(0) - d->x_leading;   // material arc-wise coordinate
+    const double r = X(1) - d->y_center0;   // body-frame transverse coordinate
 
     const double yc = eel_centerline_y(s, time, *d);
     const double vc = eel_centerline_v(s, time, *d);
@@ -326,7 +233,7 @@ eel_body_force_function(libMesh::VectorValue<double>& F,
 }
 
 void
-eel_surface_force_function(VectorValue<double>& F,
+tether_force_function(VectorValue<double>& F,
                       const VectorValue<double>& /*n*/,
                       const VectorValue<double>& /*N*/,
                       const TensorValue<double>& /*FF*/,
@@ -336,21 +243,17 @@ eel_surface_force_function(VectorValue<double>& F,
                       const unsigned short /*side*/,
                       const vector<const vector<double>*>& var_data,
                       const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                      double time,
+                      double /*time*/,
                       void* ctx)
 {
-    const Eel2DData* const d = reinterpret_cast<Eel2DData*>(ctx);
+    const TetherData* const tether_data = reinterpret_cast<TetherData*>(ctx);
 
+    VectorValue<double> D = X - x;
     VectorValue<double> U;
-    for (unsigned int k = 0; k < NDIM; ++k) U(k) = (*var_data[0])[k];
-
-    double xtar, ytar, utar_x, utar_y;
-    compute_eel_target(X, time, *d, xtar, ytar, utar_x, utar_y);
-
-    F(0) = d->kappa_s_surface * (xtar - x(0)) + d->eta_s_surface * (utar_x - U(0));
-    F(1) = d->kappa_s_surface * (ytar - x(1)) + d->eta_s_surface * (utar_y - U(1));
+    for (unsigned int d = 0; d < NDIM; ++d) U(d) = (*var_data[0])[d];
+    F = tether_data->kappa_s_surface * D - tether_data->eta_s_surface * U;
     return;
-} // eel_surface_force_function
+} // tether_force_function
 
 } // namespace ModelData
 using namespace ModelData;
@@ -360,7 +263,7 @@ static ofstream drag_stream, lift_stream, U_L1_norm_stream, U_L2_norm_stream, U_
 void postprocess_data(Pointer<Database> input_db,
                       Pointer<PatchHierarchy<NDIM> > patch_hierarchy,
                       Pointer<INSHierarchyIntegrator> navier_stokes_integrator,
-                      MeshBase& mesh,
+                      Mesh& mesh,
                       EquationSystems* equation_systems,
                       const std::string& coords_system_name,
                       const std::string& velocity_system_name,
@@ -440,20 +343,24 @@ main(int argc, char* argv[])
         std::string elem_type = input_db->getString("ELEM_TYPE");
 
         // Read mesh: use a libMesh-supported format, e.g. .msh
-        solid_mesh.read("fish2d.msh");
+        solid_mesh.read("IBFE_Mesh2D_128.msh");
         solid_mesh.prepare_for_use();
 
         pout << "mesh_dimension=" << solid_mesh.mesh_dimension()
             << ", spatial_dimension=" << solid_mesh.spatial_dimension() << "\n";
 
-        const bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
-        if (use_boundary_mesh)
-        {
-            TBOX_ERROR("eel2d_ibfe.cpp first-pass migration requires USE_BOUNDARY_MESH = FALSE\n"
-                       << "so that IBFEMethod body+surface target penalty callbacks are both active.");
-        }
+        // Build boundary mesh from solid mesh
+        BoundaryMesh boundary_mesh(solid_mesh.comm(), solid_mesh.mesh_dimension() - 1);
+        BoundaryInfo& boundary_info = solid_mesh.get_boundary_info();
+        boundary_info.sync(boundary_mesh);
+        boundary_mesh.prepare_for_use();
 
-        MeshBase& mesh = static_cast<MeshBase&>(solid_mesh);
+        bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
+
+        // Use a common base-class reference
+        MeshBase& active_mesh =
+            use_boundary_mesh ? static_cast<MeshBase&>(boundary_mesh)
+                            : static_cast<MeshBase&>(solid_mesh);
 
         // Create major algorithm and data objects that comprise the
         // application. These objects are configured from the input database
@@ -477,14 +384,29 @@ main(int argc, char* argv[])
             TBOX_ERROR("Unsupported solver type: " << solver_type << "\n"
                                                    << "Valid options are: COLLOCATED, STAGGERED");
         }
-        Pointer<IBStrategy> ib_ops =
-            new IBFEMethod("IBFEMethod",
-                           app_initializer->getComponentDatabase("IBFEMethod"),
-                           &mesh,
-                           app_initializer->getComponentDatabase("GriddingAlgorithm")->getInteger("max_levels"),
-                           /*register_for_restart*/ true,
-                           restart_read_dirname,
-                           restart_restore_num);
+        Pointer<IBStrategy> ib_ops;
+        if (use_boundary_mesh)
+        {
+            ib_ops = new IBFESurfaceMethod(
+                "IBFEMethod",
+                app_initializer->getComponentDatabase("IBFEMethod"),
+                &mesh,
+                app_initializer->getComponentDatabase("GriddingAlgorithm")->getInteger("max_levels"),
+                /*register_for_restart*/ true,
+                restart_read_dirname,
+                restart_restore_num);
+        }
+        else
+        {
+            ib_ops =
+                new IBFEMethod("IBFEMethod",
+                               app_initializer->getComponentDatabase("IBFEMethod"),
+                               &mesh,
+                               app_initializer->getComponentDatabase("GriddingAlgorithm")->getInteger("max_levels"),
+                               /*register_for_restart*/ true,
+                               restart_read_dirname,
+                               restart_restore_num);
+        }
         Pointer<IBHierarchyIntegrator> time_integrator =
             new IBExplicitHierarchyIntegrator("IBHierarchyIntegrator",
                                               app_initializer->getComponentDatabase("IBHierarchyIntegrator"),
@@ -508,34 +430,49 @@ main(int argc, char* argv[])
                                         load_balancer);
 
         // Configure the IBFE solver.
-        Eel2DData eel_data(input_db);
-        void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
+        TetherData tether_data(input_db);
+        void* const tether_data_ptr = reinterpret_cast<void*>(&tether_data);
         EquationSystems* equation_systems;
         std::string coords_system_name, velocity_system_name;
         std::vector<int> vars(NDIM);
         for (unsigned int d = 0; d < NDIM; ++d) vars[d] = d;
-        Pointer<IBFEMethod> ibfe_ops = ib_ops;
-        ibfe_ops->initializeFEEquationSystems();
-        equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
-        coords_system_name = ibfe_ops->getCurrentCoordinatesSystemName();
-        velocity_system_name = ibfe_ops->getVelocitySystemName();
-        vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
-
-        IBFEMethod::PK1StressFcnData PK1_stress_data(
-            PK1_stress_function, std::vector<IBTK::SystemData>(), eel_data_ptr);
-        PK1_stress_data.quad_order =
-            Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_QUAD_ORDER", "THIRD"));
-        ibfe_ops->registerPK1StressFunction(PK1_stress_data);
-
-        IBFEMethod::LagBodyForceFcnData body_fcn_data(eel_body_force_function, sys_data, eel_data_ptr);
-        ibfe_ops->registerLagBodyForceFunction(body_fcn_data);
-
-        IBFEMethod::LagSurfaceForceFcnData surface_fcn_data(eel_surface_force_function, sys_data, eel_data_ptr);
-        ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
-
-        if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
+        if (use_boundary_mesh)
         {
-            ibfe_ops->registerStressNormalizationPart();
+            Pointer<IBFESurfaceMethod> ibfe_ops = ib_ops;
+            ibfe_ops->initializeFEEquationSystems();
+            equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
+            coords_system_name = IBFESurfaceMethod::COORDS_SYSTEM_NAME;
+            velocity_system_name = IBFESurfaceMethod::VELOCITY_SYSTEM_NAME;
+            vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
+            IBFESurfaceMethod::LagSurfaceForceFcnData surface_fcn_data(
+                tether_force_function, sys_data, tether_data_ptr);
+            ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
+        }
+        else
+        {
+            Pointer<IBFEMethod> ibfe_ops = ib_ops;
+            ibfe_ops->initializeFEEquationSystems();
+            equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
+            coords_system_name = ibfe_ops->getCurrentCoordinatesSystemName();
+            velocity_system_name = ibfe_ops->getVelocitySystemName();
+            vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
+            
+            IBFEMethod::PK1StressFcnData PK1_stress_data(
+                PK1_stress_function, std::vector<IBTK::SystemData>(), tether_data_ptr);
+            PK1_stress_data.quad_order =
+                Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_QUAD_ORDER", "THIRD"));
+            ibfe_ops->registerPK1StressFunction(PK1_stress_data);
+
+            IBFEMethod::LagBodyForceFcnData body_fcn_data(tether_force_function, sys_data, tether_data_ptr);
+            ibfe_ops->registerLagBodyForceFunction(body_fcn_data);
+
+            IBFEMethod::LagSurfaceForceFcnData surface_fcn_data(tether_force_function, sys_data, tether_data_ptr);
+            ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
+
+            if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
+            {
+                ibfe_ops->registerStressNormalizationPart();
+            }
         }
 
         // Create Eulerian initial condition specification objects.
@@ -601,13 +538,17 @@ main(int argc, char* argv[])
         }
 
         // Initialize hierarchy configuration and data on all patches.
-        ibfe_ops->initializeFEData();
+        if (use_boundary_mesh)
+        {
+            Pointer<IBFESurfaceMethod> ibfe_ops = ib_ops;
+            ibfe_ops->initializeFEData();
+        }
+        else
+        {
+            Pointer<IBFEMethod> ibfe_ops = ib_ops;
+            ibfe_ops->initializeFEData();
+        }
         time_integrator->initializePatchHierarchy(patch_hierarchy, gridding_algorithm);
-
-        compute_com_and_orientation(equation_systems, coords_system_name, mesh, eel_data.xcom_cur, eel_data.ycom_cur, eel_data.theta_cur);
-        eel_data.xcom_ref = eel_data.xcom_cur;
-        eel_data.ycom_ref = eel_data.ycom_cur;
-        eel_data.theta_ref = eel_data.theta_cur;
 
         // Deallocate initialization objects.
         app_initializer.setNull();
@@ -665,10 +606,6 @@ main(int argc, char* argv[])
             pout << "Simulation time is " << loop_time << "\n";
 
             dt = time_integrator->getMaximumTimeStepSize();
-
-            compute_com_and_orientation(
-                equation_systems, coords_system_name, mesh, eel_data.xcom_cur, eel_data.ycom_cur, eel_data.theta_cur);
-
             time_integrator->advanceHierarchy(dt);
             loop_time += dt;
 
@@ -701,7 +638,15 @@ main(int argc, char* argv[])
             {
                 pout << "\nWriting restart files...\n\n";
                 RestartManager::getManager()->writeRestartFile(restart_dump_dirname, iteration_num);
-                dynamic_cast<IBFEMethod&>(*ib_ops).writeFEDataToRestartFile(restart_dump_dirname, iteration_num);
+                if (use_boundary_mesh)
+                {
+                    dynamic_cast<IBFESurfaceMethod&>(*ib_ops).writeFEDataToRestartFile(restart_dump_dirname,
+                                                                                       iteration_num);
+                }
+                else
+                {
+                    dynamic_cast<IBFEMethod&>(*ib_ops).writeFEDataToRestartFile(restart_dump_dirname, iteration_num);
+                }
             }
             if (dump_timer_data && (iteration_num % timer_dump_interval == 0 || last_step))
             {
@@ -744,7 +689,7 @@ void
 postprocess_data(Pointer<Database> input_db,
                  Pointer<PatchHierarchy<NDIM> > /*patch_hierarchy*/,
                  Pointer<INSHierarchyIntegrator> /*navier_stokes_integrator*/,
-                 MeshBase& mesh,
+                 Mesh& mesh,
                  EquationSystems* equation_systems,
                  const std::string& coords_system_name,
                  const std::string& velocity_system_name,
@@ -752,8 +697,8 @@ postprocess_data(Pointer<Database> input_db,
                  const double loop_time,
                  const string& /*data_dump_dirname*/)
 {
-    Eel2DData eel_data(input_db);
-    void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
+    TetherData tether_data(input_db);
+    void* const tether_data_ptr = reinterpret_cast<void*>(&tether_data);
     bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
     const unsigned int dim = mesh.mesh_dimension();
     double F_integral[NDIM];
@@ -821,7 +766,7 @@ postprocess_data(Pointer<Database> input_db,
                 {
                     U_qp_vec[d] = U(d);
                 }
-                eel_body_force_function(F, FF, x, q_point[qp], elem, var_data, grad_var_data, loop_time, eel_data_ptr);
+                tether_force_function(F, FF, x, q_point[qp], elem, var_data, grad_var_data, loop_time, tether_data_ptr);
                 for (int d = 0; d < NDIM; ++d)
                 {
                     F_integral[d] += F(d) * JxW[qp];
@@ -845,7 +790,7 @@ postprocess_data(Pointer<Database> input_db,
                     tensor_inverse_transpose(FF_inv_trans, FF, NDIM);
                     n = (FF_inv_trans * N).unit();
 
-                    eel_surface_force_function(F,
+                    tether_force_function(F,
                                           n,
                                           N,
                                           FF,
@@ -856,7 +801,7 @@ postprocess_data(Pointer<Database> input_db,
                                           var_data,
                                           grad_var_data,
                                           loop_time,
-                                          eel_data_ptr);
+                                          tether_data_ptr);
                     for (int d = 0; d < NDIM; ++d)
                     {
                         pout << F(d) << endl;
@@ -896,7 +841,7 @@ postprocess_data(Pointer<Database> input_db,
                     tensor_inverse_transpose(FF_inv_trans, FF, NDIM);
                     n = (FF_inv_trans * N).unit();
 
-                    eel_surface_force_function(F,
+                    tether_force_function(F,
                                           n,
                                           N,
                                           FF,
@@ -907,7 +852,7 @@ postprocess_data(Pointer<Database> input_db,
                                           var_data,
                                           grad_var_data,
                                           loop_time,
-                                          eel_data_ptr);
+                                          tether_data_ptr);
                     for (int d = 0; d < NDIM; ++d)
                     {
                         F_integral[d] += F(d) * JxW_face[qp];
