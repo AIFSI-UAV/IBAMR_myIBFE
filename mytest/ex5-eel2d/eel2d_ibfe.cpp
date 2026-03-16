@@ -24,8 +24,6 @@
 #include <StandardTagAndInitialize.h>
 
 // Headers for basic libMesh objects
-#include <libmesh/boundary_info.h>
-#include <libmesh/boundary_mesh.h>
 #include <libmesh/equation_systems.h>
 #include <libmesh/exodusII_io.h>
 #include <libmesh/mesh.h>
@@ -35,7 +33,6 @@
 // Headers for application-specific algorithm/data structure objects
 #include <ibamr/IBExplicitHierarchyIntegrator.h>
 #include <ibamr/IBFEMethod.h>
-#include <ibamr/IBFESurfaceMethod.h>
 #include <ibamr/INSCollocatedHierarchyIntegrator.h>
 #include <ibamr/INSStaggeredHierarchyIntegrator.h>
 
@@ -449,19 +446,14 @@ main(int argc, char* argv[])
         pout << "mesh_dimension=" << solid_mesh.mesh_dimension()
             << ", spatial_dimension=" << solid_mesh.spatial_dimension() << "\n";
 
-        // Build boundary mesh from solid mesh
-        BoundaryMesh boundary_mesh(solid_mesh.comm(), solid_mesh.mesh_dimension() - 1);
-        BoundaryInfo& boundary_info = solid_mesh.get_boundary_info();
-        boundary_info.sync(boundary_mesh);
-        boundary_mesh.prepare_for_use();
+        const bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
+        if (use_boundary_mesh)
+        {
+            TBOX_ERROR("eel2d_ibfe.cpp first-pass migration requires USE_BOUNDARY_MESH = FALSE\n"
+                       << "so that IBFEMethod body+surface target penalty callbacks are both active.");
+        }
 
-        bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
-
-        // Use a common base-class reference
-        MeshBase& active_mesh =
-            use_boundary_mesh ? static_cast<MeshBase&>(boundary_mesh)
-                              : static_cast<MeshBase&>(solid_mesh);
-        MeshBase& mesh = active_mesh;
+        MeshBase& mesh = static_cast<MeshBase&>(solid_mesh);
 
         // Create major algorithm and data objects that comprise the
         // application. These objects are configured from the input database
@@ -485,29 +477,14 @@ main(int argc, char* argv[])
             TBOX_ERROR("Unsupported solver type: " << solver_type << "\n"
                                                    << "Valid options are: COLLOCATED, STAGGERED");
         }
-        Pointer<IBStrategy> ib_ops;
-        if (use_boundary_mesh)
-        {
-            ib_ops = new IBFESurfaceMethod(
-                "IBFEMethod",
-                app_initializer->getComponentDatabase("IBFEMethod"),
-                &mesh,
-                app_initializer->getComponentDatabase("GriddingAlgorithm")->getInteger("max_levels"),
-                /*register_for_restart*/ true,
-                restart_read_dirname,
-                restart_restore_num);
-        }
-        else
-        {
-            ib_ops =
-                new IBFEMethod("IBFEMethod",
-                               app_initializer->getComponentDatabase("IBFEMethod"),
-                               &mesh,
-                               app_initializer->getComponentDatabase("GriddingAlgorithm")->getInteger("max_levels"),
-                               /*register_for_restart*/ true,
-                               restart_read_dirname,
-                               restart_restore_num);
-        }
+        Pointer<IBStrategy> ib_ops =
+            new IBFEMethod("IBFEMethod",
+                           app_initializer->getComponentDatabase("IBFEMethod"),
+                           &mesh,
+                           app_initializer->getComponentDatabase("GriddingAlgorithm")->getInteger("max_levels"),
+                           /*register_for_restart*/ true,
+                           restart_read_dirname,
+                           restart_restore_num);
         Pointer<IBHierarchyIntegrator> time_integrator =
             new IBExplicitHierarchyIntegrator("IBHierarchyIntegrator",
                                               app_initializer->getComponentDatabase("IBHierarchyIntegrator"),
@@ -537,43 +514,28 @@ main(int argc, char* argv[])
         std::string coords_system_name, velocity_system_name;
         std::vector<int> vars(NDIM);
         for (unsigned int d = 0; d < NDIM; ++d) vars[d] = d;
-        if (use_boundary_mesh)
+        Pointer<IBFEMethod> ibfe_ops = ib_ops;
+        ibfe_ops->initializeFEEquationSystems();
+        equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
+        coords_system_name = ibfe_ops->getCurrentCoordinatesSystemName();
+        velocity_system_name = ibfe_ops->getVelocitySystemName();
+        vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
+
+        IBFEMethod::PK1StressFcnData PK1_stress_data(
+            PK1_stress_function, std::vector<IBTK::SystemData>(), eel_data_ptr);
+        PK1_stress_data.quad_order =
+            Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_QUAD_ORDER", "THIRD"));
+        ibfe_ops->registerPK1StressFunction(PK1_stress_data);
+
+        IBFEMethod::LagBodyForceFcnData body_fcn_data(eel_body_force_function, sys_data, eel_data_ptr);
+        ibfe_ops->registerLagBodyForceFunction(body_fcn_data);
+
+        IBFEMethod::LagSurfaceForceFcnData surface_fcn_data(eel_surface_force_function, sys_data, eel_data_ptr);
+        ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
+
+        if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
         {
-            Pointer<IBFESurfaceMethod> ibfe_ops = ib_ops;
-            ibfe_ops->initializeFEEquationSystems();
-            equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
-            coords_system_name = IBFESurfaceMethod::COORDS_SYSTEM_NAME;
-            velocity_system_name = IBFESurfaceMethod::VELOCITY_SYSTEM_NAME;
-            vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
-            IBFESurfaceMethod::LagSurfaceForceFcnData surface_fcn_data(
-                eel_surface_force_function, sys_data, eel_data_ptr);
-            ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
-        }
-        else
-        {
-            Pointer<IBFEMethod> ibfe_ops = ib_ops;
-            ibfe_ops->initializeFEEquationSystems();
-            equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
-            coords_system_name = ibfe_ops->getCurrentCoordinatesSystemName();
-            velocity_system_name = ibfe_ops->getVelocitySystemName();
-            vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
-            
-            IBFEMethod::PK1StressFcnData PK1_stress_data(
-                PK1_stress_function, std::vector<IBTK::SystemData>(), eel_data_ptr);
-            PK1_stress_data.quad_order =
-                Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_QUAD_ORDER", "THIRD"));
-            ibfe_ops->registerPK1StressFunction(PK1_stress_data);
-
-            IBFEMethod::LagBodyForceFcnData body_fcn_data(eel_body_force_function, sys_data, eel_data_ptr);
-            ibfe_ops->registerLagBodyForceFunction(body_fcn_data);
-
-            IBFEMethod::LagSurfaceForceFcnData surface_fcn_data(eel_surface_force_function, sys_data, eel_data_ptr);
-            ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
-
-            if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
-            {
-                ibfe_ops->registerStressNormalizationPart();
-            }
+            ibfe_ops->registerStressNormalizationPart();
         }
 
         // Create Eulerian initial condition specification objects.
@@ -639,16 +601,7 @@ main(int argc, char* argv[])
         }
 
         // Initialize hierarchy configuration and data on all patches.
-        if (use_boundary_mesh)
-        {
-            Pointer<IBFESurfaceMethod> ibfe_ops = ib_ops;
-            ibfe_ops->initializeFEData();
-        }
-        else
-        {
-            Pointer<IBFEMethod> ibfe_ops = ib_ops;
-            ibfe_ops->initializeFEData();
-        }
+        ibfe_ops->initializeFEData();
         time_integrator->initializePatchHierarchy(patch_hierarchy, gridding_algorithm);
 
         compute_com_and_orientation(equation_systems, coords_system_name, mesh, eel_data.xcom_cur, eel_data.ycom_cur, eel_data.theta_cur);
@@ -748,15 +701,7 @@ main(int argc, char* argv[])
             {
                 pout << "\nWriting restart files...\n\n";
                 RestartManager::getManager()->writeRestartFile(restart_dump_dirname, iteration_num);
-                if (use_boundary_mesh)
-                {
-                    dynamic_cast<IBFESurfaceMethod&>(*ib_ops).writeFEDataToRestartFile(restart_dump_dirname,
-                                                                                       iteration_num);
-                }
-                else
-                {
-                    dynamic_cast<IBFEMethod&>(*ib_ops).writeFEDataToRestartFile(restart_dump_dirname, iteration_num);
-                }
+                dynamic_cast<IBFEMethod&>(*ib_ops).writeFEDataToRestartFile(restart_dump_dirname, iteration_num);
             }
             if (dump_timer_data && (iteration_num % timer_dump_interval == 0 || last_step))
             {
