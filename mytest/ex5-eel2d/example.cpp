@@ -757,7 +757,6 @@ postprocess_data(Pointer<Database> input_db,
                                           eel_data_ptr);
                     for (int d = 0; d < NDIM; ++d)
                     {
-                        pout << F(d) << endl;
                         F_integral[d] += F(d) * JxW_face[qp];
                     }
                 }
