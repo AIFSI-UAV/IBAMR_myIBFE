@@ -15,9 +15,9 @@
 include $(top_srcdir)/config/Make-rules
 	
 ## Dimension-dependent testers
-EXAMPLE_DRIVER = example.cpp
+EXAMPLE_DRIVER = eel2d_ibfe.cpp
 
-EXTRA_DIST = input2d input3d
+EXTRA_DIST = input2d input3d example.cpp eel2d_ibfe.cpp
 
 EXAMPLES =
 EXTRA_PROGRAMS =
