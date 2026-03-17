@@ -116,9 +116,15 @@ struct Eel2DData
     double x_leading;  // reference head x
     double y_center0;  // reference body center y
 
-    // 迁移方案开关：先做原地摆动，再可选开启向前平移
-    bool enable_forward_swim;
-    double forward_speed;
+    // 自由游动位姿（全局平移 + 转动），每步由当前网格几何更新
+    double xcom_cur;
+    double ycom_cur;
+    double theta_cur;
+
+    // 初始参考位姿：body frame 在该位姿下定义
+    double xcom_ref;
+    double ycom_ref;
+    double theta_ref;
 
     Eel2DData(Pointer<Database> input_db)
       : c1_s(input_db->getDouble("C1_S")),
@@ -133,8 +139,8 @@ struct Eel2DData
         k_wave(input_db->getDouble("EEL_KWAVE")),
         x_leading(input_db->getDouble("EEL_X_LEADING")),
         y_center0(input_db->getDouble("EEL_Y_CENTER0")),
-        enable_forward_swim(input_db->getBoolWithDefault("EEL_ENABLE_FORWARD_SWIM", false)),
-        forward_speed(input_db->getDoubleWithDefault("EEL_FORWARD_SPEED", 0.0))
+        xcom_cur(0.0), ycom_cur(0.0), theta_cur(0.0),
+        xcom_ref(0.0), ycom_ref(0.0), theta_ref(0.0)
     {}
 };
 
@@ -159,6 +165,70 @@ inline double eel_centerline_v(double s, double t, const Eel2DData& d)
     return -d.A * ((s + d.s_shift) / (d.L + d.s_shift))
          * d.omega * std::cos(d.k_wave * s - d.omega * t);
 }
+
+void compute_com_and_orientation(EquationSystems* equation_systems,
+                                 const std::string& coords_system_name,
+                                 MeshBase& mesh,
+                                 double& xcom,
+                                 double& ycom,
+                                 double& theta)
+{
+    System& X_system = equation_systems->get_system<System>(coords_system_name);
+    NumericVector<double>* X_vec = X_system.solution.get();
+    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+    const DofMap& dof_map = X_system.get_dof_map();
+
+    std::set<dof_id_type> visited_nodes;
+    double xsum = 0.0, ysum = 0.0;
+    int npts = 0;
+
+    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
+        {
+            const Node* node = elem->node_ptr(k);
+            if (!visited_nodes.insert(node->id()).second) continue;
+            std::vector<dof_id_type> dof_idx_x, dof_idx_y;
+            dof_map.dof_indices(node, dof_idx_x, 0);
+            dof_map.dof_indices(node, dof_idx_y, 1);
+            xsum += (*X_ghost_vec)(dof_idx_x[0]);
+            ysum += (*X_ghost_vec)(dof_idx_y[0]);
+            ++npts;
+        }
+    }
+
+    double local[3] = { xsum, ysum, static_cast<double>(npts) };
+    IBTK_MPI::sumReduction(local, 3);
+    xcom = local[0] / std::max(1.0, local[2]);
+    ycom = local[1] / std::max(1.0, local[2]);
+
+    double cxx = 0.0, cyy = 0.0, cxy = 0.0;
+    visited_nodes.clear();
+    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
+        {
+            const Node* node = elem->node_ptr(k);
+            if (!visited_nodes.insert(node->id()).second) continue;
+            std::vector<dof_id_type> dof_idx_x, dof_idx_y;
+            dof_map.dof_indices(node, dof_idx_x, 0);
+            dof_map.dof_indices(node, dof_idx_y, 1);
+            const double dx = (*X_ghost_vec)(dof_idx_x[0]) - xcom;
+            const double dy = (*X_ghost_vec)(dof_idx_y[0]) - ycom;
+            cxx += dx * dx;
+            cxy += dx * dy;
+            cyy += dy * dy;
+        }
+    }
+
+    double local_cov[3] = { cxx, cyy, cxy };
+    IBTK_MPI::sumReduction(local_cov, 3);
+    theta = 0.5 * std::atan2(2.0 * local_cov[2], local_cov[0] - local_cov[1]);
+}
+
 inline void compute_eel_target(
     const libMesh::Point& X,
     double time,
@@ -177,19 +247,24 @@ compute_eel_target(const libMesh::Point& X,
                    double& utar_x,
                    double& utar_y)
 {
-    // s 是材料坐标中的流向位置，摆动只在 y 方向添加波形。
+    // body-frame 形变：在参考构型中施加中心线摆动。
     const double s = X(0) - d.x_leading;
     const double yc = eel_centerline_y(s, time, d);
     const double vc = eel_centerline_v(s, time, d);
 
-    // 第一阶段：原地摆动（x 不动，仅 y 摆动）。
-    // 第二阶段：开启 enable_forward_swim 后，以常速 forward_speed 向前平移。
-    const double x_shift = d.enable_forward_swim ? d.forward_speed * time : 0.0;
+    // 参考位姿下 body-frame 坐标（含形变）
+    const double xb = X(0) - d.xcom_ref;
+    const double yb = (X(1) - d.ycom_ref) + yc;
 
-    xtar = X(0) + x_shift;
-    ytar = X(1) + yc;
-    utar_x = d.enable_forward_swim ? d.forward_speed : 0.0;
-    utar_y = vc;
+    // 当前自由位姿把 body-frame 映射到全局坐标
+    const double ct = std::cos(d.theta_cur);
+    const double st = std::sin(d.theta_cur);
+    xtar = d.xcom_cur + ct * xb - st * yb;
+    ytar = d.ycom_cur + st * xb + ct * yb;
+
+    // 仅保留形变诱导速度（全局平移/转动由流固耦合自然产生）
+    utar_x = -st * vc;
+    utar_y =  ct * vc;
 }
 
 // Tether (penalty) stress function.
@@ -261,7 +336,7 @@ eel_surface_force_function(VectorValue<double>& F,
 using namespace ModelData;
 
 // Function prototypes
-static ofstream drag_stream, lift_stream, U_L1_norm_stream, U_L2_norm_stream, U_max_norm_stream;
+static ofstream drag_stream, lift_stream, U_L1_norm_stream, U_L2_norm_stream, U_max_norm_stream, pose_stream;
 void postprocess_data(Pointer<Database> input_db,
                       Pointer<PatchHierarchy<NDIM> > patch_hierarchy,
                       Pointer<INSHierarchyIntegrator> navier_stokes_integrator,
@@ -413,10 +488,7 @@ main(int argc, char* argv[])
                                         load_balancer);
 
         // Configure the IBFE solver.
-        // 该版本是“第一版迁移”：
-        // 1) 仅保留体力罚项驱动目标位形；
-        // 2) 默认原地摆动；
-        // 3) 可通过输入参数切换为“摆动+匀速前进”。
+        // 自由游动版本：body-frame 规定形变，整体平移/转动由流固耦合自然产生。
         Eel2DData eel_data(input_db);
         void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
         EquationSystems* equation_systems;
@@ -510,6 +582,13 @@ main(int argc, char* argv[])
         ibfe_ops->initializeFEData();
         time_integrator->initializePatchHierarchy(patch_hierarchy, gridding_algorithm);
 
+        // 初始化参考位姿（body-frame 相对该位姿定义）。
+        compute_com_and_orientation(
+            equation_systems, coords_system_name, mesh, eel_data.xcom_cur, eel_data.ycom_cur, eel_data.theta_cur);
+        eel_data.xcom_ref = eel_data.xcom_cur;
+        eel_data.ycom_ref = eel_data.ycom_cur;
+        eel_data.theta_ref = eel_data.theta_cur;
+
         // Deallocate initialization objects.
         app_initializer.setNull();
 
@@ -544,12 +623,14 @@ main(int argc, char* argv[])
             U_L1_norm_stream.open("U_L1.curve", ios_base::out | ios_base::trunc);
             U_L2_norm_stream.open("U_L2.curve", ios_base::out | ios_base::trunc);
             U_max_norm_stream.open("U_max.curve", ios_base::out | ios_base::trunc);
+            pose_stream.open("pose.curve", ios_base::out | ios_base::trunc);
 
             drag_stream.precision(10);
             lift_stream.precision(10);
             U_L1_norm_stream.precision(10);
             U_L2_norm_stream.precision(10);
             U_max_norm_stream.precision(10);
+            pose_stream.precision(10);
         }
 
         // Main time step loop.
@@ -566,6 +647,11 @@ main(int argc, char* argv[])
             pout << "Simulation time is " << loop_time << "\n";
 
             dt = time_integrator->getMaximumTimeStepSize();
+
+            compute_com_and_orientation(
+                equation_systems, coords_system_name, mesh, eel_data.xcom_cur, eel_data.ycom_cur, eel_data.theta_cur);
+            pout << "Pose(COM/theta): (" << eel_data.xcom_cur << ", " << eel_data.ycom_cur << ", " << eel_data.theta_cur
+                 << ")\n";
 
             time_integrator->advanceHierarchy(dt);
             loop_time += dt;
@@ -629,6 +715,7 @@ main(int argc, char* argv[])
             U_L1_norm_stream.close();
             U_L2_norm_stream.close();
             U_max_norm_stream.close();
+            pose_stream.close();
         }
 
         // Cleanup Eulerian boundary condition specification objects (when
@@ -646,7 +733,7 @@ postprocess_data(Pointer<Database> input_db,
                  EquationSystems* equation_systems,
                  const std::string& coords_system_name,
                  const std::string& velocity_system_name,
-                 const int /*iteration_num*/,
+                 const int iteration_num,
                  const double loop_time,
                  const string& /*data_dump_dirname*/)
 {
@@ -814,6 +901,10 @@ postprocess_data(Pointer<Database> input_db,
         }
     }
     IBTK_MPI::sumReduction(F_integral, NDIM);
+
+    double xcom = 0.0, ycom = 0.0, theta = 0.0;
+    compute_com_and_orientation(equation_systems, coords_system_name, mesh, xcom, ycom, theta);
+
     static const double rho = 1.0;
     static const double U_max = 1.0;
     static const double D = 1.0;
@@ -821,6 +912,7 @@ postprocess_data(Pointer<Database> input_db,
     {
         drag_stream << loop_time << " " << -F_integral[0] / (0.5 * rho * U_max * U_max * D) << endl;
         lift_stream << loop_time << " " << -F_integral[1] / (0.5 * rho * U_max * U_max * D) << endl;
+        pose_stream << iteration_num << " " << loop_time << " " << xcom << " " << ycom << " " << theta << endl;
     }
     return;
 } // postprocess_data

@@ -17,8 +17,6 @@ EEL_KWAVE       = 6.283185307179586
 EEL_X_LEADING   = 0.0
 EEL_Y_CENTER0   = 0.0
 EEL_NUM_S_POINTS = 200
-EEL_ENABLE_FORWARD_SWIM = FALSE
-EEL_FORWARD_SPEED = 0.0
 // grid spacing parameters
 L = 16.0                                       // width of computational domain
 MAX_LEVELS = 6                                 // maximum number of levels in locally refined grid
