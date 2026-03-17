@@ -320,17 +320,17 @@ compute_eel_target(const libMesh::Point& X,
                    double& utar_x,
                    double& utar_y)
 {
-    // body-frame 形变：在参考构型中施加中心线摆动。
-    const double s = X(0) - d.x_leading;
-    const double yc = eel_centerline_y(s, time, d);
-    const double vc = eel_centerline_v(s, time, d);
-
     // 参考构型先旋转到 reference body frame（由 theta_ref 定义）
     const double dx_ref = X(0) - d.xcom_ref;
     const double dy_ref = X(1) - d.ycom_ref;
     const double cr = std::cos(d.theta_ref);
     const double sr = std::sin(d.theta_ref);
     const double xhat =  cr * dx_ref + sr * dy_ref;
+
+    // body-frame 形变：轴向坐标 s 使用 reference body frame 的 xhat。
+    const double s = xhat - (d.x_leading - d.xcom_ref);
+    const double yc = eel_centerline_y(s, time, d);
+    const double vc = eel_centerline_v(s, time, d);
     const double yhat = -sr * dx_ref + cr * dy_ref + yc;
 
     // 再由当前自由位姿映射回实验室坐标
@@ -988,8 +988,16 @@ postprocess_data(Pointer<Database> input_db,
     }
     IBTK_MPI::sumReduction(F_integral, NDIM);
 
+    static double theta_prev_post = std::numeric_limits<double>::quiet_NaN();
     double xcom = 0.0, ycom = 0.0, theta = 0.0;
-    compute_com_and_orientation(equation_systems, coords_system_name, mesh, xcom, ycom, theta);
+    compute_com_and_orientation(equation_systems,
+                                coords_system_name,
+                                mesh,
+                                xcom,
+                                ycom,
+                                theta,
+                                theta_prev_post);
+    theta_prev_post = theta;
     const double tail_y = compute_tail_y(equation_systems, coords_system_name, mesh);
 
     static const double rho = 1.0;
