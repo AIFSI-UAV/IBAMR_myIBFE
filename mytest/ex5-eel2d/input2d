@@ -65,7 +65,7 @@ ETA_S = 1.5*DX/DT
 // tether penalty data
 C1_S            = 1.0e3
 KAPPA_S_BODY    = 5.0e3
-ETA_S_BODY      = 1.0e2
+ETA_S_BODY      = 0.0
 KAPPA_S_SURFACE = 0.0
 ETA_S_SURFACE   = 0.0
 

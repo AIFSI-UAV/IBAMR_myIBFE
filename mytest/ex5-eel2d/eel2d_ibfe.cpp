@@ -145,6 +145,8 @@ struct Eel2DData
     {}
 };
 
+static Eel2DData* s_eel_data_state = nullptr;
+
 inline double body_half_width(double s, const Eel2DData& d)
 {
     const double width_head = 0.04 * d.L;
@@ -172,62 +174,81 @@ void compute_com_and_orientation(EquationSystems* equation_systems,
                                  MeshBase& mesh,
                                  double& xcom,
                                  double& ycom,
-                                 double& theta)
+                                 double& theta,
+                                 double theta_prev = std::numeric_limits<double>::quiet_NaN())
 {
+    const unsigned int dim = mesh.mesh_dimension();
     System& X_system = equation_systems->get_system<System>(coords_system_name);
     NumericVector<double>* X_vec = X_system.solution.get();
     NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
     copy_and_synch(*X_vec, *X_ghost_vec);
     const DofMap& dof_map = X_system.get_dof_map();
 
-    std::set<dof_id_type> visited_nodes;
-    double xsum = 0.0, ysum = 0.0;
-    int npts = 0;
+    std::vector<std::vector<unsigned int> > dof_indices(NDIM);
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, dof_map.variable_type(0)));
+    std::unique_ptr<QBase> qrule = QBase::build(QGAUSS, dim, THIRD);
+    fe->attach_quadrature_rule(qrule.get());
+    const vector<double>& JxW = fe->get_JxW();
+    const vector<vector<double> >& phi = fe->get_phi();
 
+    boost::multi_array<double, 2> X_node;
+    VectorValue<double> x;
+
+    double area = 0.0;
+    double mx = 0.0, my = 0.0;
     for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
     {
         const Elem* elem = *el_it;
-        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d) dof_map.dof_indices(elem, dof_indices[d], d);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+
+        const unsigned int n_qp = qrule->n_points();
+        for (unsigned int qp = 0; qp < n_qp; ++qp)
         {
-            const Node* node = elem->node_ptr(k);
-            if (!visited_nodes.insert(node->id()).second) continue;
-            std::vector<dof_id_type> dof_idx_x, dof_idx_y;
-            dof_map.dof_indices(node, dof_idx_x, 0);
-            dof_map.dof_indices(node, dof_idx_y, 1);
-            xsum += (*X_ghost_vec)(dof_idx_x[0]);
-            ysum += (*X_ghost_vec)(dof_idx_y[0]);
-            ++npts;
+            interpolate(x, qp, X_node, phi);
+            area += JxW[qp];
+            mx += x(0) * JxW[qp];
+            my += x(1) * JxW[qp];
         }
     }
 
-    double local[3] = { xsum, ysum, static_cast<double>(npts) };
-    IBTK_MPI::sumReduction(local, 3);
-    xcom = local[0] / std::max(1.0, local[2]);
-    ycom = local[1] / std::max(1.0, local[2]);
+    double local_first[3] = { area, mx, my };
+    IBTK_MPI::sumReduction(local_first, 3);
+    const double area_tot = std::max(local_first[0], std::numeric_limits<double>::epsilon());
+    xcom = local_first[1] / area_tot;
+    ycom = local_first[2] / area_tot;
 
     double cxx = 0.0, cyy = 0.0, cxy = 0.0;
-    visited_nodes.clear();
     for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
     {
         const Elem* elem = *el_it;
-        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d) dof_map.dof_indices(elem, dof_indices[d], d);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+
+        const unsigned int n_qp = qrule->n_points();
+        for (unsigned int qp = 0; qp < n_qp; ++qp)
         {
-            const Node* node = elem->node_ptr(k);
-            if (!visited_nodes.insert(node->id()).second) continue;
-            std::vector<dof_id_type> dof_idx_x, dof_idx_y;
-            dof_map.dof_indices(node, dof_idx_x, 0);
-            dof_map.dof_indices(node, dof_idx_y, 1);
-            const double dx = (*X_ghost_vec)(dof_idx_x[0]) - xcom;
-            const double dy = (*X_ghost_vec)(dof_idx_y[0]) - ycom;
-            cxx += dx * dx;
-            cxy += dx * dy;
-            cyy += dy * dy;
+            interpolate(x, qp, X_node, phi);
+            const double dx = x(0) - xcom;
+            const double dy = x(1) - ycom;
+            cxx += dx * dx * JxW[qp];
+            cxy += dx * dy * JxW[qp];
+            cyy += dy * dy * JxW[qp];
         }
     }
 
     double local_cov[3] = { cxx, cyy, cxy };
     IBTK_MPI::sumReduction(local_cov, 3);
     theta = 0.5 * std::atan2(2.0 * local_cov[2], local_cov[0] - local_cov[1]);
+
+    if (std::isfinite(theta_prev))
+    {
+        const double pi = 3.14159265358979323846;
+        while (theta - theta_prev > 0.5 * pi) theta -= pi;
+        while (theta - theta_prev < -0.5 * pi) theta += pi;
+    }
 }
 
 double compute_tail_y(EquationSystems* equation_systems,
@@ -304,17 +325,21 @@ compute_eel_target(const libMesh::Point& X,
     const double yc = eel_centerline_y(s, time, d);
     const double vc = eel_centerline_v(s, time, d);
 
-    // 参考位姿下 body-frame 坐标（含形变）
-    const double xb = X(0) - d.xcom_ref;
-    const double yb = (X(1) - d.ycom_ref) + yc;
+    // 参考构型先旋转到 reference body frame（由 theta_ref 定义）
+    const double dx_ref = X(0) - d.xcom_ref;
+    const double dy_ref = X(1) - d.ycom_ref;
+    const double cr = std::cos(d.theta_ref);
+    const double sr = std::sin(d.theta_ref);
+    const double xhat =  cr * dx_ref + sr * dy_ref;
+    const double yhat = -sr * dx_ref + cr * dy_ref + yc;
 
-    // 当前自由位姿把 body-frame 映射到全局坐标
+    // 再由当前自由位姿映射回实验室坐标
     const double ct = std::cos(d.theta_cur);
     const double st = std::sin(d.theta_cur);
-    xtar = d.xcom_cur + ct * xb - st * yb;
-    ytar = d.ycom_cur + st * xb + ct * yb;
+    xtar = d.xcom_cur + ct * xhat - st * yhat;
+    ytar = d.ycom_cur + st * xhat + ct * yhat;
 
-    // 仅保留形变诱导速度（全局平移/转动由流固耦合自然产生）
+    // 一阶近似：仅保留形变速度并映射到当前姿态方向
     utar_x = -st * vc;
     utar_y =  ct * vc;
 }
@@ -542,6 +567,7 @@ main(int argc, char* argv[])
         // Configure the IBFE solver.
         // 自由游动版本：body-frame 规定形变，整体平移/转动由流固耦合自然产生。
         Eel2DData eel_data(input_db);
+        s_eel_data_state = &eel_data;
         void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
         EquationSystems* equation_systems;
         std::string coords_system_name, velocity_system_name;
@@ -701,8 +727,14 @@ main(int argc, char* argv[])
 
             dt = time_integrator->getMaximumTimeStepSize();
 
-            compute_com_and_orientation(
-                equation_systems, coords_system_name, mesh, eel_data.xcom_cur, eel_data.ycom_cur, eel_data.theta_cur);
+            const double theta_prev = eel_data.theta_cur;
+            compute_com_and_orientation(equation_systems,
+                                        coords_system_name,
+                                        mesh,
+                                        eel_data.xcom_cur,
+                                        eel_data.ycom_cur,
+                                        eel_data.theta_cur,
+                                        theta_prev);
             pout << "Pose(COM/theta): (" << eel_data.xcom_cur << ", " << eel_data.ycom_cur << ", " << eel_data.theta_cur
                  << ")\n";
 
@@ -790,8 +822,9 @@ postprocess_data(Pointer<Database> input_db,
                  const double loop_time,
                  const string& /*data_dump_dirname*/)
 {
-    Eel2DData eel_data(input_db);
-    void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
+    Eel2DData eel_data_fallback(input_db);
+    Eel2DData* const eel_data = s_eel_data_state ? s_eel_data_state : &eel_data_fallback;
+    void* const eel_data_ptr = reinterpret_cast<void*>(eel_data);
     bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
     const unsigned int dim = mesh.mesh_dimension();
     double F_integral[NDIM];
