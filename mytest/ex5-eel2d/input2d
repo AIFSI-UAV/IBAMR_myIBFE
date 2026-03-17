@@ -17,6 +17,8 @@ EEL_KWAVE       = 6.283185307179586
 EEL_X_LEADING   = 0.0
 EEL_Y_CENTER0   = 0.0
 EEL_NUM_S_POINTS = 200
+EEL_ENABLE_FORWARD_SWIM = FALSE
+EEL_FORWARD_SPEED = 0.0
 // grid spacing parameters
 L = 16.0                                       // width of computational domain
 MAX_LEVELS = 6                                 // maximum number of levels in locally refined grid
@@ -47,7 +49,7 @@ CONVECTIVE_TS_TYPE         = "ADAMS_BASHFORTH" // convective time stepping type
 CONVECTIVE_OP_TYPE         = "PPM"             // convective differencing discretization type
 CONVECTIVE_FORM            = "ADVECTIVE"       // how to compute the convective terms
 NORMALIZE_PRESSURE         = FALSE             // whether to explicitly force the pressure to have mean zero
-ERROR_ON_DT_CHANGE         = TRUE              // whether to emit an error message if the time step size changes
+ERROR_ON_DT_CHANGE         = FALSE              // whether to emit an error message if the time step size changes
 VORTICITY_TAGGING          = TRUE              // whether to tag cells for refinement based on vorticity thresholds
 TAG_BUFFER                 = 1                 // size of tag buffer used by grid generation algorithm
 REGRID_CFL_INTERVAL        = 0.5               // regrid whenever any material point could have moved 0.5 meshwidths since previous regrid
@@ -66,8 +68,8 @@ ETA_S = 1.5*DX/DT
 C1_S            = 1.0e3
 KAPPA_S_BODY    = 1.0e4
 ETA_S_BODY      = 5.0e1
-KAPPA_S_SURFACE = 1.0e4
-ETA_S_SURFACE   = 5.0e1
+KAPPA_S_SURFACE = 0.0
+ETA_S_SURFACE   = 0.0
 
 // collocated solver parameters
 PROJECTION_METHOD_TYPE = "PRESSURE_UPDATE"
@@ -87,7 +89,7 @@ VelocityBcCoefs_0 {
    bcoef_function_2 = "1.0"
    bcoef_function_3 = "1.0"
 
-   gcoef_function_0 = "(tanh((t-t_half)/tau)+tanh(t_half/tau))/(1+tanh(t_half/tau))"
+   gcoef_function_0 = "0.0"
    gcoef_function_1 = "0.0"
    gcoef_function_2 = "0.0"
    gcoef_function_3 = "0.0"
@@ -104,7 +106,7 @@ VelocityBcCoefs_1 {
    bcoef_function_2 = "0.0"
    bcoef_function_3 = "0.0"
 
-   gcoef_function_0 = "cos(pi*X_1/16.0)*exp(-2.0*t)"
+   gcoef_function_0 = "0.0"
    gcoef_function_1 = "0.0"
    gcoef_function_2 = "0.0"
    gcoef_function_3 = "0.0"
