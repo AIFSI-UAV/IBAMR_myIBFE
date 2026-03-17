@@ -46,6 +46,7 @@
 
 #include <boost/multi_array.hpp>
 #include <set>
+#include <limits>
 
 // Set up application namespace declarations
 #include <ibamr/app_namespaces.h>
@@ -227,6 +228,57 @@ void compute_com_and_orientation(EquationSystems* equation_systems,
     double local_cov[3] = { cxx, cyy, cxy };
     IBTK_MPI::sumReduction(local_cov, 3);
     theta = 0.5 * std::atan2(2.0 * local_cov[2], local_cov[0] - local_cov[1]);
+}
+
+double compute_tail_y(EquationSystems* equation_systems,
+                      const std::string& coords_system_name,
+                      MeshBase& mesh)
+{
+    System& X_system = equation_systems->get_system<System>(coords_system_name);
+    NumericVector<double>* X_vec = X_system.solution.get();
+    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+    const DofMap& dof_map = X_system.get_dof_map();
+
+    std::set<dof_id_type> visited_nodes;
+    double local_xmax = -std::numeric_limits<double>::max();
+
+    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
+        {
+            const Node* node = elem->node_ptr(k);
+            if (!visited_nodes.insert(node->id()).second) continue;
+            local_xmax = std::max(local_xmax, (*node)(0));
+        }
+    }
+
+    double x_tail = local_xmax;
+    IBTK_MPI::maxReduction(x_tail);
+
+    const double tol = 1.0e-10 * std::max(1.0, std::abs(x_tail));
+    visited_nodes.clear();
+    double ysum = 0.0;
+    double nsum = 0.0;
+    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
+        {
+            const Node* node = elem->node_ptr(k);
+            if (!visited_nodes.insert(node->id()).second) continue;
+            if (std::abs((*node)(0) - x_tail) > tol) continue;
+            std::vector<dof_id_type> dof_idx_y;
+            dof_map.dof_indices(node, dof_idx_y, 1);
+            ysum += (*X_ghost_vec)(dof_idx_y[0]);
+            nsum += 1.0;
+        }
+    }
+
+    double local[2] = { ysum, nsum };
+    IBTK_MPI::sumReduction(local, 2);
+    return local[0] / std::max(1.0, local[1]);
 }
 
 inline void compute_eel_target(
@@ -631,6 +683,7 @@ main(int argc, char* argv[])
             U_L2_norm_stream.precision(10);
             U_max_norm_stream.precision(10);
             pose_stream.precision(10);
+            pose_stream << "# iter time x_com y_com theta tail_y" << endl;
         }
 
         // Main time step loop.
@@ -904,6 +957,7 @@ postprocess_data(Pointer<Database> input_db,
 
     double xcom = 0.0, ycom = 0.0, theta = 0.0;
     compute_com_and_orientation(equation_systems, coords_system_name, mesh, xcom, ycom, theta);
+    const double tail_y = compute_tail_y(equation_systems, coords_system_name, mesh);
 
     static const double rho = 1.0;
     static const double U_max = 1.0;
@@ -912,7 +966,7 @@ postprocess_data(Pointer<Database> input_db,
     {
         drag_stream << loop_time << " " << -F_integral[0] / (0.5 * rho * U_max * U_max * D) << endl;
         lift_stream << loop_time << " " << -F_integral[1] / (0.5 * rho * U_max * U_max * D) << endl;
-        pose_stream << iteration_num << " " << loop_time << " " << xcom << " " << ycom << " " << theta << endl;
+        pose_stream << iteration_num << " " << loop_time << " " << xcom << " " << ycom << " " << theta << " " << tail_y << endl;
     }
     return;
 } // postprocess_data

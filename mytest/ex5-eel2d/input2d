@@ -47,7 +47,7 @@ CONVECTIVE_TS_TYPE         = "ADAMS_BASHFORTH" // convective time stepping type
 CONVECTIVE_OP_TYPE         = "PPM"             // convective differencing discretization type
 CONVECTIVE_FORM            = "ADVECTIVE"       // how to compute the convective terms
 NORMALIZE_PRESSURE         = FALSE             // whether to explicitly force the pressure to have mean zero
-ERROR_ON_DT_CHANGE         = TRUE              // whether to emit an error message if the time step size changes
+ERROR_ON_DT_CHANGE         = FALSE              // whether to emit an error message if the time step size changes
 VORTICITY_TAGGING          = TRUE              // whether to tag cells for refinement based on vorticity thresholds
 TAG_BUFFER                 = 1                 // size of tag buffer used by grid generation algorithm
 REGRID_CFL_INTERVAL        = 0.5               // regrid whenever any material point could have moved 0.5 meshwidths since previous regrid
@@ -64,8 +64,8 @@ ETA_S = 1.5*DX/DT
 
 // tether penalty data
 C1_S            = 1.0e3
-KAPPA_S_BODY    = 1.0e4
-ETA_S_BODY      = 5.0e1
+KAPPA_S_BODY    = 5.0e3
+ETA_S_BODY      = 1.0e2
 KAPPA_S_SURFACE = 0.0
 ETA_S_SURFACE   = 0.0
 
