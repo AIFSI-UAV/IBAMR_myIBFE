@@ -265,66 +265,49 @@ double compute_tail_y(EquationSystems* equation_systems,
     const double cr = std::cos(d.theta_ref);
     const double sr = std::sin(d.theta_ref);
 
-    std::set<dof_id_type> visited_nodes;
-
     // ------------------------------------------------------------
-    // Pass 1: 在 reference body frame 中找到尾端的最大轴向坐标 xhat_tail
+    // Pass 1: 仅遍历本 rank 拥有的 local nodes，找 reference body frame
+    //         中最靠后的尾端轴向坐标 xhat_tail
     // ------------------------------------------------------------
     double local_xhat_max = -std::numeric_limits<double>::max();
 
-    for (auto el_it = mesh.active_local_elements_begin();
-         el_it != mesh.active_local_elements_end();
-         ++el_it)
+    for (const Node* node : mesh.local_node_ptr_range())
     {
-        const Elem* elem = *el_it;
-        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
-        {
-            const Node* node = elem->node_ptr(k);
-            if (!visited_nodes.insert(node->id()).second) continue;
+        if (!node) continue;
 
-            // 参考构型点 -> reference body frame
-            const double dx_ref = (*node)(0) - d.xcom_ref;
-            const double dy_ref = (*node)(1) - d.ycom_ref;
-            const double xhat_ref = cr * dx_ref + sr * dy_ref;
+        const double dx_ref = (*node)(0) - d.xcom_ref;
+        const double dy_ref = (*node)(1) - d.ycom_ref;
+        const double xhat_ref = cr * dx_ref + sr * dy_ref;
 
-            local_xhat_max = std::max(local_xhat_max, xhat_ref);
-        }
+        local_xhat_max = std::max(local_xhat_max, xhat_ref);
     }
 
     double xhat_tail = local_xhat_max;
     IBTK_MPI::maxReduction(xhat_tail);
 
     // ------------------------------------------------------------
-    // Pass 2: 选取 reference body frame 中 xhat_ref ≈ xhat_tail 的尾端节点，
-    //         再读取这些节点当前的 y 坐标并求平均
+    // Pass 2: 再遍历 owner local nodes，挑出 xhat_ref ≈ xhat_tail 的尾端节点，
+    //         读取这些节点当前 y 坐标并求平均
     // ------------------------------------------------------------
     const double tol = 1.0e-10 * std::max(1.0, std::abs(xhat_tail));
 
-    visited_nodes.clear();
     double ysum = 0.0;
     double nsum = 0.0;
 
-    for (auto el_it = mesh.active_local_elements_begin();
-         el_it != mesh.active_local_elements_end();
-         ++el_it)
+    for (const Node* node : mesh.local_node_ptr_range())
     {
-        const Elem* elem = *el_it;
-        for (unsigned int k = 0; k < elem->n_nodes(); ++k)
-        {
-            const Node* node = elem->node_ptr(k);
-            if (!visited_nodes.insert(node->id()).second) continue;
+        if (!node) continue;
 
-            const double dx_ref = (*node)(0) - d.xcom_ref;
-            const double dy_ref = (*node)(1) - d.ycom_ref;
-            const double xhat_ref = cr * dx_ref + sr * dy_ref;
+        const double dx_ref = (*node)(0) - d.xcom_ref;
+        const double dy_ref = (*node)(1) - d.ycom_ref;
+        const double xhat_ref = cr * dx_ref + sr * dy_ref;
 
-            if (std::abs(xhat_ref - xhat_tail) > tol) continue;
+        if (std::abs(xhat_ref - xhat_tail) > tol) continue;
 
-            std::vector<dof_id_type> dof_idx_y;
-            dof_map.dof_indices(node, dof_idx_y, 1); // variable 1 = y
-            ysum += (*X_ghost_vec)(dof_idx_y[0]);
-            nsum += 1.0;
-        }
+        std::vector<dof_id_type> dof_idx_y;
+        dof_map.dof_indices(node, dof_idx_y, 1); // variable 1 = y
+        ysum += (*X_ghost_vec)(dof_idx_y[0]);
+        nsum += 1.0;
     }
 
     double local_vals[2] = { ysum, nsum };
@@ -332,7 +315,7 @@ double compute_tail_y(EquationSystems* equation_systems,
 
     if (local_vals[1] < 0.5)
     {
-        TBOX_WARNING("compute_tail_y(): no tail nodes found in reference body frame selection.\n");
+        TBOX_WARNING("compute_tail_y(): no owned tail nodes found.\n");
         return std::numeric_limits<double>::quiet_NaN();
     }
 
@@ -357,26 +340,57 @@ compute_eel_target(const libMesh::Point& X,
                    double& utar_x,
                    double& utar_y)
 {
-    // 参考构型先旋转到 reference body frame（由 theta_ref 定义）
+    // ------------------------------------------------------------
+    // 1) 参考构型中的当前材料点，先转换到 reference body frame
+    //    theta_ref 定义参考 body frame 相对于实验室坐标的姿态。
+    // ------------------------------------------------------------
     const double dx_ref = X(0) - d.xcom_ref;
     const double dy_ref = X(1) - d.ycom_ref;
+
     const double cr = std::cos(d.theta_ref);
     const double sr = std::sin(d.theta_ref);
-    const double xhat =  cr * dx_ref + sr * dy_ref;
 
-    // body-frame 形变：轴向坐标 s 使用 reference body frame 的 xhat。
-    const double s = xhat - (d.x_leading - d.xcom_ref);
+    // reference body-frame coordinates of the material point
+    const double xhat_ref =  cr * dx_ref + sr * dy_ref;
+    const double yhat_ref = -sr * dx_ref + cr * dy_ref;
+
+    // ------------------------------------------------------------
+    // 2) 参考头部点（leading point）也转换到 reference body frame
+    //    用它来定义真正一致的轴向坐标 s
+    // ------------------------------------------------------------
+    const double dx_lead = d.x_leading - d.xcom_ref;
+    const double dy_lead = d.y_center0 - d.ycom_ref;
+
+    const double xhat_leading =  cr * dx_lead + sr * dy_lead;
+    // const double yhat_leading = -sr * dx_lead + cr * dy_lead; // 若后续需要可保留
+
+    // body-frame axial coordinate measured from the leading point
+    const double s = xhat_ref - xhat_leading;
+
+    // ------------------------------------------------------------
+    // 3) 在 reference body frame 中施加 eel 的横向行波形变
+    // ------------------------------------------------------------
     const double yc = eel_centerline_y(s, time, d);
     const double vc = eel_centerline_v(s, time, d);
-    const double yhat = -sr * dx_ref + cr * dy_ref + yc;
 
-    // 再由当前自由位姿映射回实验室坐标
+    // body-frame target point after deformation
+    const double xhat_tar = xhat_ref;
+    const double yhat_tar = yhat_ref + yc;
+
+    // ------------------------------------------------------------
+    // 4) 再用当前自由位姿映射回实验室坐标
+    // ------------------------------------------------------------
     const double ct = std::cos(d.theta_cur);
     const double st = std::sin(d.theta_cur);
-    xtar = d.xcom_cur + ct * xhat - st * yhat;
-    ytar = d.ycom_cur + st * xhat + ct * yhat;
 
-    // 一阶近似：仅保留形变速度并映射到当前姿态方向
+    xtar = d.xcom_cur + ct * xhat_tar - st * yhat_tar;
+    ytar = d.ycom_cur + st * xhat_tar + ct * yhat_tar;
+
+    // ------------------------------------------------------------
+    // 5) 目标速度：当前仍采用一阶近似，
+    //    仅保留形变速度在当前姿态下的映射。
+    //    若以后启用较大的 ETA_S_BODY，需要再补充刚体平移/转动速度项。
+    // ------------------------------------------------------------
     utar_x = -st * vc;
     utar_y =  ct * vc;
 }
@@ -1035,7 +1049,7 @@ postprocess_data(Pointer<Database> input_db,
                                 theta,
                                 theta_prev_post);
     theta_prev_post = theta;
-    const double tail_y = compute_tail_y(equation_systems, coords_system_name, mesh, eel_data);
+    const double tail_y = compute_tail_y(equation_systems, coords_system_name, mesh, *eel_data);
 
     static const double rho = 1.0;
     static const double U_max = 1.0;
