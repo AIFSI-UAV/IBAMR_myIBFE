@@ -14,7 +14,7 @@ MAPPING_SHIFT_Z = 0.5   // 3D 时再启用
 
 // --- muscle activation ---
 USE_MUSCLE = TRUE
-MUSCLE_T_MAX = 5000.0          // 先小后大（应力单位与流固一致）
+MUSCLE_T_MAX = 1.0          // 先小后大（应力单位与流固一致）
 MUSCLE_F = 2.0                 // 频率
 MUSCLE_LAMBDA_OVER_L = 1.0     // 一条波长覆盖全身（按目标文献改）
 MUSCLE_PHASE0 = 0.0
@@ -27,7 +27,8 @@ MUSCLE_XI_END   = 0.85
 MUSCLE_EPS_XI   = 0.02
 
 // left/right split in reference y
-MUSCLE_Y_SPLIT = 2.0
+MUSCLE_SPLIT_AXIS  = 2        // 0:x 1:y 2:z
+MUSCLE_SPLIT_VALUE = 0.25      // mid-plane z=0
 MUSCLE_HALF_WAVE = TRUE
 MUSCLE_POWER = 2.0
 
@@ -97,20 +98,20 @@ VelocityBcCoefs_0 {
   gcoef_function_1 = "0.0"
 
   // walls
-  acoef_function_2 = "1.0"
-  bcoef_function_2 = "0.0"
+  acoef_function_2 = "0.0"
+  bcoef_function_2 = "1.0"
   gcoef_function_2 = "0.0"
   
-  acoef_function_3 = "1.0"
-  bcoef_function_3 = "0.0"
+  acoef_function_3 = "0.0"
+  bcoef_function_3 = "1.0"
   gcoef_function_3 = "0.0"
   
-  acoef_function_4 = "1.0"
-  bcoef_function_4 = "0.0"
+  acoef_function_4 = "0.0"
+  bcoef_function_4 = "1.0"
   gcoef_function_4 = "0.0"
   
-  acoef_function_5 = "1.0"
-  bcoef_function_5 = "0.0"
+  acoef_function_5 = "0.0"
+  bcoef_function_5 = "1.0"
   gcoef_function_5 = "0.0"
 }
 
@@ -132,11 +133,11 @@ VelocityBcCoefs_1 {
   bcoef_function_3="0.0"
   gcoef_function_3="0.0"
  // z faces: slip
-  acoef_function_4="1.0"
-  bcoef_function_4="0.0"
+  acoef_function_4="0.0"
+  bcoef_function_4="1.0"
   gcoef_function_4="0.0"
-  acoef_function_5="1.0"
-  bcoef_function_5="0.0"
+  acoef_function_5="0.0"
+  bcoef_function_5="1.0"
   gcoef_function_5="0.0"
 }
 
@@ -151,11 +152,11 @@ VelocityBcCoefs_2 {
   bcoef_function_1="1.0"
   gcoef_function_1="0.0"
  // y faces: slip
-  acoef_function_2="1.0"
-  bcoef_function_2="0.0"
+  acoef_function_2="0.0"
+  bcoef_function_2="1.0"
   gcoef_function_2="0.0"
-  acoef_function_3="1.0"
-  bcoef_function_3="0.0"
+  acoef_function_3="0.0"
+  bcoef_function_3="1.0"
   gcoef_function_3="0.0"
 // z_lo/z_hi: w=0 (normal component)
   acoef_function_4="1.0"

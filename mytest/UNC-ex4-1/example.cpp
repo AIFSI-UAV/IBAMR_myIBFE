@@ -56,41 +56,30 @@ static double kappa_s = 1.0e6;
 static double c1_s = 0.05;
 static double p0_s = 0.0;
 static double beta_s = 0.0;
+static const VectorValue<double> f_0(-1.0, 0.0);
 
-void 
-target_force_function(libMesh::VectorValue<double>& F,
-                           const libMesh::TensorValue<double>& /*FF*/,
-                           const libMesh::Point& x,
-                           const libMesh::Point& X,
-                           libMesh::Elem* const /*elem*/,
-                           const std::vector<const std::vector<double>*>& /*system_var_data*/,
-                           const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*system_grad_var_data*/,
-                           double time,
-                           void* /*ctx*/)
+void
+active_stress_function(
+                        TensorValue<double>& PP,
+                        const TensorValue<double>& FF,
+                        const libMesh::Point& /*x*/,   // current coordinate
+                        const libMesh::Point& X,       // reference coordinate
+                        Elem* const /*elem*/,
+                        const std::vector<const std::vector<double>*>& /*var_data*/,
+                        const std::vector<const std::vector<VectorValue<double>>*>& /*grad_var_data*/,
+                        double time,
+                        void* /*ctx*/)
 {
-
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
-
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
-
-    const double c = std::cos(theta);
-    const double s = std::sin(theta);
-
-    // reference vector relative to pivot
-    const double dX0 = X(0) - Xc0;
-    const double dX1 = X(1) - Xc1;
-
-    libMesh::Point X_target;
-    X_target(0) = Xc0 + c * dX0 - s * dX1;
-    X_target(1) = Xc1 + s * dX0 + c * dX1;
-
-    F = kappa_s * (X_target - x);
+	// T is the magnitude of tension. Varies in space and time. 40 is the maximum.
+	//This is set up as a traveling Gaussian wave.
+	// X(0) gives the x-position of the reference configuration.
+		double t_cycle=time-floor(time);
+		double T = 40*exp(-(X(0)-(t_cycle-.5))*(X(0)-(t_cycle-.5))/(.1*.1));
+		double J = FF.det();
+		TensorValue<double> f_f;
+		outer_product(f_f,f_0,f_0);
+  
+          PP = J*T*FF*f_f;
 }
 
 
@@ -204,7 +193,7 @@ main(int argc, char* argv[])
             const double dx = input_db->getDouble("DX");
             const double ds = input_db->getDouble("MFAC")*dx;
         string elem_type = input_db->getString("ELEM_TYPE");
-        mesh.read("triangle1.msh");
+        mesh.read("IBFE_Mesh2D_128.mat");
 
         mesh.prepare_for_use();
         
@@ -271,15 +260,18 @@ main(int argc, char* argv[])
         // Configure the IBFE solver.
         IBFEMethod::PK1StressFcnData PK1_dev_stress_data(PK1_dev_stress_function);
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
-        IBFEMethod::LagBodyForceFcnData target_force_data(target_force_function);   // target force function
+        IBFEMethod::PK1StressFcnData active_stress_data(active_stress_function);   
 
         PK1_dev_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
+        active_stress_data.quad_order =
+            Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("ACTIVE_QUAD_ORDER", "THIRD"));
+
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
-        ib_method_ops->registerLagBodyForceFunction(target_force_data);         // Configure target forces.
+        ib_method_ops->registerPK1StressFunction(active_stress_data);         
         
         ib_method_ops->initializeFEEquationSystems();
 

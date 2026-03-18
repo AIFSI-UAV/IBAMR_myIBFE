@@ -56,40 +56,84 @@ static double kappa_s = 1.0e6;
 static double c1_s = 0.05;
 static double p0_s = 0.0;
 static double beta_s = 0.0;
+static const VectorValue<double> f_0(-1.0, 0.0);
 
-void 
-target_force_function(libMesh::VectorValue<double>& F,
+void target_force_function(libMesh::VectorValue<double>& F,
                            const libMesh::TensorValue<double>& /*FF*/,
-                           const libMesh::Point& x,
-                           const libMesh::Point& X,
+                           const libMesh::Point& x,   // current position
+                           const libMesh::Point& X,   // reference position
                            libMesh::Elem* const /*elem*/,
                            const std::vector<const std::vector<double>*>& /*system_var_data*/,
-                           const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*system_grad_var_data*/,
+                           const std::vector<const std::vector<libMesh::VectorValue<double>>*>& /*system_grad_var_data*/,
                            double time,
                            void* /*ctx*/)
 {
+    // --------------------------------------------------
+    // 1. Reference point on the body (in reference coordinates)
+    //    Choose this carefully: center, leading edge, hinge point, etc.
+    // --------------------------------------------------
+    const double Xref0 = 0.0;
+    const double Xref1 = 0.0;
 
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
+    double ramp = 1.0;
+    const double t_ramp = 0.2;
+    if (time < t_ramp)
+    {
+        ramp = 0.5 * (1.0 - std::cos(M_PI * time / t_ramp));
+    }
+    // --------------------------------------------------
+    // 2. Prescribed path of the reference point
+    //    Example here: circular path
+    //
+    //    x_c(t) = Rc cos(omega t)
+    //    y_c(t) = Rc sin(omega t)
+    // --------------------------------------------------
+    //const double Rc = 0.5;     // path radius
+    //const double omega = 1.0;  // angular speed
+    const double U = 0.1;
+    const double A = 0.1;
+    const double omega = 2.0 * M_PI;
 
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
+    //const double xc0 = Rc * std::cos(omega * time);
+    //const double xc1 = Rc * std::sin(omega * time);
+    const double xc0 = ramp * U * time;
+    const double xc1 = ramp * A * std::sin(omega * time);
+
+    // --------------------------------------------------
+    // 3. Tangent velocity of the path
+    //    dx_c/dt, dy_c/dt
+    // --------------------------------------------------
+    // const double vx = -Rc * omega * std::sin(omega * time);
+    // const double vy =  Rc * omega * std::cos(omega * time);
+    const double vx = ramp * U;
+    const double vy = A * omega * std::cos(omega * time);
+
+
+    // --------------------------------------------------
+    // 4. Heading angle follows tangent direction
+    // --------------------------------------------------
+    const double theta = std::atan2(vy, vx);
 
     const double c = std::cos(theta);
     const double s = std::sin(theta);
 
-    // reference vector relative to pivot
-    const double dX0 = X(0) - Xc0;
-    const double dX1 = X(1) - Xc1;
+    // --------------------------------------------------
+    // 5. Relative position in reference configuration
+    // --------------------------------------------------
+    const double dX0 = X(0) - Xref0;
+    const double dX1 = X(1) - Xref1;
 
+    // --------------------------------------------------
+    // 6. Rigid-body target position
+    //    X_target = x_c(t) + R(theta) * (X - X_ref)
+    // --------------------------------------------------
     libMesh::Point X_target;
-    X_target(0) = Xc0 + c * dX0 - s * dX1;
-    X_target(1) = Xc1 + s * dX0 + c * dX1;
+    X_target(0) = xc0 + c * dX0 - s * dX1;
+    X_target(1) = xc1 + s * dX0 + c * dX1;
 
+    // --------------------------------------------------
+    // 7. Tether force
+    // --------------------------------------------------
     F = kappa_s * (X_target - x);
 }
 
@@ -204,7 +248,7 @@ main(int argc, char* argv[])
             const double dx = input_db->getDouble("DX");
             const double ds = input_db->getDouble("MFAC")*dx;
         string elem_type = input_db->getString("ELEM_TYPE");
-        mesh.read("triangle1.msh");
+        mesh.read("IBFE_Mesh2D_128.mat");
 
         mesh.prepare_for_use();
         
@@ -271,15 +315,20 @@ main(int argc, char* argv[])
         // Configure the IBFE solver.
         IBFEMethod::PK1StressFcnData PK1_dev_stress_data(PK1_dev_stress_function);
         IBFEMethod::PK1StressFcnData PK1_dil_stress_data(PK1_dil_stress_function);
-        IBFEMethod::LagBodyForceFcnData target_force_data(target_force_function);   // target force function
+        // IBFEMethod::PK1StressFcnData active_stress_data(active_stress_function);
+        IBFEMethod::LagBodyForceFcnData target_force_data(target_force_function);      
 
         PK1_dev_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
         PK1_dil_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIRST"));
+        // active_stress_data.quad_order =
+        //     Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("ACTIVE_QUAD_ORDER", "THIRD"));
+
         ib_method_ops->registerPK1StressFunction(PK1_dev_stress_data);
         ib_method_ops->registerPK1StressFunction(PK1_dil_stress_data);
-        ib_method_ops->registerLagBodyForceFunction(target_force_data);         // Configure target forces.
+        // ib_method_ops->registerPK1StressFunction(active_stress_data);
+        ib_method_ops->registerLagBodyForceFunction(target_force_data);          
         
         ib_method_ops->initializeFEEquationSystems();
 

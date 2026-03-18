@@ -68,28 +68,54 @@ target_force_function(libMesh::VectorValue<double>& F,
                            double time,
                            void* /*ctx*/)
 {
+    // --------------------------------------------------
+    // Reference rotation point X_ref (in reference coordinates)
+    // Example: quarter-chord point or hinge point
+    // --------------------------------------------------
+    const double Xref0 = 0.25;   // x-coordinate of rotation reference point
+    const double Xref1 = 0.0;    // y-coordinate of rotation reference point
 
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
+    // --------------------------------------------------
+    // Heave motion: translation of the reference point
+    // Example: sinusoidal motion in y
+    // --------------------------------------------------
+    const double Ah = 0.1;       // heave amplitude
+    const double fh = 1.0;       // heave frequency
+    const double omegah = 2.0 * M_PI * fh;
+    const double phih = 0.0;     // heave phase
 
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
+    const double xc0 = Xref0;    // no x-translation in this example
+    const double xc1 = Xref1 + Ah * std::sin(omegah * time + phih);
+
+    // --------------------------------------------------
+    // Pitch motion: rotation angle
+    // --------------------------------------------------
+    const double theta0 = 15.0 * M_PI / 180.0;   // pitch amplitude (15 deg)
+    const double fp = 1.0;                       // pitch frequency
+    const double omegap = 2.0 * M_PI * fp;
+    const double phip = 0.5 * M_PI;             // phase difference w.r.t. heave
+
+    const double theta = theta0 * std::sin(omegap * time + phip);
 
     const double c = std::cos(theta);
     const double s = std::sin(theta);
 
-    // reference vector relative to pivot
-    const double dX0 = X(0) - Xc0;
-    const double dX1 = X(1) - Xc1;
+    // --------------------------------------------------
+    // Relative position in reference configuration
+    // --------------------------------------------------
+    const double dX0 = X(0) - Xref0;
+    const double dX1 = X(1) - Xref1;
 
+    // --------------------------------------------------
+    // Target position = translated pivot + rotated relative vector
+    // --------------------------------------------------
     libMesh::Point X_target;
-    X_target(0) = Xc0 + c * dX0 - s * dX1;
-    X_target(1) = Xc1 + s * dX0 + c * dX1;
+    X_target(0) = xc0 + c * dX0 - s * dX1;
+    X_target(1) = xc1 + s * dX0 + c * dX1;
 
+    // --------------------------------------------------
+    // Tether force
+    // --------------------------------------------------
     F = kappa_s * (X_target - x);
 }
 

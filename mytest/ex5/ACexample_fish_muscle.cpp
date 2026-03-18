@@ -271,7 +271,7 @@ void PK1_muscle_stress_function(TensorValue<double>& PP,
     if (act <= 0.0) return;
 
     const double ramp = ramp_factor(time, m.ramp_time);
-    
+    //const double Tact = m.T_max * act * m_space * ramp;
     const double amp = 1.0 + (m.amp_tail - 1.0) * xi;   // head=1, tail=amp_tail
     const double Tact = m.T_max * amp * act * m_space * ramp;
 

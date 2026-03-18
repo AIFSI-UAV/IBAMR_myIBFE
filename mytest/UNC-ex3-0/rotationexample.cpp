@@ -59,7 +59,7 @@ static double beta_s = 0.0;
 
 void 
 target_force_function(libMesh::VectorValue<double>& F,
-                           const libMesh::TensorValue<double>& /*FF*/,
+                           const libMesh::TensorValue<double>& FF,
                            const libMesh::Point& x,
                            const libMesh::Point& X,
                            libMesh::Elem* const /*elem*/,
@@ -68,28 +68,52 @@ target_force_function(libMesh::VectorValue<double>& F,
                            double time,
                            void* /*ctx*/)
 {
+    // --------------------------------------------------
+    // Reference point in the body
+    // --------------------------------------------------
+    const double Xref0 = 0.25;
+    const double Xref1 = 0.0;
 
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
+    // --------------------------------------------------
+    // Circular trajectory of the reference point
+    // x_c(t) = (xc(t), yc(t))
+    // --------------------------------------------------
+    const double Rc = 0.5;      // circle radius
+    const double omega = 1.0;   // angular speed of path motion
 
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
+    const double xc0 = Rc * std::cos(omega * time);
+    const double xc1 = Rc * std::sin(omega * time);
+
+    // --------------------------------------------------
+    // Tangent direction of the path
+    // dx/dt = -Rc*omega*sin(omega t)
+    // dy/dt =  Rc*omega*cos(omega t)
+    // Heading angle follows tangent
+    // --------------------------------------------------
+    const double vx = -Rc * omega * std::sin(omega * time);
+    const double vy =  Rc * omega * std::cos(omega * time);
+
+    const double theta = std::atan2(vy, vx);
 
     const double c = std::cos(theta);
     const double s = std::sin(theta);
 
-    // reference vector relative to pivot
-    const double dX0 = X(0) - Xc0;
-    const double dX1 = X(1) - Xc1;
+    // --------------------------------------------------
+    // Relative position in reference configuration
+    // --------------------------------------------------
+    const double dX0 = X(0) - Xref0;
+    const double dX1 = X(1) - Xref1;
 
+    // --------------------------------------------------
+    // Target position
+    // --------------------------------------------------
     libMesh::Point X_target;
-    X_target(0) = Xc0 + c * dX0 - s * dX1;
-    X_target(1) = Xc1 + s * dX0 + c * dX1;
+    X_target(0) = xc0 + c * dX0 - s * dX1;
+    X_target(1) = xc1 + s * dX0 + c * dX1;
 
+    // --------------------------------------------------
+    // Tether force
+    // --------------------------------------------------
     F = kappa_s * (X_target - x);
 }
 

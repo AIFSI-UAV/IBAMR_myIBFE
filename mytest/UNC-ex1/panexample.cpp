@@ -195,17 +195,21 @@ main(int argc, char* argv[])
         // Note that boundary condition data must be registered with each FE
         // system before calling IBFEMethod::initializeFEData().
         Mesh mesh(init.comm(), NDIM);
+        //Mesh mesh(NDIM);
+            const double dx = input_db->getDouble("DX");
+            const double ds = input_db->getDouble("MFAC")*dx;
+        string elem_type = input_db->getString("ELEM_TYPE");
+        mesh.read("triangle1.msh");
 
-        const std::string mesh_filename =
-            input_db->getStringWithDefault("MESH_FILENAME", "triangle.msh");
-
-        // 直接读入 Gmsh 网格
-        mesh.read(mesh_filename);
         mesh.prepare_for_use();
+        
+        pout << "mesh_dimension=" << mesh.mesh_dimension()
+        << ", spatial_dimension=" << mesh.spatial_dimension() << "\n";
 
         c1_s = input_db->getDouble("C1_S");
         p0_s = input_db->getDouble("P0_S");
         beta_s = input_db->getDouble("BETA_S");
+        kappa_s = input_db->getDouble("Kappa_S");
 
         // Create major algorithm and data objects that comprise the
         // application.  These objects are configured from the input database

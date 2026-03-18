@@ -68,21 +68,25 @@ target_force_function(libMesh::VectorValue<double>& F,
                            double time,
                            void* /*ctx*/)
 {
+    // center pivot (example)
+    const double Xc0 = 0.5;
+    const double Xc1 = 0.1;
 
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
+    // ramp-up then constant rotation (smooth start)
+    const double omega = 0.5 * M_PI;
+    const double t_ramp = 3;
 
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
+    double omega_eff = omega;
+    if (time < t_ramp)
+    {
+        const double s = 0.5 * (1.0 - std::cos(M_PI * time / t_ramp));
+        omega_eff = omega * s;
+    }
+    const double theta = omega_eff * time;
 
     const double c = std::cos(theta);
     const double s = std::sin(theta);
 
-    // reference vector relative to pivot
     const double dX0 = X(0) - Xc0;
     const double dX1 = X(1) - Xc1;
 

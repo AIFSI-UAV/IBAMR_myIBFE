@@ -178,7 +178,8 @@ compute_eel_target(const libMesh::Point& X,
                    double& utar_y)
 {
     // s 是材料坐标中的流向位置，摆动只在 y 方向添加波形。
-    const double s = X(0) - d.x_leading;
+    const double s_raw = X(0) - d.x_leading;
+    const double s = std::max(0.0, std::min(d.L, s_raw));
     const double yc = eel_centerline_y(s, time, d);
     const double vc = eel_centerline_v(s, time, d);
 
@@ -234,26 +235,28 @@ eel_body_force_function(libMesh::VectorValue<double>& F,
 
 void
 eel_surface_force_function(VectorValue<double>& F,
-                      const VectorValue<double>& /*n*/,
-                      const VectorValue<double>& /*N*/,
-                      const TensorValue<double>& /*FF*/,
-                      const libMesh::Point& x,
-                      const libMesh::Point& X,
-                      Elem* const /*elem*/,
-                      const unsigned short /*side*/,
-                      const vector<const vector<double>*>& var_data,
-                      const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                      double time,
-                      void* ctx)
+                           const VectorValue<double>& /*n*/,
+                           const VectorValue<double>& /*N*/,
+                           const TensorValue<double>& /*FF*/,
+                           const libMesh::Point& x,
+                           const libMesh::Point& X,
+                           Elem* const /*elem*/,
+                           const unsigned short /*side*/,
+                           const vector<const vector<double>*>& var_data,
+                           const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
+                           double time,
+                           void* ctx)
 {
     const Eel2DData* const d = reinterpret_cast<Eel2DData*>(ctx);
 
     VectorValue<double> U;
     for (unsigned int k = 0; k < NDIM; ++k) U(k) = (*var_data[0])[k];
 
-    // 简化版本中关闭表面附加力，仅保留体力罚项驱动摆动。
-    F(0) = 0.0;
-    F(1) = 0.0;
+    double xtar, ytar, utar_x, utar_y;
+    compute_eel_target(X, time, *d, xtar, ytar, utar_x, utar_y);
+
+    F(0) = d->kappa_s_surface * (xtar - x(0)) + d->eta_s_surface * (utar_x - U(0));
+    F(1) = d->kappa_s_surface * (ytar - x(1)) + d->eta_s_surface * (utar_y - U(1));
     return;
 } // eel_surface_force_function
 
@@ -435,6 +438,9 @@ main(int argc, char* argv[])
         PK1_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_QUAD_ORDER", "THIRD"));
         ibfe_ops->registerPK1StressFunction(PK1_stress_data);
+
+        IBFEMethod::LagSurfaceForceFcnData surface_fcn_data(eel_surface_force_function, sys_data, eel_data_ptr);
+        ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
 
         IBFEMethod::LagBodyForceFcnData body_fcn_data(eel_body_force_function, sys_data, eel_data_ptr);
         ibfe_ops->registerLagBodyForceFunction(body_fcn_data);

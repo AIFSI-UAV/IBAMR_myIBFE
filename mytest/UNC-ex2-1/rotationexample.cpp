@@ -68,21 +68,21 @@ target_force_function(libMesh::VectorValue<double>& F,
                            double time,
                            void* /*ctx*/)
 {
+    // --- hinge pivot in reference coordinates (example numbers) ---
+    // Suppose plate spans X in [0, Lx], Y in [0, Ly]
+    const double Lx = 1.0;
+    const double Ly = 0.2;
+    const double Xc0 = 0.0;        // left edge
+    const double Xc1 = 0.5 * Ly;   // mid-height
 
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
-
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
+    // --- oscillatory rotation (pitch) ---
+    const double theta0 = 10.0 * M_PI / 180.0; // 15 deg
+    const double f = 1.0;                      // Hz
+    const double theta = theta0 * std::sin(2.0 * M_PI * f * time);
 
     const double c = std::cos(theta);
     const double s = std::sin(theta);
 
-    // reference vector relative to pivot
     const double dX0 = X(0) - Xc0;
     const double dX1 = X(1) - Xc1;
 

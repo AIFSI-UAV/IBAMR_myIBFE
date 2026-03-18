@@ -127,6 +127,24 @@ struct Eel2DData
     double ycom_ref;
     double theta_ref;
 
+    // 参考 body frame 上用于去除刚体模态的局部积分样本
+    std::vector<double> xhat_qp_ref;
+    std::vector<double> yhat_qp_ref;
+    std::vector<double> s_qp_ref;
+    std::vector<double> w_qp_ref;
+    double area_ref;
+    double polar_moment_ref;
+
+    // 给定 time 时，原始行波形变在参考 body frame 上的刚体模态投影
+    double cached_mode_time;
+    bool cached_mode_valid;
+    double disp_tx;
+    double disp_ty;
+    double disp_rot;
+    double vel_tx;
+    double vel_ty;
+    double vel_rot;
+
     Eel2DData(Pointer<Database> input_db)
       : c1_s(input_db->getDouble("C1_S")),
         kappa_s_body(input_db->getDouble("KAPPA_S_BODY")),
@@ -141,7 +159,11 @@ struct Eel2DData
         x_leading(input_db->getDouble("EEL_X_LEADING")),
         y_center0(input_db->getDouble("EEL_Y_CENTER0")),
         xcom_cur(0.0), ycom_cur(0.0), theta_cur(0.0),
-        xcom_ref(0.0), ycom_ref(0.0), theta_ref(0.0)
+        xcom_ref(0.0), ycom_ref(0.0), theta_ref(0.0),
+        area_ref(0.0), polar_moment_ref(0.0),
+        cached_mode_time(0.0), cached_mode_valid(false),
+        disp_tx(0.0), disp_ty(0.0), disp_rot(0.0),
+        vel_tx(0.0), vel_ty(0.0), vel_rot(0.0)
     {}
 };
 
@@ -167,6 +189,132 @@ inline double eel_centerline_v(double s, double t, const Eel2DData& d)
 {
     return -d.A * ((s + d.s_shift) / (d.L + d.s_shift))
          * d.omega * std::cos(d.k_wave * s - d.omega * t);
+}
+
+inline void eel_raw_body_frame_kinematics(double s,
+                                          double time,
+                                          const Eel2DData& d,
+                                          double& disp_x,
+                                          double& disp_y,
+                                          double& vel_x,
+                                          double& vel_y)
+{
+    disp_x = 0.0;
+    disp_y = eel_centerline_y(s, time, d);
+    vel_x = 0.0;
+    vel_y = eel_centerline_v(s, time, d);
+}
+
+void initialize_reference_projection_data(EquationSystems* equation_systems,
+                                          const std::string& coords_system_name,
+                                          MeshBase& mesh,
+                                          Eel2DData& d)
+{
+    d.xhat_qp_ref.clear();
+    d.yhat_qp_ref.clear();
+    d.s_qp_ref.clear();
+    d.w_qp_ref.clear();
+
+    const unsigned int dim = mesh.mesh_dimension();
+    System& X_system = equation_systems->get_system<System>(coords_system_name);
+    NumericVector<double>* X_vec = X_system.solution.get();
+    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+    const DofMap& dof_map = X_system.get_dof_map();
+
+    std::vector<std::vector<unsigned int> > dof_indices(NDIM);
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, dof_map.variable_type(0)));
+    std::unique_ptr<QBase> qrule = QBase::build(QGAUSS, dim, SEVENTH);
+    fe->attach_quadrature_rule(qrule.get());
+    const vector<double>& JxW = fe->get_JxW();
+    const vector<vector<double> >& phi = fe->get_phi();
+
+    boost::multi_array<double, 2> X_node;
+    VectorValue<double> x;
+
+    const double cr = std::cos(d.theta_ref);
+    const double sr = std::sin(d.theta_ref);
+    const double dx_lead = d.x_leading - d.xcom_ref;
+    const double dy_lead = d.y_center0 - d.ycom_ref;
+    const double xhat_leading = cr * dx_lead + sr * dy_lead;
+
+    double area_local = 0.0;
+    double polar_moment_local = 0.0;
+
+    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        fe->reinit(elem);
+        for (unsigned int d_idx = 0; d_idx < NDIM; ++d_idx) dof_map.dof_indices(elem, dof_indices[d_idx], d_idx);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+
+        const unsigned int n_qp = qrule->n_points();
+        for (unsigned int qp = 0; qp < n_qp; ++qp)
+        {
+            interpolate(x, qp, X_node, phi);
+
+            const double dx = x(0) - d.xcom_ref;
+            const double dy = x(1) - d.ycom_ref;
+            const double xhat = cr * dx + sr * dy;
+            const double yhat = -sr * dx + cr * dy;
+            const double s = xhat - xhat_leading;
+            const double w = JxW[qp];
+
+            d.xhat_qp_ref.push_back(xhat);
+            d.yhat_qp_ref.push_back(yhat);
+            d.s_qp_ref.push_back(s);
+            d.w_qp_ref.push_back(w);
+
+            area_local += w;
+            polar_moment_local += (xhat * xhat + yhat * yhat) * w;
+        }
+    }
+
+    double global_vals[2] = { area_local, polar_moment_local };
+    IBTK_MPI::sumReduction(global_vals, 2);
+    d.area_ref = global_vals[0];
+    d.polar_moment_ref = global_vals[1];
+    d.cached_mode_valid = false;
+}
+
+void update_projected_kinematics_cache(double time, Eel2DData& d)
+{
+    const double tol = 1.0e-12 * std::max(1.0, std::abs(time));
+    if (d.cached_mode_valid && std::abs(time - d.cached_mode_time) <= tol) return;
+
+    double local_sums[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    const std::size_t n_qp = d.s_qp_ref.size();
+    for (std::size_t k = 0; k < n_qp; ++k)
+    {
+        double disp_x_raw, disp_y_raw, vel_x_raw, vel_y_raw;
+        eel_raw_body_frame_kinematics(d.s_qp_ref[k], time, d, disp_x_raw, disp_y_raw, vel_x_raw, vel_y_raw);
+
+        const double xhat = d.xhat_qp_ref[k];
+        const double yhat = d.yhat_qp_ref[k];
+        const double w = d.w_qp_ref[k];
+
+        local_sums[0] += disp_x_raw * w;
+        local_sums[1] += disp_y_raw * w;
+        local_sums[2] += (xhat * disp_y_raw - yhat * disp_x_raw) * w;
+        local_sums[3] += vel_x_raw * w;
+        local_sums[4] += vel_y_raw * w;
+        local_sums[5] += (xhat * vel_y_raw - yhat * vel_x_raw) * w;
+    }
+
+    IBTK_MPI::sumReduction(local_sums, 6);
+
+    const double area = std::max(d.area_ref, std::numeric_limits<double>::epsilon());
+    const double polar_moment = std::max(d.polar_moment_ref, std::numeric_limits<double>::epsilon());
+
+    d.disp_tx = local_sums[0] / area;
+    d.disp_ty = local_sums[1] / area;
+    d.disp_rot = local_sums[2] / polar_moment;
+    d.vel_tx = local_sums[3] / area;
+    d.vel_ty = local_sums[4] / area;
+    d.vel_rot = local_sums[5] / polar_moment;
+
+    d.cached_mode_time = time;
+    d.cached_mode_valid = true;
 }
 
 void compute_com_and_orientation(EquationSystems* equation_systems,
@@ -251,6 +399,106 @@ void compute_com_and_orientation(EquationSystems* equation_systems,
     }
 }
 
+void compute_com_and_rigid_pose(EquationSystems* equation_systems,
+                                const std::string& coords_system_name,
+                                MeshBase& mesh,
+                                const Eel2DData& d,
+                                double& xcom,
+                                double& ycom,
+                                double& theta,
+                                double theta_prev = std::numeric_limits<double>::quiet_NaN())
+{
+    if (d.area_ref <= std::numeric_limits<double>::epsilon())
+    {
+        compute_com_and_orientation(equation_systems, coords_system_name, mesh, xcom, ycom, theta, theta_prev);
+        return;
+    }
+
+    const unsigned int dim = mesh.mesh_dimension();
+    System& X_system = equation_systems->get_system<System>(coords_system_name);
+    NumericVector<double>* X_vec = X_system.solution.get();
+    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+    const DofMap& dof_map = X_system.get_dof_map();
+
+    std::vector<std::vector<unsigned int> > dof_indices(NDIM);
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, dof_map.variable_type(0)));
+    std::unique_ptr<QBase> qrule = QBase::build(QGAUSS, dim, SEVENTH);
+    fe->attach_quadrature_rule(qrule.get());
+    const vector<double>& JxW = fe->get_JxW();
+    const vector<libMesh::Point>& q_point = fe->get_xyz();
+    const vector<vector<double> >& phi = fe->get_phi();
+
+    boost::multi_array<double, 2> X_node;
+    VectorValue<double> x;
+
+    double area = 0.0;
+    double mx = 0.0, my = 0.0;
+    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        fe->reinit(elem);
+        for (unsigned int d_idx = 0; d_idx < NDIM; ++d_idx) dof_map.dof_indices(elem, dof_indices[d_idx], d_idx);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+
+        const unsigned int n_qp = qrule->n_points();
+        for (unsigned int qp = 0; qp < n_qp; ++qp)
+        {
+            interpolate(x, qp, X_node, phi);
+            area += JxW[qp];
+            mx += x(0) * JxW[qp];
+            my += x(1) * JxW[qp];
+        }
+    }
+
+    double local_first[3] = { area, mx, my };
+    IBTK_MPI::sumReduction(local_first, 3);
+    const double area_tot = std::max(local_first[0], std::numeric_limits<double>::epsilon());
+    xcom = local_first[1] / area_tot;
+    ycom = local_first[2] / area_tot;
+
+    const double cr = std::cos(d.theta_ref);
+    const double sr = std::sin(d.theta_ref);
+
+    double a_local = 0.0;
+    double b_local = 0.0;
+    for (auto el_it = mesh.active_local_elements_begin(); el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        fe->reinit(elem);
+        for (unsigned int d_idx = 0; d_idx < NDIM; ++d_idx) dof_map.dof_indices(elem, dof_indices[d_idx], d_idx);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+
+        const unsigned int n_qp = qrule->n_points();
+        for (unsigned int qp = 0; qp < n_qp; ++qp)
+        {
+            interpolate(x, qp, X_node, phi);
+
+            const double qx = x(0) - xcom;
+            const double qy = x(1) - ycom;
+
+            const double dx_ref = q_point[qp](0) - d.xcom_ref;
+            const double dy_ref = q_point[qp](1) - d.ycom_ref;
+            const double xhat_ref = cr * dx_ref + sr * dy_ref;
+            const double yhat_ref = -sr * dx_ref + cr * dy_ref;
+
+            a_local += (xhat_ref * qx + yhat_ref * qy) * JxW[qp];
+            b_local += (xhat_ref * qy - yhat_ref * qx) * JxW[qp];
+        }
+    }
+
+    double local_fit[2] = { a_local, b_local };
+    IBTK_MPI::sumReduction(local_fit, 2);
+    theta = std::atan2(local_fit[1], local_fit[0]);
+
+    if (std::isfinite(theta_prev))
+    {
+        const double pi = 3.14159265358979323846;
+        while (theta - theta_prev > pi) theta -= 2.0 * pi;
+        while (theta - theta_prev < -pi) theta += 2.0 * pi;
+    }
+}
+
 double compute_tail_y(EquationSystems* equation_systems,
                       const std::string& coords_system_name,
                       MeshBase& mesh,
@@ -325,7 +573,7 @@ double compute_tail_y(EquationSystems* equation_systems,
 inline void compute_eel_target(
     const libMesh::Point& X,
     double time,
-    const Eel2DData& d,
+    Eel2DData& d,
     double& xtar,
     double& ytar,
     double& utar_x,
@@ -334,12 +582,14 @@ inline void compute_eel_target(
 inline void
 compute_eel_target(const libMesh::Point& X,
                    double time,
-                   const Eel2DData& d,
+                   Eel2DData& d,
                    double& xtar,
                    double& ytar,
                    double& utar_x,
                    double& utar_y)
 {
+    update_projected_kinematics_cache(time, d);
+
     // ------------------------------------------------------------
     // 1) 参考构型中的当前材料点，先转换到 reference body frame
     //    theta_ref 定义参考 body frame 相对于实验室坐标的姿态。
@@ -370,12 +620,17 @@ compute_eel_target(const libMesh::Point& X,
     // ------------------------------------------------------------
     // 3) 在 reference body frame 中施加 eel 的横向行波形变
     // ------------------------------------------------------------
-    const double yc = eel_centerline_y(s, time, d);
-    const double vc = eel_centerline_v(s, time, d);
+    double disp_x_raw, disp_y_raw, vel_x_raw, vel_y_raw;
+    eel_raw_body_frame_kinematics(s, time, d, disp_x_raw, disp_y_raw, vel_x_raw, vel_y_raw);
 
     // body-frame target point after deformation
-    const double xhat_tar = xhat_ref;
-    const double yhat_tar = yhat_ref + yc;
+    const double disp_x = disp_x_raw - d.disp_tx + d.disp_rot * yhat_ref;
+    const double disp_y = disp_y_raw - d.disp_ty - d.disp_rot * xhat_ref;
+    const double vel_x = vel_x_raw - d.vel_tx + d.vel_rot * yhat_ref;
+    const double vel_y = vel_y_raw - d.vel_ty - d.vel_rot * xhat_ref;
+
+    const double xhat_tar = xhat_ref + disp_x;
+    const double yhat_tar = yhat_ref + disp_y;
 
     // ------------------------------------------------------------
     // 4) 再用当前自由位姿映射回实验室坐标
@@ -387,12 +642,11 @@ compute_eel_target(const libMesh::Point& X,
     ytar = d.ycom_cur + st * xhat_tar + ct * yhat_tar;
 
     // ------------------------------------------------------------
-    // 5) 目标速度：当前仍采用一阶近似，
-    //    仅保留形变速度在当前姿态下的映射。
-    //    若以后启用较大的 ETA_S_BODY，需要再补充刚体平移/转动速度项。
+    // 5) 目标速度：使用去除刚体模态后的 body-frame 速度，
+    //    再按当前自由位姿映射回实验室坐标。
     // ------------------------------------------------------------
-    utar_x = -st * vc;
-    utar_y =  ct * vc;
+    utar_x = ct * vel_x - st * vel_y;
+    utar_y = st * vel_x + ct * vel_y;
 }
 
 // Tether (penalty) stress function.
@@ -425,7 +679,7 @@ eel_body_force_function(libMesh::VectorValue<double>& F,
                         double time,
                         void* ctx)
 {
-    const Eel2DData* d = reinterpret_cast<Eel2DData*>(ctx);
+    Eel2DData* d = reinterpret_cast<Eel2DData*>(ctx);
     const std::vector<double>& U = *var_data[0];
 
     double xtar, ytar, utar_x, utar_y;
@@ -717,6 +971,7 @@ main(int argc, char* argv[])
         eel_data.xcom_ref = eel_data.xcom_cur;
         eel_data.ycom_ref = eel_data.ycom_cur;
         eel_data.theta_ref = eel_data.theta_cur;
+        initialize_reference_projection_data(equation_systems, coords_system_name, mesh, eel_data);
 
         // Deallocate initialization objects.
         app_initializer.setNull();
@@ -779,13 +1034,14 @@ main(int argc, char* argv[])
             dt = time_integrator->getMaximumTimeStepSize();
 
             const double theta_prev = eel_data.theta_cur;
-            compute_com_and_orientation(equation_systems,
-                                        coords_system_name,
-                                        mesh,
-                                        eel_data.xcom_cur,
-                                        eel_data.ycom_cur,
-                                        eel_data.theta_cur,
-                                        theta_prev);
+            compute_com_and_rigid_pose(equation_systems,
+                                       coords_system_name,
+                                       mesh,
+                                       eel_data,
+                                       eel_data.xcom_cur,
+                                       eel_data.ycom_cur,
+                                       eel_data.theta_cur,
+                                       theta_prev);
             pout << "Pose(COM/theta): (" << eel_data.xcom_cur << ", " << eel_data.ycom_cur << ", " << eel_data.theta_cur
                  << ")\n";
 
@@ -1041,13 +1297,14 @@ postprocess_data(Pointer<Database> input_db,
 
     static double theta_prev_post = std::numeric_limits<double>::quiet_NaN();
     double xcom = 0.0, ycom = 0.0, theta = 0.0;
-    compute_com_and_orientation(equation_systems,
-                                coords_system_name,
-                                mesh,
-                                xcom,
-                                ycom,
-                                theta,
-                                theta_prev_post);
+    compute_com_and_rigid_pose(equation_systems,
+                               coords_system_name,
+                               mesh,
+                               *eel_data,
+                               xcom,
+                               ycom,
+                               theta,
+                               theta_prev_post);
     theta_prev_post = theta;
     const double tail_y = compute_tail_y(equation_systems, coords_system_name, mesh, *eel_data);
 

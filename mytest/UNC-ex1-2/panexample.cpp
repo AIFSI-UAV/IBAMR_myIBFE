@@ -51,14 +51,13 @@
 namespace ModelData
 {
 
-static double kappa_s = 1.0e6;
 // Stress tensor functions.
 static double c1_s = 0.05;
 static double p0_s = 0.0;
 static double beta_s = 0.0;
+static double kappa_s = 1.0e6;
 
-void 
-target_force_function(libMesh::VectorValue<double>& F,
+void target_force_function(libMesh::VectorValue<double>& F,
                            const libMesh::TensorValue<double>& /*FF*/,
                            const libMesh::Point& x,
                            const libMesh::Point& X,
@@ -69,30 +68,35 @@ target_force_function(libMesh::VectorValue<double>& F,
                            void* /*ctx*/)
 {
 
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
+    // Heave parameters
+    const double A = 0.1;      // amplitude
+    const double f = 1.0;      // frequency (Hz)
+    const double omega = 2.0 * M_PI * f;
 
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
+    // Optional: phase shift
+    const double phi = 0.0;
 
-    const double c = std::cos(theta);
-    const double s = std::sin(theta);
-
-    // reference vector relative to pivot
-    const double dX0 = X(0) - Xc0;
-    const double dX1 = X(1) - Xc1;
+    // Optional: turn off after some time (set negative to disable)
+    const double t_release = -1.0;
 
     libMesh::Point X_target;
-    X_target(0) = Xc0 + c * dX0 - s * dX1;
-    X_target(1) = Xc1 + s * dX0 + c * dX1;
+
+    if (t_release > 0.0 && time >= t_release)
+    {
+        // release: force off
+        X_target(0) = x(0);
+        X_target(1) = x(1);
+    }
+    else
+    {
+        // Oscillation in y: y += A sin(omega t + phi)
+        X_target(0) = X(0);
+        X_target(1) = X(1) + A * std::sin(omega * time + phi);
+    }
 
     F = kappa_s * (X_target - x);
 }
-
+    
 
 void
 PK1_dev_stress_function(TensorValue<double>& PP,

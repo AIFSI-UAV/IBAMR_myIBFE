@@ -51,14 +51,13 @@
 namespace ModelData
 {
 
-static double kappa_s = 1.0e6;
 // Stress tensor functions.
 static double c1_s = 0.05;
 static double p0_s = 0.0;
 static double beta_s = 0.0;
+static double kappa_s = 1.0e6;
 
-void 
-target_force_function(libMesh::VectorValue<double>& F,
+void target_force_function(libMesh::VectorValue<double>& F,
                            const libMesh::TensorValue<double>& /*FF*/,
                            const libMesh::Point& x,
                            const libMesh::Point& X,
@@ -68,32 +67,42 @@ target_force_function(libMesh::VectorValue<double>& F,
                            double time,
                            void* /*ctx*/)
 {
+    
+    // Translation velocity (example: +y direction)
+    const double V = 0.5;
 
-    // --- pivot (choose based on your mesh reference coordinates) ---
-    // Example: pivot at origin
-    const double Xc0 = 0.0;
-    const double Xc1 = 0.0;
+    // Optional: smooth ramp-up duration (set 0 to disable)
+    const double t_ramp = 0.2;
 
-    // --- rotation law ---
-    // Example: constant angular velocity (rad/s)
-    const double omega = 0.5 * M_PI;   // rotates 90 deg in 1 s
-    const double theta = omega * time;
+    // Optional: release time (set negative to disable release)
+    const double t_release = -1.0;
 
-    const double c = std::cos(theta);
-    const double s = std::sin(theta);
-
-    // reference vector relative to pivot
-    const double dX0 = X(0) - Xc0;
-    const double dX1 = X(1) - Xc1;
+    // Ramp factor s(t) in [0,1]
+    double s = 1.0;
+    if (t_ramp > 0.0 && time < t_ramp)
+    {
+        // C1-smooth ramp: s = 0.5*(1 - cos(pi*t/t_ramp))
+        s = 0.5 * (1.0 - std::cos(M_PI * time / t_ramp));
+    }
 
     libMesh::Point X_target;
-    X_target(0) = Xc0 + c * dX0 - s * dX1;
-    X_target(1) = Xc1 + s * dX0 + c * dX1;
+
+    if (t_release > 0.0 && time >= t_release)
+    {
+        // release: force off
+        X_target(0) = x(0);
+        X_target(1) = x(1);
+    }
+    else
+    {
+        // uniform translation: y += (s*V)*t
+        X_target(0) = X(0);
+        X_target(1) = X(1) + (s * V) * time;
+    }
 
     F = kappa_s * (X_target - x);
 }
-
-
+    
 void
 PK1_dev_stress_function(TensorValue<double>& PP,
                         const TensorValue<double>& FF,
