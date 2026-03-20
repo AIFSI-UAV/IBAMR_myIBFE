@@ -159,6 +159,20 @@ inline double eel_centerline_v(double s, double t, const Eel2DData& d)
     return -d.A * ((s + d.s_shift) / (d.L + d.s_shift))
          * d.omega * std::cos(d.k_wave * s - d.omega * t);
 }
+inline double eel_centerline_dy_ds(double s, double t, const Eel2DData& d)
+{
+    const double alpha = (s + d.s_shift) / (d.L + d.s_shift);
+    const double alpha_s = 1.0 / (d.L + d.s_shift);
+    const double phase = d.k_wave * s - d.omega * t;
+    return d.A * (alpha_s * std::sin(phase) + alpha * d.k_wave * std::cos(phase));
+}
+inline double eel_centerline_dv_ds(double s, double t, const Eel2DData& d)
+{
+    const double alpha = (s + d.s_shift) / (d.L + d.s_shift);
+    const double alpha_s = 1.0 / (d.L + d.s_shift);
+    const double phase = d.k_wave * s - d.omega * t;
+    return d.A * (-alpha_s * d.omega * std::cos(phase) + alpha * d.k_wave * d.omega * std::sin(phase));
+}
 inline void compute_eel_target(
     const libMesh::Point& X,
     double time,
@@ -177,20 +191,46 @@ compute_eel_target(const libMesh::Point& X,
                    double& utar_x,
                    double& utar_y)
 {
-    // s 是材料坐标中的流向位置，摆动只在 y 方向添加波形。
+    // 参考构型是一条水平中心线。对鱼头/鱼尾端帽，我们保留超出 [0, L]
+    // 区间部分的轴向余量 a，使端帽随端点切向方向刚性带动而不塌缩。
     const double s_raw = X(0) - d.x_leading;
     const double s = std::max(0.0, std::min(d.L, s_raw));
-    const double yc = eel_centerline_y(s, time, d);
+    const double a = X(0) - (d.x_leading + s);
+    const double r = X(1) - d.y_center0;
+
+    // 使用相对初始时刻的位移与转角，确保 t = 0 时 target 与原始网格严格一致。
+    const double y_ref = eel_centerline_y(s, 0.0, d);
+    const double y_cur = eel_centerline_y(s, time, d);
+    const double yc = d.y_center0 + (y_cur - y_ref);
     const double vc = eel_centerline_v(s, time, d);
+
+    const double m_ref = eel_centerline_dy_ds(s, 0.0, d);
+    const double m_cur = eel_centerline_dy_ds(s, time, d);
+    const double m = m_cur - m_ref;
+    const double m_t = eel_centerline_dv_ds(s, time, d);
 
     // 第一阶段：原地摆动（x 不动，仅 y 摆动）。
     // 第二阶段：开启 enable_forward_swim 后，以常速 forward_speed 向前平移。
     const double x_shift = d.enable_forward_swim ? d.forward_speed * time : 0.0;
+    const double x_vel = d.enable_forward_swim ? d.forward_speed : 0.0;
 
-    xtar = X(0) + x_shift;
-    ytar = X(1) + yc;
-    utar_x = d.enable_forward_swim ? d.forward_speed : 0.0;
-    utar_y = vc;
+    const double norm = std::sqrt(1.0 + m * m);
+    const double tx = 1.0 / norm;
+    const double ty = m / norm;
+    const double nx = -m / norm;
+    const double ny = 1.0 / norm;
+
+    // 对 m 的时间导数应用链式法则，得到切向/法向基向量的速度。
+    const double norm3 = norm * norm * norm;
+    const double tx_t = -(m * m_t) / norm3;
+    const double ty_t = m_t / norm3;
+    const double nx_t = -m_t / norm3;
+    const double ny_t = -(m * m_t) / norm3;
+
+    xtar = d.x_leading + s + x_shift + a * tx + r * nx;
+    ytar = yc + a * ty + r * ny;
+    utar_x = x_vel + a * tx_t + r * nx_t;
+    utar_y = vc + a * ty_t + r * ny_t;
 }
 
 // Tether (penalty) stress function.

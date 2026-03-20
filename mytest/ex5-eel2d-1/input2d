@@ -14,9 +14,26 @@ EEL_OMEGA       = 6.28
 //0.785/0.125
 EEL_KWAVE       = 6.283185307179586 
 //2*pi
-EEL_X_LEADING   = 0.0
+EEL_X_LEADING   = -0.1
 EEL_Y_CENTER0   = 0.0
 EEL_NUM_S_POINTS = 200
+
+// traveling-wave body kinematics
+WAVE_FREQUENCY_F = EEL_OMEGA/(2*pi)
+WAVELENGTH_LAMBDA = 2*pi/EEL_KWAVE
+WAVE_PHASE0 = 0.0
+ENVELOPE_TYPE = "quadratic"   // "quadratic" or "cubic"
+
+// quadratic amplitude envelope: A(xi) = a0 + a1*xi + a2*xi^2
+QUAD_A0 = EEL_A*EEL_S_SHIFT/(EEL_LENGTH + EEL_S_SHIFT)
+QUAD_A1 = 0.0
+QUAD_A2 = EEL_A - QUAD_A0
+
+// cubic amplitude envelope: A(xi) = b0 + b1*xi + b2*xi^2 + b3*xi^3
+CUBIC_B0 = QUAD_A0
+CUBIC_B1 = 0.0
+CUBIC_B2 = 0.0
+CUBIC_B3 = EEL_A - CUBIC_B0
 // grid spacing parameters
 L = 16.0                                       // width of computational domain
 MAX_LEVELS = 6                                 // maximum number of levels in locally refined grid
@@ -68,6 +85,31 @@ KAPPA_S_BODY    = 5.0e3
 ETA_S_BODY      = 0.0
 KAPPA_S_SURFACE = 0.0
 ETA_S_SURFACE   = 0.0
+
+// active bending stress data
+USE_ACTIVE_STRESS = TRUE
+ACTIVE_STRESS_T0  = KAPPA_S_BODY * EEL_A
+ACTIVE_PHASE0     = 0.0
+ACTIVE_RAMP_TIME  = 0.0
+ACTIVE_XI_START   = 0.0
+ACTIVE_XI_END     = 1.0
+ACTIVE_XI_EPS     = 0.02
+
+// stage-1 free-swimming rigid-body diagnostics
+BODY_DENSITY        = RHO
+STEADY_FORCE_TOL    = 1.0e-4
+STEADY_SPEED_REL_TOL = 5.0e-2
+STEADY_MIN_CYCLES   = 2.0
+
+// stage-1 tail stiffness controls
+STIFFNESS_MODE = "uniform_linear"    // "uniform_linear" or "tail_gradient"
+TAIL_XI_START = 0.7
+TAIL_STIFFNESS_RATIO = 1.0
+TAIL_STIFFNESS_POWER = 1.0
+USE_TAIL_NONLINEAR_STIFFNESS = FALSE
+TAIL_NONLINEAR_K0 = C1_S
+TAIL_NONLINEAR_A = 0.0
+TAIL_NONLINEAR_B = 0.0
 
 // collocated solver parameters
 PROJECTION_METHOD_TYPE = "PRESSURE_UPDATE"

@@ -14,14 +14,14 @@ EEL_OMEGA       = 6.28
 //0.785/0.125
 EEL_KWAVE       = 6.283185307179586 
 //2*pi
-EEL_X_LEADING   = 0.0
+EEL_X_LEADING   = -0.1
 EEL_Y_CENTER0   = 0.0
 EEL_NUM_S_POINTS = 200
 EEL_ENABLE_FORWARD_SWIM = TRUE
-EEL_FORWARD_SPEED = -0.1
+EEL_FORWARD_SPEED = -0.05
 // grid spacing parameters
 L = 32.0                                       // width of computational domain
-MAX_LEVELS = 4                                 // maximum number of levels in locally refined grid
+MAX_LEVELS = 5                                 // increase finest Eulerian resolution around the fish body
 REF_RATIO  = 2                                 // refinement ratio between levels
 N = 64                                         // actual    number of grid cells on coarsest grid level
 NFINEST = (REF_RATIO^(MAX_LEVELS - 1))*N       // effective number of grid cells on finest   grid level
@@ -43,7 +43,7 @@ SOLVER_TYPE                = "STAGGERED"       // the fluid solver to use (STAGG
 CFL_MAX                    = 0.2               // maximum CFL number
 DT                         = 0.25*CFL_MAX*DX    // maximum timestep size
 START_TIME                 = 0.0e0             // initial simulation time
-END_TIME                   = 2                  // final simulation time
+END_TIME                   = 3                  // final simulation time
 GROW_DT                    = 2.0e0             // growth factor for timesteps
 CONVECTIVE_TS_TYPE         = "ADAMS_BASHFORTH" // convective time stepping type
 CONVECTIVE_OP_TYPE         = "PPM"             // convective differencing discretization type

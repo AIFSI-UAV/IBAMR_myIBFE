@@ -24,6 +24,7 @@
 #include <StandardTagAndInitialize.h>
 
 // Headers for basic libMesh objects
+#include <libmesh/boundary_info.h>
 #include <libmesh/equation_systems.h>
 #include <libmesh/exodusII_io.h>
 #include <libmesh/mesh.h>
@@ -46,6 +47,7 @@
 
 #include <boost/multi_array.hpp>
 #include <set>
+#include <string>
 #include <limits>
 
 // Set up application namespace declarations
@@ -91,6 +93,8 @@ kernel(double x)
         return 0.;
 } // kernel
 
+static constexpr double PI_VAL = 3.14159265358979323846;
+
 // Elasticity model data.
 namespace ModelData
 {
@@ -108,14 +112,42 @@ struct Eel2DData
 
     // eel kinematics
     double L;          // body length
-    double A;          // amplitude coefficient, e.g. 0.125
-    double s_shift;    // 0.03125
-    double omega;      // 0.785 / 0.125
-    double k_wave;     // 2*pi
+    double A;          // legacy amplitude scale kept for backward compatibility
+    double s_shift;    // legacy head-offset scale kept for backward compatibility
+    double omega;      // angular frequency used by the traveling wave
+    double k_wave;     // wave number used by the traveling wave
+    double wave_frequency_f;
+    double wavelength_lambda;
+    double wave_phase0;
+    std::string envelope_type;
+    double quad_a0;
+    double quad_a1;
+    double quad_a2;
+    double cubic_b0;
+    double cubic_b1;
+    double cubic_b2;
+    double cubic_b3;
+
+    // active bending stress
+    bool use_active_stress;
+    double active_stress_t0;
+    double active_phase0;
+    double active_ramp_time;
+    double active_xi_start;
+    double active_xi_end;
+    double active_xi_eps;
 
     // geometry
     double x_leading;  // reference head x
     double y_center0;  // reference body center y
+    int n_geom_pts;
+    double xhat_head_ref;
+    double xhat_tail_ref;
+    double L_mesh;
+    double ds_mesh;
+    std::vector<double> s_mesh_ref;
+    std::vector<double> y_center_ref;
+    std::vector<double> half_width_ref;
 
     // 自由游动位姿（全局平移 + 转动），每步由当前网格几何更新
     double xcom_cur;
@@ -145,6 +177,52 @@ struct Eel2DData
     double vel_ty;
     double vel_rot;
 
+    // free-swimming rigid-body state inferred from the resolved FE motion
+    double body_density;
+    double body_mass;
+    double body_inertia;
+    double u_com_current;
+    double v_com_current;
+    double omega_body_current;
+    double xcom_observed_prev;
+    double ycom_observed_prev;
+    double theta_observed_prev;
+    double hydrodynamic_force_x;
+    double hydrodynamic_force_y;
+    double hydrodynamic_torque_z;
+    double steady_force_tol;
+    double steady_speed_rel_tol;
+    double steady_min_cycles;
+    bool rigid_dynamics_initialized;
+
+    // tail stiffness controls (stage-1)
+    std::string stiffness_mode;
+    double tail_xi_start;
+    double tail_stiffness_ratio;
+    double tail_stiffness_power;
+    double tail_k0;
+    double tail_a;
+    double tail_b;
+    bool use_tail_nonlinear_stiffness;
+
+    // diagnostics accumulators
+    double diagnostics_prev_time;
+    bool diagnostics_initialized;
+    double pout_integral;
+    double pin_integral;
+    double mean_speed_integral;
+    double mean_speed_time;
+    int alpha_cycle_index;
+    double alpha_cycle_max_current;
+    double alpha_cycle_max_last;
+    bool alpha_cycle_initialized;
+    int tail_cycle_index;
+    double tail_q_cycle_min;
+    double tail_q_cycle_max;
+    double tail_peak_to_peak_last;
+    double tail_potential_prev;
+    bool tail_cycle_initialized;
+
     Eel2DData(Pointer<Database> input_db)
       : c1_s(input_db->getDouble("C1_S")),
         kappa_s_body(input_db->getDouble("KAPPA_S_BODY")),
@@ -154,41 +232,371 @@ struct Eel2DData
         L(input_db->getDouble("EEL_LENGTH")),
         A(input_db->getDouble("EEL_A")),
         s_shift(input_db->getDouble("EEL_S_SHIFT")),
-        omega(input_db->getDouble("EEL_OMEGA")),
-        k_wave(input_db->getDouble("EEL_KWAVE")),
+        omega([&]()
+              {
+                  const double f_default =
+                      input_db->getDoubleWithDefault("EEL_OMEGA", 2.0 * PI_VAL) / (2.0 * PI_VAL);
+                  return 2.0 * PI_VAL * input_db->getDoubleWithDefault("WAVE_FREQUENCY_F", f_default);
+              }()),
+        k_wave([&]()
+               {
+                   const double k_default = input_db->getDoubleWithDefault("EEL_KWAVE", 2.0 * PI_VAL);
+                   const double lambda_default =
+                       (std::abs(k_default) > std::numeric_limits<double>::epsilon()) ? 2.0 * PI_VAL / std::abs(k_default) :
+                                                                                       input_db->getDouble("EEL_LENGTH");
+                   const double lambda = input_db->getDoubleWithDefault("WAVELENGTH_LAMBDA", lambda_default);
+                   return 2.0 * PI_VAL / std::max(lambda, std::numeric_limits<double>::epsilon());
+               }()),
+        wave_frequency_f([&]()
+                         {
+                             const double f_default =
+                                 input_db->getDoubleWithDefault("EEL_OMEGA", 2.0 * PI_VAL) / (2.0 * PI_VAL);
+                             return input_db->getDoubleWithDefault("WAVE_FREQUENCY_F", f_default);
+                         }()),
+        wavelength_lambda([&]()
+                          {
+                              const double k_default = input_db->getDoubleWithDefault("EEL_KWAVE", 2.0 * PI_VAL);
+                              const double lambda_default =
+                                  (std::abs(k_default) > std::numeric_limits<double>::epsilon()) ? 2.0 * PI_VAL / std::abs(k_default) :
+                                                                                                  input_db->getDouble("EEL_LENGTH");
+                              return input_db->getDoubleWithDefault("WAVELENGTH_LAMBDA", lambda_default);
+                          }()),
+        wave_phase0(input_db->getDoubleWithDefault("WAVE_PHASE0", 0.0)),
+        envelope_type(input_db->getStringWithDefault("ENVELOPE_TYPE", "quadratic")),
+        quad_a0([&]()
+                {
+                    const double denom =
+                        std::max(input_db->getDouble("EEL_LENGTH") + input_db->getDouble("EEL_S_SHIFT"),
+                                 std::numeric_limits<double>::epsilon());
+                    const double a_head = input_db->getDouble("EEL_A") * input_db->getDouble("EEL_S_SHIFT") / denom;
+                    return input_db->getDoubleWithDefault("QUAD_A0", a_head);
+                }()),
+        quad_a1(input_db->getDoubleWithDefault("QUAD_A1", 0.0)),
+        quad_a2([&]()
+                {
+                    const double denom =
+                        std::max(input_db->getDouble("EEL_LENGTH") + input_db->getDouble("EEL_S_SHIFT"),
+                                 std::numeric_limits<double>::epsilon());
+                    const double a_head = input_db->getDouble("EEL_A") * input_db->getDouble("EEL_S_SHIFT") / denom;
+                    return input_db->getDoubleWithDefault("QUAD_A2", input_db->getDouble("EEL_A") - a_head);
+                }()),
+        cubic_b0([&]()
+                 {
+                     const double denom =
+                         std::max(input_db->getDouble("EEL_LENGTH") + input_db->getDouble("EEL_S_SHIFT"),
+                                  std::numeric_limits<double>::epsilon());
+                     const double a_head = input_db->getDouble("EEL_A") * input_db->getDouble("EEL_S_SHIFT") / denom;
+                     return input_db->getDoubleWithDefault("CUBIC_B0", a_head);
+                 }()),
+        cubic_b1(input_db->getDoubleWithDefault("CUBIC_B1", 0.0)),
+        cubic_b2(input_db->getDoubleWithDefault("CUBIC_B2", 0.0)),
+        cubic_b3([&]()
+                 {
+                     const double denom =
+                         std::max(input_db->getDouble("EEL_LENGTH") + input_db->getDouble("EEL_S_SHIFT"),
+                                  std::numeric_limits<double>::epsilon());
+                     const double a_head = input_db->getDouble("EEL_A") * input_db->getDouble("EEL_S_SHIFT") / denom;
+                     return input_db->getDoubleWithDefault("CUBIC_B3", input_db->getDouble("EEL_A") - a_head);
+                 }()),
+        use_active_stress(input_db->getBoolWithDefault("USE_ACTIVE_STRESS", true)),
+        active_stress_t0(input_db->getDoubleWithDefault("ACTIVE_STRESS_T0",
+                                                        input_db->getDouble("KAPPA_S_BODY") *
+                                                            input_db->getDouble("EEL_A"))),
+        active_phase0(input_db->getDoubleWithDefault("ACTIVE_PHASE0", 0.0)),
+        active_ramp_time(input_db->getDoubleWithDefault("ACTIVE_RAMP_TIME", 0.0)),
+        active_xi_start(input_db->getDoubleWithDefault("ACTIVE_XI_START", 0.0)),
+        active_xi_end(input_db->getDoubleWithDefault("ACTIVE_XI_END", 1.0)),
+        active_xi_eps(input_db->getDoubleWithDefault("ACTIVE_XI_EPS", 0.02)),
         x_leading(input_db->getDouble("EEL_X_LEADING")),
         y_center0(input_db->getDouble("EEL_Y_CENTER0")),
+        n_geom_pts(input_db->getInteger("EEL_NUM_S_POINTS")),
+        xhat_head_ref(0.0),
+        xhat_tail_ref(0.0),
+        L_mesh(0.0),
+        ds_mesh(0.0),
         xcom_cur(0.0), ycom_cur(0.0), theta_cur(0.0),
         xcom_ref(0.0), ycom_ref(0.0), theta_ref(0.0),
         area_ref(0.0), polar_moment_ref(0.0),
         cached_mode_time(0.0), cached_mode_valid(false),
         disp_tx(0.0), disp_ty(0.0), disp_rot(0.0),
-        vel_tx(0.0), vel_ty(0.0), vel_rot(0.0)
+        vel_tx(0.0), vel_ty(0.0), vel_rot(0.0),
+        body_density(input_db->getDoubleWithDefault("BODY_DENSITY",
+                                                    input_db->getDoubleWithDefault("RHO", 1.0))),
+        body_mass(0.0),
+        body_inertia(0.0),
+        u_com_current(0.0), v_com_current(0.0), omega_body_current(0.0),
+        xcom_observed_prev(0.0), ycom_observed_prev(0.0), theta_observed_prev(0.0),
+        hydrodynamic_force_x(0.0), hydrodynamic_force_y(0.0), hydrodynamic_torque_z(0.0),
+        steady_force_tol(input_db->getDoubleWithDefault("STEADY_FORCE_TOL", 1.0e-4)),
+        steady_speed_rel_tol(input_db->getDoubleWithDefault("STEADY_SPEED_REL_TOL", 5.0e-2)),
+        steady_min_cycles(input_db->getDoubleWithDefault("STEADY_MIN_CYCLES", 2.0)),
+        rigid_dynamics_initialized(false),
+        stiffness_mode(input_db->getStringWithDefault("STIFFNESS_MODE", "uniform_linear")),
+        tail_xi_start(input_db->getDoubleWithDefault("TAIL_XI_START", 0.7)),
+        tail_stiffness_ratio(input_db->getDoubleWithDefault("TAIL_STIFFNESS_RATIO", 1.0)),
+        tail_stiffness_power(input_db->getDoubleWithDefault("TAIL_STIFFNESS_POWER", 1.0)),
+        tail_k0(input_db->getDoubleWithDefault("TAIL_NONLINEAR_K0", input_db->getDouble("C1_S"))),
+        tail_a(input_db->getDoubleWithDefault("TAIL_NONLINEAR_A", 0.0)),
+        tail_b(input_db->getDoubleWithDefault("TAIL_NONLINEAR_B", 0.0)),
+        use_tail_nonlinear_stiffness(input_db->getBoolWithDefault("USE_TAIL_NONLINEAR_STIFFNESS", false)),
+        diagnostics_prev_time(0.0),
+        diagnostics_initialized(false),
+        pout_integral(0.0), pin_integral(0.0),
+        mean_speed_integral(0.0), mean_speed_time(0.0),
+        alpha_cycle_index(0), alpha_cycle_max_current(0.0), alpha_cycle_max_last(0.0),
+        alpha_cycle_initialized(false),
+        tail_cycle_index(0), tail_q_cycle_min(0.0), tail_q_cycle_max(0.0),
+        tail_peak_to_peak_last(0.0), tail_potential_prev(0.0),
+        tail_cycle_initialized(false)
     {}
 };
 
 static Eel2DData* s_eel_data_state = nullptr;
 
+inline double
+clamp_value(double x, double a, double b)
+{
+    return std::max(a, std::min(x, b));
+}
+
+inline double
+wrap_angle(double angle)
+{
+    const double two_pi = 2.0 * PI_VAL;
+    while (angle > PI_VAL) angle -= two_pi;
+    while (angle < -PI_VAL) angle += two_pi;
+    return angle;
+}
+
 inline double body_half_width(double s, const Eel2DData& d)
 {
-    const double width_head = 0.04 * d.L;
-    const double length_head = 0.04 * d.L;
+    if (d.half_width_ref.empty()) return 0.0;
+    if (d.half_width_ref.size() == 1 || d.L_mesh <= std::numeric_limits<double>::epsilon()) return d.half_width_ref.front();
 
-    if (s < 0.0 || s > d.L) return 0.0;
-    if (s <= length_head)
-        return std::sqrt(std::max(0.0, 2.0 * width_head * s - s * s));
-    else
-        return width_head * (d.L - s) / (d.L - length_head);
+    const double s_mesh = clamp_value(s, 0.0, d.L_mesh);
+    const double r = s_mesh / d.ds_mesh;
+    const std::size_t i =
+        std::min<std::size_t>(d.half_width_ref.size() - 2, static_cast<std::size_t>(std::floor(r)));
+    const double a = r - static_cast<double>(i);
+    return std::max(0.0, (1.0 - a) * d.half_width_ref[i] + a * d.half_width_ref[i + 1]);
 }
-inline double eel_centerline_y(double s, double t, const Eel2DData& d)
+
+inline double
+mesh_centerline_y(double s_mesh, const Eel2DData& d)
 {
-    return d.A * ((s + d.s_shift) / (d.L + d.s_shift))
-         * std::sin(d.k_wave * s - d.omega * t);
+    if (d.y_center_ref.empty()) return 0.0;
+    if (d.y_center_ref.size() == 1 || d.L_mesh <= std::numeric_limits<double>::epsilon()) return d.y_center_ref.front();
+
+    const double s = clamp_value(s_mesh, 0.0, d.L_mesh);
+    const double r = s / d.ds_mesh;
+    const std::size_t i =
+        std::min<std::size_t>(d.y_center_ref.size() - 2, static_cast<std::size_t>(std::floor(r)));
+    const double a = r - static_cast<double>(i);
+    return (1.0 - a) * d.y_center_ref[i] + a * d.y_center_ref[i + 1];
 }
-inline double eel_centerline_v(double s, double t, const Eel2DData& d)
+
+inline double
+mesh_s_to_wave_s(double s_mesh, const Eel2DData& d)
 {
-    return -d.A * ((s + d.s_shift) / (d.L + d.s_shift))
-         * d.omega * std::cos(d.k_wave * s - d.omega * t);
+    if (d.L_mesh <= std::numeric_limits<double>::epsilon()) return 0.0;
+    const double xi = clamp_value(s_mesh / d.L_mesh, 0.0, 1.0);
+    return d.L * xi;
+}
+
+inline void
+compute_body_coordinates(double xhat_ref, double yhat_ref, const Eel2DData& d, double& s_mesh, double& eta_ref)
+{
+    s_mesh = clamp_value(xhat_ref - d.xhat_head_ref, 0.0, d.L_mesh);
+    eta_ref = yhat_ref - mesh_centerline_y(s_mesh, d);
+}
+
+inline double
+fallback_envelope_head_amplitude(const Eel2DData& d)
+{
+    const double denom = std::max(d.L + d.s_shift, std::numeric_limits<double>::epsilon());
+    return std::max(0.0, d.A * d.s_shift / denom);
+}
+
+inline double
+fallback_envelope_tail_amplitude(const Eel2DData& d)
+{
+    return std::max(fallback_envelope_head_amplitude(d) + 1.0e-8, std::max(0.0, d.A));
+}
+
+inline double
+evaluate_quadratic_envelope(double xi, const Eel2DData& d)
+{
+    return d.quad_a0 + d.quad_a1 * xi + d.quad_a2 * xi * xi;
+}
+
+inline double
+evaluate_quadratic_envelope_dxi(double xi, const Eel2DData& d)
+{
+    return d.quad_a1 + 2.0 * d.quad_a2 * xi;
+}
+
+inline double
+evaluate_cubic_envelope(double xi, const Eel2DData& d)
+{
+    return d.cubic_b0 + d.cubic_b1 * xi + d.cubic_b2 * xi * xi + d.cubic_b3 * xi * xi * xi;
+}
+
+inline double
+evaluate_cubic_envelope_dxi(double xi, const Eel2DData& d)
+{
+    return d.cubic_b1 + 2.0 * d.cubic_b2 * xi + 3.0 * d.cubic_b3 * xi * xi;
+}
+
+inline double
+amplitude_envelope(double s, const Eel2DData& d)
+{
+    // Traveling-wave body kinematics follows the literature form
+    // y = A(s) sin(omega t - k s), with the amplitude envelope modeled
+    // separately. Quadratic/cubic options follow BCF/thunniform practice.
+    const double s_wave = mesh_s_to_wave_s(s, d);
+    const double xi =
+        (d.L > std::numeric_limits<double>::epsilon()) ? clamp_value(s_wave / d.L, 0.0, 1.0) : 0.0;
+
+    const bool use_cubic = (d.envelope_type == "cubic");
+    const double a_raw = use_cubic ? evaluate_cubic_envelope(xi, d) : evaluate_quadratic_envelope(xi, d);
+    const double a_head_raw = use_cubic ? evaluate_cubic_envelope(0.0, d) : evaluate_quadratic_envelope(0.0, d);
+    const double a_tail_raw = use_cubic ? evaluate_cubic_envelope(1.0, d) : evaluate_quadratic_envelope(1.0, d);
+
+    if (a_tail_raw > a_head_raw + 1.0e-8) return std::max(0.0, a_raw);
+
+    const double a_head = fallback_envelope_head_amplitude(d);
+    const double a_tail = fallback_envelope_tail_amplitude(d);
+    return a_head + (a_tail - a_head) * xi * xi;
+}
+
+inline double
+amplitude_envelope_ds(double s, const Eel2DData& d)
+{
+    const double s_wave = mesh_s_to_wave_s(s, d);
+    const double xi =
+        (d.L > std::numeric_limits<double>::epsilon()) ? clamp_value(s_wave / d.L, 0.0, 1.0) : 0.0;
+    const bool use_cubic = (d.envelope_type == "cubic");
+    const double a_head_raw = use_cubic ? evaluate_cubic_envelope(0.0, d) : evaluate_quadratic_envelope(0.0, d);
+    const double a_tail_raw = use_cubic ? evaluate_cubic_envelope(1.0, d) : evaluate_quadratic_envelope(1.0, d);
+
+    if (a_tail_raw > a_head_raw + 1.0e-8)
+    {
+        const double dA_dxi =
+            use_cubic ? evaluate_cubic_envelope_dxi(xi, d) : evaluate_quadratic_envelope_dxi(xi, d);
+        return dA_dxi / std::max(d.L, std::numeric_limits<double>::epsilon());
+    }
+
+    const double a_head = fallback_envelope_head_amplitude(d);
+    const double a_tail = fallback_envelope_tail_amplitude(d);
+    return 2.0 * (a_tail - a_head) * xi / std::max(d.L, std::numeric_limits<double>::epsilon());
+}
+
+inline double
+body_wave_y(double s, double t, const Eel2DData& d)
+{
+    // Traveling-wave body kinematics follows the literature form
+    // y = A(s) sin(omega t - k s + phase0).
+    const double s_wave = mesh_s_to_wave_s(s, d);
+    const double phase = d.omega * t - d.k_wave * s_wave + d.wave_phase0;
+    return amplitude_envelope(s, d) * std::sin(phase);
+}
+
+inline double
+body_wave_v(double s, double t, const Eel2DData& d)
+{
+    // Time derivative of the traveling wave:
+    // dy/dt = omega A(s) cos(omega t - k s + phase0).
+    const double s_wave = mesh_s_to_wave_s(s, d);
+    const double phase = d.omega * t - d.k_wave * s_wave + d.wave_phase0;
+    return d.omega * amplitude_envelope(s, d) * std::cos(phase);
+}
+
+inline double
+body_wave_dy_ds(double s, double t, const Eel2DData& d)
+{
+    const double s_wave = mesh_s_to_wave_s(s, d);
+    const double phase = d.omega * t - d.k_wave * s_wave + d.wave_phase0;
+    return amplitude_envelope_ds(s, d) * std::sin(phase) - d.k_wave * amplitude_envelope(s, d) * std::cos(phase);
+}
+
+inline bool is_tail_region(double s, const Eel2DData& d)
+{
+    if (d.L_mesh <= std::numeric_limits<double>::epsilon()) return false;
+    const double xi = clamp_value(s / d.L_mesh, 0.0, 1.0);
+    return xi >= d.tail_xi_start;
+}
+
+inline double
+tail_nonlinear_restoring_force(double q, double k0, double a, double b)
+{
+    const double abs_q = std::abs(q);
+    return k0 * (q + a * q * abs_q + b * q * q * q);
+}
+
+inline double
+tail_equivalent_stiffness(double q, double k0, double a, double b)
+{
+    return std::max(0.0, k0 * (1.0 + 2.0 * a * std::abs(q) + 3.0 * b * q * q));
+}
+
+inline double
+tail_potential_energy(double q, double k0, double a, double b)
+{
+    const double abs_q = std::abs(q);
+    return 0.5 * k0 * q * q + (k0 * a / 3.0) * abs_q * abs_q * abs_q + 0.25 * k0 * b * q * q * q * q;
+}
+
+inline double
+stiffness_distribution(double s, const Eel2DData& d)
+{
+    if (d.stiffness_mode == "tail_gradient")
+    {
+        if (d.L_mesh <= std::numeric_limits<double>::epsilon()) return 1.0;
+        const double xi = clamp_value(s / d.L_mesh, 0.0, 1.0);
+        if (xi <= d.tail_xi_start) return 1.0;
+
+        const double denom = std::max(1.0 - d.tail_xi_start, std::numeric_limits<double>::epsilon());
+        const double eta = clamp_value((xi - d.tail_xi_start) / denom, 0.0, 1.0);
+        return 1.0 + (d.tail_stiffness_ratio - 1.0) * std::pow(eta, std::max(0.0, d.tail_stiffness_power));
+    }
+
+    // Stage-1 default: linear uniform stiffness.
+    return 1.0;
+}
+
+inline double
+compute_local_modulus(double s, double q, const Eel2DData& d)
+{
+    double scale = stiffness_distribution(s, d);
+
+    // Stage-1 approximation: reuse the existing hyperelastic coefficient c1_s
+    // and modulate it with a tail-only equivalent stiffness ratio.
+    if (d.use_tail_nonlinear_stiffness && is_tail_region(s, d))
+    {
+        const double k_ref = std::max(d.tail_k0, std::numeric_limits<double>::epsilon());
+        scale *= tail_equivalent_stiffness(q, d.tail_k0, d.tail_a, d.tail_b) / k_ref;
+    }
+
+    return std::max(d.c1_s * scale, 1.0e-12);
+}
+
+inline double smooth_step_tanh(double x, double eps)
+{
+    if (eps <= 0.0) return (x >= 0.0) ? 1.0 : 0.0;
+    return 0.5 * (1.0 + std::tanh(x / eps));
+}
+
+inline double mask_interval(double xi, double a, double b, double eps)
+{
+    const double m1 = smooth_step_tanh(xi - a, eps);
+    const double m2 = smooth_step_tanh(b - xi, eps);
+    return m1 * m2;
+}
+
+inline double ramp_factor(double time, double ramp_time)
+{
+    if (ramp_time <= 0.0) return 1.0;
+    return std::min(1.0, std::max(0.0, time / ramp_time));
 }
 
 inline void eel_raw_body_frame_kinematics(double s,
@@ -200,9 +608,9 @@ inline void eel_raw_body_frame_kinematics(double s,
                                           double& vel_y)
 {
     disp_x = 0.0;
-    disp_y = eel_centerline_y(s, time, d);
+    disp_y = body_wave_y(s, time, d);
     vel_x = 0.0;
-    vel_y = eel_centerline_v(s, time, d);
+    vel_y = body_wave_v(s, time, d);
 }
 
 void initialize_reference_projection_data(EquationSystems* equation_systems,
@@ -234,9 +642,6 @@ void initialize_reference_projection_data(EquationSystems* equation_systems,
 
     const double cr = std::cos(d.theta_ref);
     const double sr = std::sin(d.theta_ref);
-    const double dx_lead = d.x_leading - d.xcom_ref;
-    const double dy_lead = d.y_center0 - d.ycom_ref;
-    const double xhat_leading = cr * dx_lead + sr * dy_lead;
 
     double area_local = 0.0;
     double polar_moment_local = 0.0;
@@ -257,7 +662,8 @@ void initialize_reference_projection_data(EquationSystems* equation_systems,
             const double dy = x(1) - d.ycom_ref;
             const double xhat = cr * dx + sr * dy;
             const double yhat = -sr * dx + cr * dy;
-            const double s = xhat - xhat_leading;
+            double s = 0.0, eta = 0.0;
+            compute_body_coordinates(xhat, yhat, d, s, eta);
             const double w = JxW[qp];
 
             d.xhat_qp_ref.push_back(xhat);
@@ -274,6 +680,107 @@ void initialize_reference_projection_data(EquationSystems* equation_systems,
     IBTK_MPI::sumReduction(global_vals, 2);
     d.area_ref = global_vals[0];
     d.polar_moment_ref = global_vals[1];
+    d.cached_mode_valid = false;
+}
+
+void initialize_reference_body_geometry(MeshBase& mesh, Eel2DData& d)
+{
+    BoundaryInfo& boundary_info = mesh.get_boundary_info();
+    boundary_info.build_node_list_from_side_list();
+
+    const double cr = std::cos(d.theta_ref);
+    const double sr = std::sin(d.theta_ref);
+
+    double xhat_head_local = std::numeric_limits<double>::max();
+    double xhat_tail_local = -std::numeric_limits<double>::max();
+
+    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
+    {
+        const Node* node = *it;
+        if (!node) continue;
+
+        const double dx = (*node)(0) - d.xcom_ref;
+        const double dy = (*node)(1) - d.ycom_ref;
+        const double xhat = cr * dx + sr * dy;
+
+        xhat_head_local = std::min(xhat_head_local, xhat);
+        xhat_tail_local = std::max(xhat_tail_local, xhat);
+    }
+
+    d.xhat_head_ref = xhat_head_local;
+    d.xhat_tail_ref = xhat_tail_local;
+    IBTK_MPI::minReduction(&d.xhat_head_ref, 1);
+    IBTK_MPI::maxReduction(&d.xhat_tail_ref, 1);
+
+    d.L_mesh = std::max(d.xhat_tail_ref - d.xhat_head_ref, std::numeric_limits<double>::epsilon());
+    d.n_geom_pts = std::max(8, d.n_geom_pts);
+    d.ds_mesh = d.L_mesh / static_cast<double>(d.n_geom_pts - 1);
+
+    d.s_mesh_ref.resize(d.n_geom_pts);
+    d.y_center_ref.assign(d.n_geom_pts, 0.0);
+    d.half_width_ref.assign(d.n_geom_pts, 0.0);
+
+    std::vector<double> ymax_local(d.n_geom_pts, -std::numeric_limits<double>::max());
+    std::vector<double> ymin_local(d.n_geom_pts, std::numeric_limits<double>::max());
+    std::vector<double> count_local(d.n_geom_pts, 0.0);
+
+    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
+    {
+        const Node* node = *it;
+        if (!node) continue;
+
+        const double dx = (*node)(0) - d.xcom_ref;
+        const double dy = (*node)(1) - d.ycom_ref;
+        const double xhat = cr * dx + sr * dy;
+        const double yhat = -sr * dx + cr * dy;
+
+        const double s_mesh = clamp_value(xhat - d.xhat_head_ref, 0.0, d.L_mesh);
+        const int k = std::max(
+            0, std::min(d.n_geom_pts - 1, static_cast<int>(std::llround(s_mesh / d.ds_mesh))));
+
+        ymax_local[k] = std::max(ymax_local[k], yhat);
+        ymin_local[k] = std::min(ymin_local[k], yhat);
+        count_local[k] += 1.0;
+    }
+
+    IBTK_MPI::maxReduction(ymax_local.data(), d.n_geom_pts);
+    IBTK_MPI::minReduction(ymin_local.data(), d.n_geom_pts);
+    IBTK_MPI::sumReduction(count_local.data(), d.n_geom_pts);
+
+    for (int k = 0; k < d.n_geom_pts; ++k)
+    {
+        if (count_local[k] > 0.5) continue;
+
+        int kl = k - 1;
+        while (kl >= 0 && count_local[kl] < 0.5) --kl;
+        int kr = k + 1;
+        while (kr < d.n_geom_pts && count_local[kr] < 0.5) ++kr;
+
+        if (kl >= 0 && kr < d.n_geom_pts)
+        {
+            const double a = static_cast<double>(k - kl) / static_cast<double>(kr - kl);
+            ymax_local[k] = (1.0 - a) * ymax_local[kl] + a * ymax_local[kr];
+            ymin_local[k] = (1.0 - a) * ymin_local[kl] + a * ymin_local[kr];
+        }
+        else if (kl >= 0)
+        {
+            ymax_local[k] = ymax_local[kl];
+            ymin_local[k] = ymin_local[kl];
+        }
+        else if (kr < d.n_geom_pts)
+        {
+            ymax_local[k] = ymax_local[kr];
+            ymin_local[k] = ymin_local[kr];
+        }
+    }
+
+    for (int k = 0; k < d.n_geom_pts; ++k)
+    {
+        d.s_mesh_ref[k] = static_cast<double>(k) * d.ds_mesh;
+        d.y_center_ref[k] = 0.5 * (ymax_local[k] + ymin_local[k]);
+        d.half_width_ref[k] = std::max(0.0, 0.5 * (ymax_local[k] - ymin_local[k]));
+    }
+
     d.cached_mode_valid = false;
 }
 
@@ -315,6 +822,99 @@ void update_projected_kinematics_cache(double time, Eel2DData& d)
 
     d.cached_mode_time = time;
     d.cached_mode_valid = true;
+}
+
+void initialize_rigid_body_dynamics(Eel2DData& d)
+{
+    d.body_mass = std::max(d.body_density * d.area_ref, std::numeric_limits<double>::epsilon());
+    d.body_inertia = std::max(d.body_density * d.polar_moment_ref, std::numeric_limits<double>::epsilon());
+    d.u_com_current = 0.0;
+    d.v_com_current = 0.0;
+    d.omega_body_current = 0.0;
+    d.xcom_observed_prev = d.xcom_cur;
+    d.ycom_observed_prev = d.ycom_cur;
+    d.theta_observed_prev = d.theta_cur;
+    d.hydrodynamic_force_x = 0.0;
+    d.hydrodynamic_force_y = 0.0;
+    d.hydrodynamic_torque_z = 0.0;
+    d.rigid_dynamics_initialized = true;
+}
+
+void compute_hydrodynamic_force_and_torque(double xcom_observed,
+                                           double ycom_observed,
+                                           double theta_observed,
+                                           double dt,
+                                           Eel2DData& d,
+                                           double& fx,
+                                           double& fy,
+                                           double& torque_z)
+{
+    fx = 0.0;
+    fy = 0.0;
+    torque_z = 0.0;
+
+    if (!d.rigid_dynamics_initialized || dt <= std::numeric_limits<double>::epsilon()) return;
+
+    // Stage-1 approximation: the active-stress IBFE path does not expose a
+    // clean external load accumulator, so infer the net hydrodynamic load from
+    // the resolved rigid-body acceleration of the FE body.
+    const double u_observed = (xcom_observed - d.xcom_observed_prev) / dt;
+    const double v_observed = (ycom_observed - d.ycom_observed_prev) / dt;
+    const double omega_observed = wrap_angle(theta_observed - d.theta_observed_prev) / dt;
+
+    fx = d.body_mass * (u_observed - d.u_com_current) / dt;
+    fy = d.body_mass * (v_observed - d.v_com_current) / dt;
+    torque_z = d.body_inertia * (omega_observed - d.omega_body_current) / dt;
+}
+
+void integrate_linear_momentum(double fx, double fy, double dt, Eel2DData& d)
+{
+    if (d.body_mass <= std::numeric_limits<double>::epsilon()) return;
+    d.u_com_current += dt * fx / d.body_mass;
+    d.v_com_current += dt * fy / d.body_mass;
+}
+
+void integrate_angular_momentum(double torque_z, double dt, Eel2DData& d)
+{
+    if (d.body_inertia <= std::numeric_limits<double>::epsilon()) return;
+    d.omega_body_current += dt * torque_z / d.body_inertia;
+}
+
+void update_free_swimming_pose(double xcom_observed,
+                               double ycom_observed,
+                               double theta_observed,
+                               double dt,
+                               Eel2DData& d)
+{
+    d.xcom_cur += dt * d.u_com_current;
+    d.ycom_cur += dt * d.v_com_current;
+    d.theta_cur = wrap_angle(d.theta_cur + dt * d.omega_body_current);
+
+    // Stage-1 coupling keeps the rigid-body state aligned with the resolved FE
+    // geometry to avoid drift without a larger solver refactor.
+    d.xcom_cur = xcom_observed;
+    d.ycom_cur = ycom_observed;
+    d.theta_cur = theta_observed;
+
+    d.xcom_observed_prev = xcom_observed;
+    d.ycom_observed_prev = ycom_observed;
+    d.theta_observed_prev = theta_observed;
+}
+
+bool is_self_propelled_steady_state(const Eel2DData& d)
+{
+    const double period = (std::abs(d.omega) > std::numeric_limits<double>::epsilon()) ? 2.0 * PI_VAL / std::abs(d.omega) : 0.0;
+    if (period <= 0.0 || d.mean_speed_time < d.steady_min_cycles * period) return false;
+
+    const double speed = std::sqrt(d.u_com_current * d.u_com_current + d.v_com_current * d.v_com_current);
+    const double mean_speed =
+        (d.mean_speed_time > std::numeric_limits<double>::epsilon()) ? d.mean_speed_integral / d.mean_speed_time : speed;
+    const double force_norm =
+        std::sqrt(d.hydrodynamic_force_x * d.hydrodynamic_force_x + d.hydrodynamic_force_y * d.hydrodynamic_force_y);
+    const double speed_scale = std::max(mean_speed, 1.0e-8);
+
+    return force_norm <= d.steady_force_tol &&
+           std::abs(speed - mean_speed) / speed_scale <= d.steady_speed_rel_tol;
 }
 
 void compute_com_and_orientation(EquationSystems* equation_systems,
@@ -570,6 +1170,171 @@ double compute_tail_y(EquationSystems* equation_systems,
     return local_vals[0] / local_vals[1];
 }
 
+double compute_attack_angle(double vx, double vy, double theta)
+{
+    if (std::sqrt(vx * vx + vy * vy) <= 1.0e-12) return 0.0;
+    return wrap_angle(theta - std::atan2(vy, vx));
+}
+
+double compute_tail_attack_angle(double time,
+                                 Eel2DData& d,
+                                 double& tail_vx,
+                                 double& tail_vy,
+                                 double& tail_heading,
+                                 double& tail_q)
+{
+    update_projected_kinematics_cache(time, d);
+
+    const double s_tail = d.L_mesh;
+    const double xhat_ref = d.xhat_tail_ref;
+    const double yhat_ref = mesh_centerline_y(s_tail, d);
+
+    double disp_x_raw = 0.0, disp_y_raw = 0.0, vel_x_raw = 0.0, vel_y_raw = 0.0;
+    eel_raw_body_frame_kinematics(s_tail, time, d, disp_x_raw, disp_y_raw, vel_x_raw, vel_y_raw);
+
+    const double disp_x = disp_x_raw - d.disp_tx + d.disp_rot * yhat_ref;
+    const double disp_y = disp_y_raw - d.disp_ty - d.disp_rot * xhat_ref;
+    const double vel_x = vel_x_raw - d.vel_tx + d.vel_rot * yhat_ref;
+    const double vel_y = vel_y_raw - d.vel_ty - d.vel_rot * xhat_ref;
+
+    const double xhat_tail = xhat_ref + disp_x;
+    const double yhat_tail = yhat_ref + disp_y;
+    const double ct = std::cos(d.theta_cur);
+    const double st = std::sin(d.theta_cur);
+    const double rx = ct * xhat_tail - st * yhat_tail;
+    const double ry = st * xhat_tail + ct * yhat_tail;
+
+    tail_vx = d.u_com_current - d.omega_body_current * ry + ct * vel_x - st * vel_y;
+    tail_vy = d.v_com_current + d.omega_body_current * rx + st * vel_x + ct * vel_y;
+    tail_heading = d.theta_cur + std::atan(body_wave_dy_ds(s_tail, time, d));
+    tail_q = yhat_tail - mesh_centerline_y(s_tail, d);
+    return compute_attack_angle(tail_vx, tail_vy, tail_heading);
+}
+
+double compute_alpha_max_over_cycle(double alpha, double time, Eel2DData& d)
+{
+    const double period = (std::abs(d.omega) > std::numeric_limits<double>::epsilon()) ? 2.0 * PI_VAL / std::abs(d.omega) : 0.0;
+    if (period <= 0.0)
+    {
+        d.alpha_cycle_max_current = std::max(d.alpha_cycle_max_current, std::abs(alpha));
+        return d.alpha_cycle_max_current;
+    }
+
+    const int cycle_index = static_cast<int>(std::floor(time / period + 1.0e-12));
+    if (!d.alpha_cycle_initialized)
+    {
+        d.alpha_cycle_index = cycle_index;
+        d.alpha_cycle_max_current = std::abs(alpha);
+        d.alpha_cycle_max_last = std::abs(alpha);
+        d.alpha_cycle_initialized = true;
+        return d.alpha_cycle_max_current;
+    }
+
+    if (cycle_index != d.alpha_cycle_index)
+    {
+        d.alpha_cycle_max_last = d.alpha_cycle_max_current;
+        d.alpha_cycle_index = cycle_index;
+        d.alpha_cycle_max_current = std::abs(alpha);
+    }
+    else
+    {
+        d.alpha_cycle_max_current = std::max(d.alpha_cycle_max_current, std::abs(alpha));
+    }
+    return d.alpha_cycle_max_current;
+}
+
+double compute_output_power(double fx, double fy, double torque_z, double u, double v, double omega_body)
+{
+    return std::max(0.0, -(fx * u + fy * v + torque_z * omega_body));
+}
+
+double compute_input_power(double pout_inst, double tail_elastic_power_rate)
+{
+    // Stage-1 approximation: estimate the required actuation power as useful
+    // output power plus the positive rate of tail elastic energy storage.
+    return std::max(0.0, pout_inst) + std::max(0.0, tail_elastic_power_rate);
+}
+
+double compute_froude_efficiency(double Pout_avg, double Pin_avg)
+{
+    if (Pin_avg <= std::numeric_limits<double>::epsilon()) return 0.0;
+    return Pout_avg / Pin_avg;
+}
+
+double compute_cost_of_transport(double Pin_avg, double mass, double mean_speed)
+{
+    const double denom = mass * mean_speed;
+    if (denom <= std::numeric_limits<double>::epsilon()) return 0.0;
+    return Pin_avg / denom;
+}
+
+double compute_mean_swimming_speed(double speed_inst, double dt, Eel2DData& d)
+{
+    if (dt > 0.0)
+    {
+        d.mean_speed_integral += speed_inst * dt;
+        d.mean_speed_time += dt;
+    }
+    if (d.mean_speed_time <= std::numeric_limits<double>::epsilon()) return speed_inst;
+    return d.mean_speed_integral / d.mean_speed_time;
+}
+
+double compute_reynolds_number(double U, double L, double nu)
+{
+    if (nu <= std::numeric_limits<double>::epsilon()) return 0.0;
+    return U * L / nu;
+}
+
+double compute_strouhal_number(double f, double AF, double U)
+{
+    if (U <= std::numeric_limits<double>::epsilon()) return 0.0;
+    return f * AF / U;
+}
+
+double compute_tail_peak_to_peak_amplitude(double tail_q, double time, Eel2DData& d)
+{
+    const double period = (std::abs(d.omega) > std::numeric_limits<double>::epsilon()) ? 2.0 * PI_VAL / std::abs(d.omega) : 0.0;
+    if (period <= 0.0)
+    {
+        if (!d.tail_cycle_initialized)
+        {
+            d.tail_q_cycle_min = tail_q;
+            d.tail_q_cycle_max = tail_q;
+            d.tail_peak_to_peak_last = 0.0;
+            d.tail_cycle_initialized = true;
+        }
+        d.tail_q_cycle_min = std::min(d.tail_q_cycle_min, tail_q);
+        d.tail_q_cycle_max = std::max(d.tail_q_cycle_max, tail_q);
+        return d.tail_q_cycle_max - d.tail_q_cycle_min;
+    }
+
+    const int cycle_index = static_cast<int>(std::floor(time / period + 1.0e-12));
+    if (!d.tail_cycle_initialized)
+    {
+        d.tail_cycle_index = cycle_index;
+        d.tail_q_cycle_min = tail_q;
+        d.tail_q_cycle_max = tail_q;
+        d.tail_peak_to_peak_last = 0.0;
+        d.tail_cycle_initialized = true;
+        return 0.0;
+    }
+
+    if (cycle_index != d.tail_cycle_index)
+    {
+        d.tail_peak_to_peak_last = d.tail_q_cycle_max - d.tail_q_cycle_min;
+        d.tail_cycle_index = cycle_index;
+        d.tail_q_cycle_min = tail_q;
+        d.tail_q_cycle_max = tail_q;
+    }
+    else
+    {
+        d.tail_q_cycle_min = std::min(d.tail_q_cycle_min, tail_q);
+        d.tail_q_cycle_max = std::max(d.tail_q_cycle_max, tail_q);
+    }
+
+    return d.tail_q_cycle_max - d.tail_q_cycle_min;
+}
+
 inline void compute_eel_target(
     const libMesh::Point& X,
     double time,
@@ -604,18 +1369,8 @@ compute_eel_target(const libMesh::Point& X,
     const double xhat_ref =  cr * dx_ref + sr * dy_ref;
     const double yhat_ref = -sr * dx_ref + cr * dy_ref;
 
-    // ------------------------------------------------------------
-    // 2) 参考头部点（leading point）也转换到 reference body frame
-    //    用它来定义真正一致的轴向坐标 s
-    // ------------------------------------------------------------
-    const double dx_lead = d.x_leading - d.xcom_ref;
-    const double dy_lead = d.y_center0 - d.ycom_ref;
-
-    const double xhat_leading =  cr * dx_lead + sr * dy_lead;
-    // const double yhat_leading = -sr * dx_lead + cr * dy_lead; // 若后续需要可保留
-
-    // body-frame axial coordinate measured from the leading point
-    const double s = xhat_ref - xhat_leading;
+    double s = 0.0, eta = 0.0;
+    compute_body_coordinates(xhat_ref, yhat_ref, d, s, eta);
 
     // ------------------------------------------------------------
     // 3) 在 reference body frame 中施加 eel 的横向行波形变
@@ -654,39 +1409,74 @@ void
 PK1_stress_function(TensorValue<double>& PP,
                     const TensorValue<double>& FF,
                     const libMesh::Point& /*x*/,
-                    const libMesh::Point& /*X*/,
+                    const libMesh::Point& X,
                     Elem* const /*elem*/,
                     const vector<const vector<double>*>& /*var_data*/,
                     const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                    double /*time*/,
+                    double time,
                     void* ctx)
 {
     const Eel2DData* const d = reinterpret_cast<Eel2DData*>(ctx);
 
-    PP = 2.0 * d->c1_s * (FF - tensor_inverse_transpose(FF, NDIM));
+    const double cr = std::cos(d->theta_ref);
+    const double sr = std::sin(d->theta_ref);
+
+    const double dx_ref = X(0) - d->xcom_ref;
+    const double dy_ref = X(1) - d->ycom_ref;
+    const double xhat_ref = cr * dx_ref + sr * dy_ref;
+    const double yhat_ref = -sr * dx_ref + cr * dy_ref;
+
+    double s = 0.0, eta = 0.0;
+    compute_body_coordinates(xhat_ref, yhat_ref, *d, s, eta);
+
+    const double q_local = body_wave_y(s, time, *d);
+    const double local_modulus = compute_local_modulus(s, q_local, *d);
+    PP = 2.0 * local_modulus * (FF - tensor_inverse_transpose(FF, NDIM));
+
+    if (!d->use_active_stress) return;
+
+    const double h = body_half_width(s, *d);
+    if (h <= 1.0e-12) return;
+
+    const double xi = clamp_value(s / d->L_mesh, 0.0, 1.0);
+    const double s_wave = d->L * xi;
+    const double m_space = mask_interval(xi, d->active_xi_start, d->active_xi_end, d->active_xi_eps);
+    if (m_space <= 0.0) return;
+
+    const double envelope = (s_wave + d->s_shift) / (d->L + d->s_shift);
+    const double eta_over_h = std::max(-1.0, std::min(1.0, eta / h));
+    const double phase = d->k_wave * s_wave - d->omega * time + d->active_phase0;
+    const double Tact =
+        d->active_stress_t0 * ramp_factor(time, d->active_ramp_time) * m_space * envelope * eta_over_h * std::sin(phase);
+
+    libMesh::VectorValue<double> A0;
+    A0(0) = cr;
+    A0(1) = sr;
+#if (NDIM == 3)
+    A0(2) = 0.0;
+#endif
+
+    const auto FA0 = FF * A0;
+    TensorValue<double> PP_active;
+    outer_product(PP_active, FA0, A0);
+    PP += Tact * PP_active;
     return;
 } // PK1_stress_function
 
-// Tether (penalty) force functions.
+// Legacy target-penalty force path. The active-stress swimmer keeps this disabled.
 void
 eel_body_force_function(libMesh::VectorValue<double>& F,
                         const libMesh::TensorValue<double>& /*FF*/,
-                        const libMesh::Point& x,
-                        const libMesh::Point& X,
+                        const libMesh::Point& /*x*/,
+                        const libMesh::Point& /*X*/,
                         libMesh::Elem* const /*elem*/,
-                        const std::vector<const std::vector<double>*>& var_data,
+                        const std::vector<const std::vector<double>*>& /*var_data*/,
                         const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*grad_var_data*/,
-                        double time,
-                        void* ctx)
+                        double /*time*/,
+                        void* /*ctx*/)
 {
-    Eel2DData* d = reinterpret_cast<Eel2DData*>(ctx);
-    const std::vector<double>& U = *var_data[0];
-
-    double xtar, ytar, utar_x, utar_y;
-    compute_eel_target(X, time, *d, xtar, ytar, utar_x, utar_y);
-
-    F(0) = d->kappa_s_body * (xtar - x(0)) + d->eta_s_body * (utar_x - U[0]);
-    F(1) = d->kappa_s_body * (ytar - x(1)) + d->eta_s_body * (utar_y - U[1]);
+    F(0) = 0.0;
+    F(1) = 0.0;
 }
 
 void
@@ -718,7 +1508,8 @@ eel_surface_force_function(VectorValue<double>& F,
 using namespace ModelData;
 
 // Function prototypes
-static ofstream drag_stream, lift_stream, U_L1_norm_stream, U_L2_norm_stream, U_max_norm_stream, pose_stream;
+static ofstream drag_stream, lift_stream, U_L1_norm_stream, U_L2_norm_stream, U_max_norm_stream, pose_stream,
+    swim_diag_stream;
 void postprocess_data(Pointer<Database> input_db,
                       Pointer<PatchHierarchy<NDIM> > patch_hierarchy,
                       Pointer<INSHierarchyIntegrator> navier_stokes_integrator,
@@ -876,23 +1667,17 @@ main(int argc, char* argv[])
         void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
         EquationSystems* equation_systems;
         std::string coords_system_name, velocity_system_name;
-        std::vector<int> vars(NDIM);
-        for (unsigned int d = 0; d < NDIM; ++d) vars[d] = d;
         Pointer<IBFEMethod> ibfe_ops = ib_ops;
         ibfe_ops->initializeFEEquationSystems();
         equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
         coords_system_name = ibfe_ops->getCurrentCoordinatesSystemName();
         velocity_system_name = ibfe_ops->getVelocitySystemName();
-        vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
 
         IBFEMethod::PK1StressFcnData PK1_stress_data(
             PK1_stress_function, std::vector<IBTK::SystemData>(), eel_data_ptr);
         PK1_stress_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_QUAD_ORDER", "THIRD"));
         ibfe_ops->registerPK1StressFunction(PK1_stress_data);
-
-        IBFEMethod::LagBodyForceFcnData body_fcn_data(eel_body_force_function, sys_data, eel_data_ptr);
-        ibfe_ops->registerLagBodyForceFunction(body_fcn_data);
 
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
         {
@@ -971,7 +1756,9 @@ main(int argc, char* argv[])
         eel_data.xcom_ref = eel_data.xcom_cur;
         eel_data.ycom_ref = eel_data.ycom_cur;
         eel_data.theta_ref = eel_data.theta_cur;
+        initialize_reference_body_geometry(mesh, eel_data);
         initialize_reference_projection_data(equation_systems, coords_system_name, mesh, eel_data);
+        initialize_rigid_body_dynamics(eel_data);
 
         // Deallocate initialization objects.
         app_initializer.setNull();
@@ -1008,6 +1795,7 @@ main(int argc, char* argv[])
             U_L2_norm_stream.open("U_L2.curve", ios_base::out | ios_base::trunc);
             U_max_norm_stream.open("U_max.curve", ios_base::out | ios_base::trunc);
             pose_stream.open("pose.curve", ios_base::out | ios_base::trunc);
+            swim_diag_stream.open("swim_diagnostics.curve", ios_base::out | ios_base::trunc);
 
             drag_stream.precision(10);
             lift_stream.precision(10);
@@ -1015,7 +1803,12 @@ main(int argc, char* argv[])
             U_L2_norm_stream.precision(10);
             U_max_norm_stream.precision(10);
             pose_stream.precision(10);
+            swim_diag_stream.precision(10);
             pose_stream << "# iter time x_com y_com theta tail_y" << endl;
+            swim_diag_stream
+                << "# iter time u_com v_com omega_body Fx_h Fy_h Tz_h tail_alpha alpha_max_cycle tail_q AF "
+                   "Pout Pin Pout_avg Pin_avg eta_F CoT U_mean Re St k_tail_eq F_tail_restore steady"
+                << endl;
         }
 
         // Main time step loop.
@@ -1047,6 +1840,37 @@ main(int argc, char* argv[])
 
             time_integrator->advanceHierarchy(dt);
             loop_time += dt;
+
+            double xcom_observed = 0.0, ycom_observed = 0.0, theta_observed = 0.0;
+            compute_com_and_rigid_pose(equation_systems,
+                                       coords_system_name,
+                                       mesh,
+                                       eel_data,
+                                       xcom_observed,
+                                       ycom_observed,
+                                       theta_observed,
+                                       eel_data.theta_cur);
+
+            double hydrodynamic_fx = 0.0, hydrodynamic_fy = 0.0, hydrodynamic_torque = 0.0;
+            compute_hydrodynamic_force_and_torque(xcom_observed,
+                                                  ycom_observed,
+                                                  theta_observed,
+                                                  dt,
+                                                  eel_data,
+                                                  hydrodynamic_fx,
+                                                  hydrodynamic_fy,
+                                                  hydrodynamic_torque);
+            integrate_linear_momentum(hydrodynamic_fx, hydrodynamic_fy, dt, eel_data);
+            integrate_angular_momentum(hydrodynamic_torque, dt, eel_data);
+            update_free_swimming_pose(xcom_observed, ycom_observed, theta_observed, dt, eel_data);
+            eel_data.hydrodynamic_force_x = hydrodynamic_fx;
+            eel_data.hydrodynamic_force_y = hydrodynamic_fy;
+            eel_data.hydrodynamic_torque_z = hydrodynamic_torque;
+
+            pout << "Rigid velocity: (" << eel_data.u_com_current << ", " << eel_data.v_com_current << ", "
+                 << eel_data.omega_body_current << ")\n";
+            pout << "Hydrodynamic load (stage-1 inferred): (" << hydrodynamic_fx << ", " << hydrodynamic_fy << ", "
+                 << hydrodynamic_torque << ")\n";
 
             pout << "\n";
             pout << "At end       of timestep # " << iteration_num << "\n";
@@ -1108,6 +1932,7 @@ main(int argc, char* argv[])
             U_L2_norm_stream.close();
             U_max_norm_stream.close();
             pose_stream.close();
+            swim_diag_stream.close();
         }
 
         // Cleanup Eulerian boundary condition specification objects (when
@@ -1294,6 +2119,8 @@ postprocess_data(Pointer<Database> input_db,
         }
     }
     IBTK_MPI::sumReduction(F_integral, NDIM);
+    F_integral[0] = eel_data->hydrodynamic_force_x;
+    F_integral[1] = eel_data->hydrodynamic_force_y;
 
     static double theta_prev_post = std::numeric_limits<double>::quiet_NaN();
     double xcom = 0.0, ycom = 0.0, theta = 0.0;
@@ -1308,7 +2135,57 @@ postprocess_data(Pointer<Database> input_db,
     theta_prev_post = theta;
     const double tail_y = compute_tail_y(equation_systems, coords_system_name, mesh, *eel_data);
 
-    static const double rho = 1.0;
+    double tail_vx = 0.0, tail_vy = 0.0, tail_heading = 0.0, tail_q = 0.0;
+    const double tail_alpha = compute_tail_attack_angle(loop_time, *eel_data, tail_vx, tail_vy, tail_heading, tail_q);
+    const double alpha_max_cycle = compute_alpha_max_over_cycle(tail_alpha, loop_time, *eel_data);
+    const double AF = compute_tail_peak_to_peak_amplitude(tail_q, loop_time, *eel_data);
+    const double tail_stiff_scale = stiffness_distribution(eel_data->L_mesh, *eel_data);
+    const double tail_k_eq =
+        tail_stiff_scale * tail_equivalent_stiffness(tail_q, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
+    const double tail_restore =
+        tail_stiff_scale * tail_nonlinear_restoring_force(tail_q, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
+
+    const double speed_inst =
+        std::sqrt(eel_data->u_com_current * eel_data->u_com_current + eel_data->v_com_current * eel_data->v_com_current);
+    const double dt_diag =
+        eel_data->diagnostics_initialized ? std::max(0.0, loop_time - eel_data->diagnostics_prev_time) : 0.0;
+    const double tail_potential =
+        tail_stiff_scale * tail_potential_energy(tail_q, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
+    const double tail_potential_rate =
+        (dt_diag > std::numeric_limits<double>::epsilon()) ? (tail_potential - eel_data->tail_potential_prev) / dt_diag : 0.0;
+
+    const double pout_inst = compute_output_power(eel_data->hydrodynamic_force_x,
+                                                  eel_data->hydrodynamic_force_y,
+                                                  eel_data->hydrodynamic_torque_z,
+                                                  eel_data->u_com_current,
+                                                  eel_data->v_com_current,
+                                                  eel_data->omega_body_current);
+    const double pin_inst = compute_input_power(pout_inst, tail_potential_rate);
+    const double mean_speed = compute_mean_swimming_speed(speed_inst, dt_diag, *eel_data);
+
+    if (dt_diag > 0.0)
+    {
+        eel_data->pout_integral += pout_inst * dt_diag;
+        eel_data->pin_integral += pin_inst * dt_diag;
+    }
+
+    const double avg_time = std::max(eel_data->mean_speed_time, std::numeric_limits<double>::epsilon());
+    const double pout_avg = eel_data->pout_integral / avg_time;
+    const double pin_avg = eel_data->pin_integral / avg_time;
+    const double eta_f = compute_froude_efficiency(pout_avg, pin_avg);
+    const double cot = compute_cost_of_transport(pin_avg, eel_data->body_mass, mean_speed);
+    const double rho = input_db->getDoubleWithDefault("RHO", 1.0);
+    const double mu = input_db->getDoubleWithDefault("MU", 1.0);
+    const double nu = (rho > std::numeric_limits<double>::epsilon()) ? mu / rho : 0.0;
+    const double f_tail = std::abs(eel_data->omega) / (2.0 * PI_VAL);
+    const double reynolds = compute_reynolds_number(mean_speed, eel_data->L, nu);
+    const double strouhal = compute_strouhal_number(f_tail, AF, mean_speed);
+    const int steady_flag = is_self_propelled_steady_state(*eel_data) ? 1 : 0;
+
+    eel_data->diagnostics_prev_time = loop_time;
+    eel_data->tail_potential_prev = tail_potential;
+    eel_data->diagnostics_initialized = true;
+
     static const double U_max = 1.0;
     static const double D = 1.0;
     if (IBTK_MPI::getRank() == 0)
@@ -1316,6 +2193,13 @@ postprocess_data(Pointer<Database> input_db,
         drag_stream << loop_time << " " << -F_integral[0] / (0.5 * rho * U_max * U_max * D) << endl;
         lift_stream << loop_time << " " << -F_integral[1] / (0.5 * rho * U_max * U_max * D) << endl;
         pose_stream << iteration_num << " " << loop_time << " " << xcom << " " << ycom << " " << theta << " " << tail_y << endl;
+        swim_diag_stream << iteration_num << " " << loop_time << " " << eel_data->u_com_current << " "
+                         << eel_data->v_com_current << " " << eel_data->omega_body_current << " "
+                         << eel_data->hydrodynamic_force_x << " " << eel_data->hydrodynamic_force_y << " "
+                         << eel_data->hydrodynamic_torque_z << " " << tail_alpha << " " << alpha_max_cycle << " "
+                         << tail_q << " " << AF << " " << pout_inst << " " << pin_inst << " " << pout_avg << " "
+                         << pin_avg << " " << eta_f << " " << cot << " " << mean_speed << " " << reynolds << " "
+                         << strouhal << " " << tail_k_eq << " " << tail_restore << " " << steady_flag << endl;
     }
     return;
 } // postprocess_data
