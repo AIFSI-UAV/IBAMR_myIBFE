@@ -149,6 +149,17 @@ struct Eel2DData
     std::vector<double> y_center_ref;
     std::vector<double> half_width_ref;
 
+    // 当前 FE 网格在刚体 body frame 下重建得到的中心线缓存
+    std::vector<double> x_center_cur_cache;
+    std::vector<double> y_center_cur_cache;
+    std::vector<double> curvature_cur_cache;
+    std::vector<double> axial_strain_cur_cache;
+    double cached_centerline_time;
+    double cached_centerline_xcom;
+    double cached_centerline_ycom;
+    double cached_centerline_theta;
+    bool cached_centerline_valid;
+
     // 自由游动位姿（全局平移 + 转动），每步由当前网格几何更新
     double xcom_cur;
     double ycom_cur;
@@ -177,7 +188,7 @@ struct Eel2DData
     double vel_ty;
     double vel_rot;
 
-    // free-swimming rigid-body state inferred from the resolved FE motion
+    // explicitly advanced free-swimming rigid-body state
     double body_density;
     double body_mass;
     double body_inertia;
@@ -187,6 +198,9 @@ struct Eel2DData
     double xcom_observed_prev;
     double ycom_observed_prev;
     double theta_observed_prev;
+    double actuation_force_x;
+    double actuation_force_y;
+    double actuation_torque_z;
     double hydrodynamic_force_x;
     double hydrodynamic_force_y;
     double hydrodynamic_torque_z;
@@ -225,8 +239,10 @@ struct Eel2DData
 
     Eel2DData(Pointer<Database> input_db)
       : c1_s(input_db->getDouble("C1_S")),
-        kappa_s_body(input_db->getDouble("KAPPA_S_BODY")),
-        eta_s_body(input_db->getDouble("ETA_S_BODY")),
+        kappa_s_body(input_db->getDoubleWithDefault("KAPPA_S_BODY",
+                                                    input_db->getDoubleWithDefault("KAPPA_S", 0.0))),
+        eta_s_body(input_db->getDoubleWithDefault("ETA_S_BODY",
+                                                  input_db->getDoubleWithDefault("ETA_S", 0.0))),
         kappa_s_surface(input_db->getDouble("KAPPA_S_SURFACE")),
         eta_s_surface(input_db->getDouble("ETA_S_SURFACE")),
         L(input_db->getDouble("EEL_LENGTH")),
@@ -314,6 +330,8 @@ struct Eel2DData
         xhat_tail_ref(0.0),
         L_mesh(0.0),
         ds_mesh(0.0),
+        cached_centerline_time(0.0), cached_centerline_xcom(0.0), cached_centerline_ycom(0.0),
+        cached_centerline_theta(0.0), cached_centerline_valid(false),
         xcom_cur(0.0), ycom_cur(0.0), theta_cur(0.0),
         xcom_ref(0.0), ycom_ref(0.0), theta_ref(0.0),
         area_ref(0.0), polar_moment_ref(0.0),
@@ -326,6 +344,7 @@ struct Eel2DData
         body_inertia(0.0),
         u_com_current(0.0), v_com_current(0.0), omega_body_current(0.0),
         xcom_observed_prev(0.0), ycom_observed_prev(0.0), theta_observed_prev(0.0),
+        actuation_force_x(0.0), actuation_force_y(0.0), actuation_torque_z(0.0),
         hydrodynamic_force_x(0.0), hydrodynamic_force_y(0.0), hydrodynamic_torque_z(0.0),
         steady_force_tol(input_db->getDoubleWithDefault("STEADY_FORCE_TOL", 1.0e-4)),
         steady_speed_rel_tol(input_db->getDoubleWithDefault("STEADY_SPEED_REL_TOL", 5.0e-2)),
@@ -352,6 +371,12 @@ struct Eel2DData
 };
 
 static Eel2DData* s_eel_data_state = nullptr;
+static EquationSystems* s_equation_systems_state = nullptr;
+static MeshBase* s_mesh_state = nullptr;
+static std::string s_coords_system_name_state;
+
+void update_current_centerline_cache_from_global_state(double time, Eel2DData& d);
+inline double current_centerline_curvature(double s_mesh, const Eel2DData& d);
 
 inline double
 clamp_value(double x, double a, double b)
@@ -382,17 +407,30 @@ inline double body_half_width(double s, const Eel2DData& d)
 }
 
 inline double
-mesh_centerline_y(double s_mesh, const Eel2DData& d)
+interpolate_body_grid_values(double s_mesh, const std::vector<double>& values, const Eel2DData& d)
 {
-    if (d.y_center_ref.empty()) return 0.0;
-    if (d.y_center_ref.size() == 1 || d.L_mesh <= std::numeric_limits<double>::epsilon()) return d.y_center_ref.front();
+    if (values.empty()) return 0.0;
+    if (values.size() == 1 || d.L_mesh <= std::numeric_limits<double>::epsilon()) return values.front();
 
     const double s = clamp_value(s_mesh, 0.0, d.L_mesh);
     const double r = s / d.ds_mesh;
     const std::size_t i =
-        std::min<std::size_t>(d.y_center_ref.size() - 2, static_cast<std::size_t>(std::floor(r)));
+        std::min<std::size_t>(values.size() - 2, static_cast<std::size_t>(std::floor(r)));
     const double a = r - static_cast<double>(i);
-    return (1.0 - a) * d.y_center_ref[i] + a * d.y_center_ref[i + 1];
+    return (1.0 - a) * values[i] + a * values[i + 1];
+}
+
+inline double
+mesh_centerline_y(double s_mesh, const Eel2DData& d)
+{
+    return interpolate_body_grid_values(s_mesh, d.y_center_ref, d);
+}
+
+inline double
+mesh_to_wave_scale(const Eel2DData& d)
+{
+    if (d.L_mesh <= std::numeric_limits<double>::epsilon()) return 0.0;
+    return d.L / d.L_mesh;
 }
 
 inline double
@@ -483,12 +521,12 @@ amplitude_envelope_ds(double s, const Eel2DData& d)
     {
         const double dA_dxi =
             use_cubic ? evaluate_cubic_envelope_dxi(xi, d) : evaluate_quadratic_envelope_dxi(xi, d);
-        return dA_dxi / std::max(d.L, std::numeric_limits<double>::epsilon());
+        return dA_dxi / std::max(d.L_mesh, std::numeric_limits<double>::epsilon());
     }
 
     const double a_head = fallback_envelope_head_amplitude(d);
     const double a_tail = fallback_envelope_tail_amplitude(d);
-    return 2.0 * (a_tail - a_head) * xi / std::max(d.L, std::numeric_limits<double>::epsilon());
+    return 2.0 * (a_tail - a_head) * xi / std::max(d.L_mesh, std::numeric_limits<double>::epsilon());
 }
 
 inline double
@@ -516,7 +554,8 @@ body_wave_dy_ds(double s, double t, const Eel2DData& d)
 {
     const double s_wave = mesh_s_to_wave_s(s, d);
     const double phase = d.omega * t - d.k_wave * s_wave + d.wave_phase0;
-    return amplitude_envelope_ds(s, d) * std::sin(phase) - d.k_wave * amplitude_envelope(s, d) * std::cos(phase);
+    return amplitude_envelope_ds(s, d) * std::sin(phase) -
+           d.k_wave * mesh_to_wave_scale(d) * amplitude_envelope(s, d) * std::cos(phase);
 }
 
 inline bool is_tail_region(double s, const Eel2DData& d)
@@ -565,16 +604,78 @@ stiffness_distribution(double s, const Eel2DData& d)
 }
 
 inline double
-compute_local_modulus(double s, double q, const Eel2DData& d)
+compute_effective_tail_deformation(double transverse_deflection,
+                                   double axial_strain,
+                                   double curvature_like,
+                                   double s,
+                                   const Eel2DData& d)
+{
+    const double h = std::max(body_half_width(s, d), 0.0);
+    const double q_stretch = d.L_mesh * axial_strain;
+    const double q_bend = h * h * curvature_like;
+    return std::sqrt(transverse_deflection * transverse_deflection + q_stretch * q_stretch + q_bend * q_bend);
+}
+
+inline void
+compute_actual_deformation_measures(const libMesh::Point& x,
+                                    const TensorValue<double>& FF,
+                                    double s_ref,
+                                    double eta_ref,
+                                    double time,
+                                    const Eel2DData& d,
+                                    double& transverse_deflection,
+                                    double& axial_strain,
+                                    double& curvature_like)
+{
+    update_current_centerline_cache_from_global_state(time, const_cast<Eel2DData&>(d));
+
+    const double ct = std::cos(d.theta_cur);
+    const double st = std::sin(d.theta_cur);
+
+    const double dx_cur = x(0) - d.xcom_cur;
+    const double dy_cur = x(1) - d.ycom_cur;
+    const double xhat_cur = ct * dx_cur + st * dy_cur;
+    const double yhat_cur = -st * dx_cur + ct * dy_cur;
+
+    double s_cur = 0.0, eta_cur = 0.0;
+    compute_body_coordinates(xhat_cur, yhat_cur, d, s_cur, eta_cur);
+    transverse_deflection = eta_cur - eta_ref;
+
+    const double cr = std::cos(d.theta_ref);
+    const double sr = std::sin(d.theta_ref);
+    libMesh::VectorValue<double> A0_ref;
+    A0_ref(0) = cr;
+    A0_ref(1) = sr;
+#if (NDIM == 3)
+    A0_ref(2) = 0.0;
+#endif
+
+    const auto FA0 = FF * A0_ref;
+    const double a_body_x = ct * FA0(0) + st * FA0(1);
+    const double a_body_y = -st * FA0(0) + ct * FA0(1);
+    const double lambda_f = std::sqrt(a_body_x * a_body_x + a_body_y * a_body_y);
+    axial_strain = lambda_f - 1.0;
+
+    curvature_like = current_centerline_curvature(s_ref, d);
+}
+
+inline double
+compute_local_modulus(double s,
+                      double transverse_deflection,
+                      double axial_strain,
+                      double curvature_like,
+                      const Eel2DData& d)
 {
     double scale = stiffness_distribution(s, d);
 
-    // Stage-1 approximation: reuse the existing hyperelastic coefficient c1_s
-    // and modulate it with a tail-only equivalent stiffness ratio.
+    // Modulate the tail stiffness with actual FE deformation measures instead
+    // of the prescribed kinematic wave alone.
     if (d.use_tail_nonlinear_stiffness && is_tail_region(s, d))
     {
         const double k_ref = std::max(d.tail_k0, std::numeric_limits<double>::epsilon());
-        scale *= tail_equivalent_stiffness(q, d.tail_k0, d.tail_a, d.tail_b) / k_ref;
+        const double q_eff =
+            compute_effective_tail_deformation(transverse_deflection, axial_strain, curvature_like, s, d);
+        scale *= tail_equivalent_stiffness(q_eff, d.tail_k0, d.tail_a, d.tail_b) / k_ref;
     }
 
     return std::max(d.c1_s * scale, 1.0e-12);
@@ -782,6 +883,197 @@ void initialize_reference_body_geometry(MeshBase& mesh, Eel2DData& d)
     }
 
     d.cached_mode_valid = false;
+    d.cached_centerline_valid = false;
+}
+
+void update_current_centerline_cache(EquationSystems* equation_systems,
+                                     const std::string& coords_system_name,
+                                     MeshBase& mesh,
+                                     double xcom_frame,
+                                     double ycom_frame,
+                                     double theta_frame,
+                                     double time,
+                                     Eel2DData& d)
+{
+    const double tol_time = 1.0e-12 * std::max(1.0, std::abs(time));
+    const double tol_pose = 1.0e-12;
+    if (d.cached_centerline_valid && std::abs(time - d.cached_centerline_time) <= tol_time &&
+        std::abs(xcom_frame - d.cached_centerline_xcom) <= tol_pose &&
+        std::abs(ycom_frame - d.cached_centerline_ycom) <= tol_pose &&
+        std::abs(wrap_angle(theta_frame - d.cached_centerline_theta)) <= tol_pose)
+    {
+        return;
+    }
+
+    BoundaryInfo& boundary_info = mesh.get_boundary_info();
+    boundary_info.build_node_list_from_side_list();
+
+    System& X_system = equation_systems->get_system<System>(coords_system_name);
+    NumericVector<double>* X_vec = X_system.solution.get();
+    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+    const DofMap& dof_map = X_system.get_dof_map();
+
+    const double cr_ref = std::cos(d.theta_ref);
+    const double sr_ref = std::sin(d.theta_ref);
+    const double ct = std::cos(theta_frame);
+    const double st = std::sin(theta_frame);
+
+    std::vector<double> ymax_local(d.n_geom_pts, -std::numeric_limits<double>::max());
+    std::vector<double> ymin_local(d.n_geom_pts, std::numeric_limits<double>::max());
+    std::vector<double> xsum_local(d.n_geom_pts, 0.0);
+    std::vector<double> count_local(d.n_geom_pts, 0.0);
+
+    std::vector<dof_id_type> dof_idx_x, dof_idx_y;
+    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
+    {
+        const Node* node = *it;
+        if (!node) continue;
+
+        const double dx_ref = (*node)(0) - d.xcom_ref;
+        const double dy_ref = (*node)(1) - d.ycom_ref;
+        const double xhat_ref = cr_ref * dx_ref + sr_ref * dy_ref;
+        const double s_mesh = clamp_value(xhat_ref - d.xhat_head_ref, 0.0, d.L_mesh);
+        const int k = std::max(0, std::min(d.n_geom_pts - 1, static_cast<int>(std::llround(s_mesh / d.ds_mesh))));
+
+        dof_map.dof_indices(node, dof_idx_x, 0);
+        dof_map.dof_indices(node, dof_idx_y, 1);
+        const double x_cur = (*X_ghost_vec)(dof_idx_x[0]);
+        const double y_cur = (*X_ghost_vec)(dof_idx_y[0]);
+
+        const double dx_cur = x_cur - xcom_frame;
+        const double dy_cur = y_cur - ycom_frame;
+        const double xhat_cur = ct * dx_cur + st * dy_cur;
+        const double yhat_cur = -st * dx_cur + ct * dy_cur;
+
+        ymax_local[k] = std::max(ymax_local[k], yhat_cur);
+        ymin_local[k] = std::min(ymin_local[k], yhat_cur);
+        xsum_local[k] += xhat_cur;
+        count_local[k] += 1.0;
+    }
+
+    IBTK_MPI::maxReduction(ymax_local.data(), d.n_geom_pts);
+    IBTK_MPI::minReduction(ymin_local.data(), d.n_geom_pts);
+    IBTK_MPI::sumReduction(xsum_local.data(), d.n_geom_pts);
+    IBTK_MPI::sumReduction(count_local.data(), d.n_geom_pts);
+
+    d.x_center_cur_cache.assign(d.n_geom_pts, 0.0);
+    d.y_center_cur_cache.assign(d.n_geom_pts, 0.0);
+    for (int k = 0; k < d.n_geom_pts; ++k)
+    {
+        if (count_local[k] > 0.5)
+        {
+            d.x_center_cur_cache[k] = xsum_local[k] / count_local[k];
+            d.y_center_cur_cache[k] = 0.5 * (ymax_local[k] + ymin_local[k]);
+            continue;
+        }
+
+        int kl = k - 1;
+        while (kl >= 0 && count_local[kl] < 0.5) --kl;
+        int kr = k + 1;
+        while (kr < d.n_geom_pts && count_local[kr] < 0.5) ++kr;
+
+        if (kl >= 0 && kr < d.n_geom_pts)
+        {
+            const double a = static_cast<double>(k - kl) / static_cast<double>(kr - kl);
+            d.x_center_cur_cache[k] = (1.0 - a) * (xsum_local[kl] / count_local[kl]) + a * (xsum_local[kr] / count_local[kr]);
+            const double y_left = 0.5 * (ymax_local[kl] + ymin_local[kl]);
+            const double y_right = 0.5 * (ymax_local[kr] + ymin_local[kr]);
+            d.y_center_cur_cache[k] = (1.0 - a) * y_left + a * y_right;
+        }
+        else if (kl >= 0)
+        {
+            d.x_center_cur_cache[k] = xsum_local[kl] / count_local[kl];
+            d.y_center_cur_cache[k] = 0.5 * (ymax_local[kl] + ymin_local[kl]);
+        }
+        else if (kr < d.n_geom_pts)
+        {
+            d.x_center_cur_cache[k] = xsum_local[kr] / count_local[kr];
+            d.y_center_cur_cache[k] = 0.5 * (ymax_local[kr] + ymin_local[kr]);
+        }
+    }
+
+    d.curvature_cur_cache.assign(d.n_geom_pts, 0.0);
+    d.axial_strain_cur_cache.assign(d.n_geom_pts, 0.0);
+    if (d.n_geom_pts >= 2)
+    {
+        std::vector<double> seg_theta(d.n_geom_pts - 1, 0.0);
+        std::vector<double> seg_len(d.n_geom_pts - 1, d.ds_mesh);
+        std::vector<double> seg_strain(d.n_geom_pts - 1, 0.0);
+        for (int k = 0; k < d.n_geom_pts - 1; ++k)
+        {
+            const double dx_seg = d.x_center_cur_cache[k + 1] - d.x_center_cur_cache[k];
+            const double dy_seg = d.y_center_cur_cache[k + 1] - d.y_center_cur_cache[k];
+            seg_len[k] = std::max(std::sqrt(dx_seg * dx_seg + dy_seg * dy_seg), std::numeric_limits<double>::epsilon());
+            seg_theta[k] = std::atan2(dy_seg, dx_seg);
+            seg_strain[k] = seg_len[k] / std::max(d.ds_mesh, std::numeric_limits<double>::epsilon()) - 1.0;
+        }
+
+        d.axial_strain_cur_cache.front() = seg_strain.front();
+        d.axial_strain_cur_cache.back() = seg_strain.back();
+        for (int k = 1; k < d.n_geom_pts - 1; ++k)
+        {
+            d.axial_strain_cur_cache[k] = 0.5 * (seg_strain[k - 1] + seg_strain[k]);
+        }
+
+        if (d.n_geom_pts >= 3)
+        {
+            d.curvature_cur_cache.front() = wrap_angle(seg_theta[1] - seg_theta[0]) /
+                                            std::max(0.5 * (seg_len[0] + seg_len[1]), std::numeric_limits<double>::epsilon());
+            d.curvature_cur_cache.back() = wrap_angle(seg_theta[d.n_geom_pts - 2] - seg_theta[d.n_geom_pts - 3]) /
+                                           std::max(0.5 * (seg_len[d.n_geom_pts - 2] + seg_len[d.n_geom_pts - 3]),
+                                                    std::numeric_limits<double>::epsilon());
+            for (int k = 1; k < d.n_geom_pts - 1; ++k)
+            {
+                d.curvature_cur_cache[k] = wrap_angle(seg_theta[k] - seg_theta[k - 1]) /
+                                           std::max(0.5 * (seg_len[k] + seg_len[k - 1]),
+                                                    std::numeric_limits<double>::epsilon());
+            }
+        }
+    }
+
+    d.cached_centerline_time = time;
+    d.cached_centerline_xcom = xcom_frame;
+    d.cached_centerline_ycom = ycom_frame;
+    d.cached_centerline_theta = theta_frame;
+    d.cached_centerline_valid = true;
+}
+
+void update_current_centerline_cache_from_global_state(double time, Eel2DData& d)
+{
+    if (!s_equation_systems_state || !s_mesh_state || s_coords_system_name_state.empty()) return;
+    update_current_centerline_cache(s_equation_systems_state,
+                                    s_coords_system_name_state,
+                                    *s_mesh_state,
+                                    d.xcom_cur,
+                                    d.ycom_cur,
+                                    d.theta_cur,
+                                    time,
+                                    d);
+}
+
+inline double
+current_centerline_x(double s_mesh, const Eel2DData& d)
+{
+    return interpolate_body_grid_values(s_mesh, d.x_center_cur_cache, d);
+}
+
+inline double
+current_centerline_y(double s_mesh, const Eel2DData& d)
+{
+    return interpolate_body_grid_values(s_mesh, d.y_center_cur_cache, d);
+}
+
+inline double
+current_centerline_curvature(double s_mesh, const Eel2DData& d)
+{
+    return interpolate_body_grid_values(s_mesh, d.curvature_cur_cache, d);
+}
+
+inline double
+current_centerline_axial_strain(double s_mesh, const Eel2DData& d)
+{
+    return interpolate_body_grid_values(s_mesh, d.axial_strain_cur_cache, d);
 }
 
 void update_projected_kinematics_cache(double time, Eel2DData& d)
@@ -834,6 +1126,9 @@ void initialize_rigid_body_dynamics(Eel2DData& d)
     d.xcom_observed_prev = d.xcom_cur;
     d.ycom_observed_prev = d.ycom_cur;
     d.theta_observed_prev = d.theta_cur;
+    d.actuation_force_x = 0.0;
+    d.actuation_force_y = 0.0;
+    d.actuation_torque_z = 0.0;
     d.hydrodynamic_force_x = 0.0;
     d.hydrodynamic_force_y = 0.0;
     d.hydrodynamic_torque_z = 0.0;
@@ -843,6 +1138,9 @@ void initialize_rigid_body_dynamics(Eel2DData& d)
 void compute_hydrodynamic_force_and_torque(double xcom_observed,
                                            double ycom_observed,
                                            double theta_observed,
+                                           double actuation_fx,
+                                           double actuation_fy,
+                                           double actuation_torque_z,
                                            double dt,
                                            Eel2DData& d,
                                            double& fx,
@@ -855,16 +1153,15 @@ void compute_hydrodynamic_force_and_torque(double xcom_observed,
 
     if (!d.rigid_dynamics_initialized || dt <= std::numeric_limits<double>::epsilon()) return;
 
-    // Stage-1 approximation: the active-stress IBFE path does not expose a
-    // clean external load accumulator, so infer the net hydrodynamic load from
-    // the resolved rigid-body acceleration of the FE body.
+    // Infer the fluid reaction from the resolved FE acceleration after removing
+    // the explicitly applied target-penalty actuation.
     const double u_observed = (xcom_observed - d.xcom_observed_prev) / dt;
     const double v_observed = (ycom_observed - d.ycom_observed_prev) / dt;
     const double omega_observed = wrap_angle(theta_observed - d.theta_observed_prev) / dt;
 
-    fx = d.body_mass * (u_observed - d.u_com_current) / dt;
-    fy = d.body_mass * (v_observed - d.v_com_current) / dt;
-    torque_z = d.body_inertia * (omega_observed - d.omega_body_current) / dt;
+    fx = d.body_mass * (u_observed - d.u_com_current) / dt - actuation_fx;
+    fy = d.body_mass * (v_observed - d.v_com_current) / dt - actuation_fy;
+    torque_z = d.body_inertia * (omega_observed - d.omega_body_current) / dt - actuation_torque_z;
 }
 
 void integrate_linear_momentum(double fx, double fy, double dt, Eel2DData& d)
@@ -880,22 +1177,18 @@ void integrate_angular_momentum(double torque_z, double dt, Eel2DData& d)
     d.omega_body_current += dt * torque_z / d.body_inertia;
 }
 
-void update_free_swimming_pose(double xcom_observed,
-                               double ycom_observed,
-                               double theta_observed,
-                               double dt,
-                               Eel2DData& d)
+void update_free_swimming_pose(double dt, Eel2DData& d)
 {
     d.xcom_cur += dt * d.u_com_current;
     d.ycom_cur += dt * d.v_com_current;
     d.theta_cur = wrap_angle(d.theta_cur + dt * d.omega_body_current);
+}
 
-    // Stage-1 coupling keeps the rigid-body state aligned with the resolved FE
-    // geometry to avoid drift without a larger solver refactor.
-    d.xcom_cur = xcom_observed;
-    d.ycom_cur = ycom_observed;
-    d.theta_cur = theta_observed;
-
+void update_observed_pose_history(double xcom_observed,
+                                  double ycom_observed,
+                                  double theta_observed,
+                                  Eel2DData& d)
+{
     d.xcom_observed_prev = xcom_observed;
     d.ycom_observed_prev = ycom_observed;
     d.theta_observed_prev = theta_observed;
@@ -1170,6 +1463,35 @@ double compute_tail_y(EquationSystems* equation_systems,
     return local_vals[0] / local_vals[1];
 }
 
+void compute_tail_actual_state(EquationSystems* equation_systems,
+                               const std::string& coords_system_name,
+                               MeshBase& mesh,
+                               double time,
+                               double xcom_frame,
+                               double ycom_frame,
+                               double theta_frame,
+                               Eel2DData& d,
+                               double& tail_y,
+                               double& tail_q,
+                               double& tail_axial_strain,
+                               double& tail_curvature,
+                               double& tail_q_eff)
+{
+    update_current_centerline_cache(equation_systems, coords_system_name, mesh, xcom_frame, ycom_frame, theta_frame, time, d);
+
+    const double s_tail = d.L_mesh;
+    const double xhat_tail = current_centerline_x(s_tail, d);
+    const double yhat_tail = current_centerline_y(s_tail, d);
+    const double ct = std::cos(theta_frame);
+    const double st = std::sin(theta_frame);
+
+    tail_y = ycom_frame + st * xhat_tail + ct * yhat_tail;
+    tail_q = yhat_tail - mesh_centerline_y(s_tail, d);
+    tail_axial_strain = current_centerline_axial_strain(s_tail, d);
+    tail_curvature = current_centerline_curvature(s_tail, d);
+    tail_q_eff = compute_effective_tail_deformation(tail_q, tail_axial_strain, tail_curvature, s_tail, d);
+}
+
 double compute_attack_angle(double vx, double vy, double theta)
 {
     if (std::sqrt(vx * vx + vy * vy) <= 1.0e-12) return 0.0;
@@ -1392,23 +1714,25 @@ compute_eel_target(const libMesh::Point& X,
     // ------------------------------------------------------------
     const double ct = std::cos(d.theta_cur);
     const double st = std::sin(d.theta_cur);
+    const double rx = ct * xhat_tar - st * yhat_tar;
+    const double ry = st * xhat_tar + ct * yhat_tar;
 
-    xtar = d.xcom_cur + ct * xhat_tar - st * yhat_tar;
-    ytar = d.ycom_cur + st * xhat_tar + ct * yhat_tar;
+    xtar = d.xcom_cur + rx;
+    ytar = d.ycom_cur + ry;
 
     // ------------------------------------------------------------
-    // 5) 目标速度：使用去除刚体模态后的 body-frame 速度，
-    //    再按当前自由位姿映射回实验室坐标。
+    // 5) 目标速度包含刚体平移、刚体转动以及去除刚体模态后的
+    //    body-frame 形变速度。
     // ------------------------------------------------------------
-    utar_x = ct * vel_x - st * vel_y;
-    utar_y = st * vel_x + ct * vel_y;
+    utar_x = d.u_com_current - d.omega_body_current * ry + ct * vel_x - st * vel_y;
+    utar_y = d.v_com_current + d.omega_body_current * rx + st * vel_x + ct * vel_y;
 }
 
 // Tether (penalty) stress function.
 void
 PK1_stress_function(TensorValue<double>& PP,
                     const TensorValue<double>& FF,
-                    const libMesh::Point& /*x*/,
+                    const libMesh::Point& x,
                     const libMesh::Point& X,
                     Elem* const /*elem*/,
                     const vector<const vector<double>*>& /*var_data*/,
@@ -1429,8 +1753,10 @@ PK1_stress_function(TensorValue<double>& PP,
     double s = 0.0, eta = 0.0;
     compute_body_coordinates(xhat_ref, yhat_ref, *d, s, eta);
 
-    const double q_local = body_wave_y(s, time, *d);
-    const double local_modulus = compute_local_modulus(s, q_local, *d);
+    double transverse_deflection = 0.0, axial_strain = 0.0, curvature_like = 0.0;
+    compute_actual_deformation_measures(x, FF, s, eta, time, *d, transverse_deflection, axial_strain, curvature_like);
+
+    const double local_modulus = compute_local_modulus(s, transverse_deflection, axial_strain, curvature_like, *d);
     PP = 2.0 * local_modulus * (FF - tensor_inverse_transpose(FF, NDIM));
 
     if (!d->use_active_stress) return;
@@ -1463,46 +1789,181 @@ PK1_stress_function(TensorValue<double>& PP,
     return;
 } // PK1_stress_function
 
-// Legacy target-penalty force path. The active-stress swimmer keeps this disabled.
 void
 eel_body_force_function(libMesh::VectorValue<double>& F,
                         const libMesh::TensorValue<double>& /*FF*/,
-                        const libMesh::Point& /*x*/,
-                        const libMesh::Point& /*X*/,
+                        const libMesh::Point& x,
+                        const libMesh::Point& X,
                         libMesh::Elem* const /*elem*/,
-                        const std::vector<const std::vector<double>*>& /*var_data*/,
+                        const std::vector<const std::vector<double>*>& var_data,
                         const std::vector<const std::vector<libMesh::VectorValue<double> >*>& /*grad_var_data*/,
-                        double /*time*/,
-                        void* /*ctx*/)
+                        double time,
+                        void* ctx)
 {
-    F(0) = 0.0;
-    F(1) = 0.0;
+    const Eel2DData* const d = reinterpret_cast<Eel2DData*>(ctx);
+    const std::vector<double>& U = *var_data[0];
+
+    double xtar = 0.0, ytar = 0.0, utar_x = 0.0, utar_y = 0.0;
+    compute_eel_target(X, time, *const_cast<Eel2DData*>(d), xtar, ytar, utar_x, utar_y);
+
+    F(0) = d->kappa_s_body * (xtar - x(0)) + d->eta_s_body * (utar_x - U[0]);
+    F(1) = d->kappa_s_body * (ytar - x(1)) + d->eta_s_body * (utar_y - U[1]);
 }
 
 void
 eel_surface_force_function(VectorValue<double>& F,
-                      const VectorValue<double>& /*n*/,
-                      const VectorValue<double>& /*N*/,
-                      const TensorValue<double>& /*FF*/,
-                      const libMesh::Point& x,
-                      const libMesh::Point& X,
-                      Elem* const /*elem*/,
-                      const unsigned short /*side*/,
-                      const vector<const vector<double>*>& var_data,
-                      const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                      double time,
-                      void* ctx)
+                           const VectorValue<double>& /*n*/,
+                           const VectorValue<double>& /*N*/,
+                           const TensorValue<double>& /*FF*/,
+                           const libMesh::Point& x,
+                           const libMesh::Point& X,
+                           Elem* const /*elem*/,
+                           const unsigned short /*side*/,
+                           const vector<const vector<double>*>& var_data,
+                           const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
+                           double time,
+                           void* ctx)
 {
     const Eel2DData* const d = reinterpret_cast<Eel2DData*>(ctx);
 
     VectorValue<double> U;
     for (unsigned int k = 0; k < NDIM; ++k) U(k) = (*var_data[0])[k];
 
-    // 简化版本中关闭表面附加力，仅保留体力罚项驱动摆动。
-    F(0) = 0.0;
-    F(1) = 0.0;
+    double xtar = 0.0, ytar = 0.0, utar_x = 0.0, utar_y = 0.0;
+    compute_eel_target(X, time, *const_cast<Eel2DData*>(d), xtar, ytar, utar_x, utar_y);
+
+    F(0) = d->kappa_s_surface * (xtar - x(0)) + d->eta_s_surface * (utar_x - U(0));
+    F(1) = d->kappa_s_surface * (ytar - x(1)) + d->eta_s_surface * (utar_y - U(1));
     return;
 } // eel_surface_force_function
+
+void compute_lagrangian_actuation_loads(EquationSystems* equation_systems,
+                                        const std::string& coords_system_name,
+                                        const std::string& velocity_system_name,
+                                        MeshBase& mesh,
+                                        bool use_boundary_mesh,
+                                        double time,
+                                        Eel2DData& eel_data,
+                                        double xref,
+                                        double yref,
+                                        double& fx,
+                                        double& fy,
+                                        double& torque_z)
+{
+    fx = 0.0;
+    fy = 0.0;
+    torque_z = 0.0;
+
+    void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
+    const unsigned int dim = mesh.mesh_dimension();
+    System& X_system = equation_systems->get_system(coords_system_name);
+    System& U_system = equation_systems->get_system(velocity_system_name);
+    NumericVector<double>* X_vec = X_system.solution.get();
+    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+    NumericVector<double>* U_vec = U_system.solution.get();
+    NumericVector<double>* U_ghost_vec = U_system.current_local_solution.get();
+    copy_and_synch(*U_vec, *U_ghost_vec);
+    const DofMap& dof_map = X_system.get_dof_map();
+    std::vector<std::vector<unsigned int> > dof_indices(NDIM);
+
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, dof_map.variable_type(0)));
+    std::unique_ptr<QBase> qrule = QBase::build(QGAUSS, dim, SEVENTH);
+    fe->attach_quadrature_rule(qrule.get());
+    const vector<double>& JxW = fe->get_JxW();
+    const vector<libMesh::Point>& q_point = fe->get_xyz();
+    const vector<vector<double> >& phi = fe->get_phi();
+    const vector<vector<VectorValue<double> > >& dphi = fe->get_dphi();
+
+    std::unique_ptr<FEBase> fe_face(FEBase::build(dim, dof_map.variable_type(0)));
+    std::unique_ptr<QBase> qrule_face = QBase::build(QGAUSS, dim - 1, SEVENTH);
+    fe_face->attach_quadrature_rule(qrule_face.get());
+    const vector<double>& JxW_face = fe_face->get_JxW();
+    const vector<libMesh::Point>& q_point_face = fe_face->get_xyz();
+    const vector<libMesh::Point>& normal_face = fe_face->get_normals();
+    const vector<vector<double> >& phi_face = fe_face->get_phi();
+    const vector<vector<VectorValue<double> > >& dphi_face = fe_face->get_dphi();
+
+    std::vector<double> U_qp_vec(NDIM);
+    std::vector<const std::vector<double>*> var_data(1);
+    var_data[0] = &U_qp_vec;
+    std::vector<const std::vector<libMesh::VectorValue<double> >*> grad_var_data;
+
+    TensorValue<double> FF, FF_inv_trans;
+    boost::multi_array<double, 2> X_node, U_node;
+    VectorValue<double> F, N, U, n, x;
+
+    double local_loads[3] = { 0.0, 0.0, 0.0 };
+    const auto el_begin = mesh.active_local_elements_begin();
+    const auto el_end = mesh.active_local_elements_end();
+    for (auto el_it = el_begin; el_it != el_end; ++el_it)
+    {
+        auto elem = *el_it;
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d)
+        {
+            dof_map.dof_indices(elem, dof_indices[d], d);
+        }
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+        get_values_for_interpolation(U_node, *U_ghost_vec, dof_indices);
+
+        if (!use_boundary_mesh)
+        {
+            const unsigned int n_qp = qrule->n_points();
+            for (unsigned int qp = 0; qp < n_qp; ++qp)
+            {
+                interpolate(x, qp, X_node, phi);
+                jacobian(FF, qp, X_node, dphi);
+                interpolate(U, qp, U_node, phi);
+                for (unsigned int d = 0; d < NDIM; ++d) U_qp_vec[d] = U(d);
+
+                eel_body_force_function(F, FF, x, q_point[qp], elem, var_data, grad_var_data, time, eel_data_ptr);
+                local_loads[0] += F(0) * JxW[qp];
+                local_loads[1] += F(1) * JxW[qp];
+                local_loads[2] += ((x(0) - xref) * F(1) - (x(1) - yref) * F(0)) * JxW[qp];
+            }
+        }
+
+        for (unsigned short int side = 0; side < elem->n_sides(); ++side)
+        {
+            if (!use_boundary_mesh && elem->neighbor_ptr(side)) continue;
+
+            fe_face->reinit(elem, side);
+            const unsigned int n_qp_face = qrule_face->n_points();
+            for (unsigned int qp = 0; qp < n_qp_face; ++qp)
+            {
+                interpolate(x, qp, X_node, phi_face);
+                jacobian(FF, qp, X_node, dphi_face);
+                interpolate(U, qp, U_node, phi_face);
+                for (unsigned int d = 0; d < NDIM; ++d) U_qp_vec[d] = U(d);
+                N = normal_face[qp];
+                tensor_inverse_transpose(FF_inv_trans, FF, NDIM);
+                n = (FF_inv_trans * N).unit();
+
+                eel_surface_force_function(F,
+                                           n,
+                                           N,
+                                           FF,
+                                           x,
+                                           q_point_face[qp],
+                                           elem,
+                                           side,
+                                           var_data,
+                                           grad_var_data,
+                                           time,
+                                           eel_data_ptr);
+                local_loads[0] += F(0) * JxW_face[qp];
+                local_loads[1] += F(1) * JxW_face[qp];
+                local_loads[2] += ((x(0) - xref) * F(1) - (x(1) - yref) * F(0)) * JxW_face[qp];
+            }
+        }
+    }
+
+    IBTK_MPI::sumReduction(local_loads, 3);
+    fx = local_loads[0];
+    fy = local_loads[1];
+    torque_z = local_loads[2];
+}
 
 } // namespace ModelData
 using namespace ModelData;
@@ -1589,8 +2050,6 @@ main(int argc, char* argv[])
         Mesh solid_mesh(init.comm(), NDIM);
 
         const double dx = input_db->getDouble("DX");
-        const double ds = input_db->getDouble("MFAC") * dx;
-        std::string elem_type = input_db->getString("ELEM_TYPE");
 
         // Read mesh: use a libMesh-supported format, e.g. .msh
         solid_mesh.read("fish2d.msh");
@@ -1667,17 +2126,28 @@ main(int argc, char* argv[])
         void* const eel_data_ptr = reinterpret_cast<void*>(&eel_data);
         EquationSystems* equation_systems;
         std::string coords_system_name, velocity_system_name;
+        std::vector<int> vars(NDIM);
+        for (unsigned int d = 0; d < NDIM; ++d) vars[d] = d;
         Pointer<IBFEMethod> ibfe_ops = ib_ops;
         ibfe_ops->initializeFEEquationSystems();
         equation_systems = ibfe_ops->getFEDataManager()->getEquationSystems();
         coords_system_name = ibfe_ops->getCurrentCoordinatesSystemName();
         velocity_system_name = ibfe_ops->getVelocitySystemName();
 
+        vector<SystemData> sys_data(1, SystemData(velocity_system_name, vars));
+
         IBFEMethod::PK1StressFcnData PK1_stress_data(
             PK1_stress_function, std::vector<IBTK::SystemData>(), eel_data_ptr);
-        PK1_stress_data.quad_order =
-            Utility::string_to_enum<libMesh::Order>(input_db->getStringWithDefault("PK1_QUAD_ORDER", "THIRD"));
+        const std::string pk1_quad_order_name =
+            input_db->getStringWithDefault("PK1_QUAD_ORDER", input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "THIRD"));
+        PK1_stress_data.quad_order = Utility::string_to_enum<libMesh::Order>(pk1_quad_order_name);
         ibfe_ops->registerPK1StressFunction(PK1_stress_data);
+
+        IBFEMethod::LagSurfaceForceFcnData surface_fcn_data(eel_surface_force_function, sys_data, eel_data_ptr);
+        ibfe_ops->registerLagSurfaceForceFunction(surface_fcn_data);
+
+        IBFEMethod::LagBodyForceFcnData body_fcn_data(eel_body_force_function, sys_data, eel_data_ptr);
+        ibfe_ops->registerLagBodyForceFunction(body_fcn_data);
 
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
         {
@@ -1759,6 +2229,9 @@ main(int argc, char* argv[])
         initialize_reference_body_geometry(mesh, eel_data);
         initialize_reference_projection_data(equation_systems, coords_system_name, mesh, eel_data);
         initialize_rigid_body_dynamics(eel_data);
+        s_equation_systems_state = equation_systems;
+        s_mesh_state = &mesh;
+        s_coords_system_name_state = coords_system_name;
 
         // Deallocate initialization objects.
         app_initializer.setNull();
@@ -1806,7 +2279,7 @@ main(int argc, char* argv[])
             swim_diag_stream.precision(10);
             pose_stream << "# iter time x_com y_com theta tail_y" << endl;
             swim_diag_stream
-                << "# iter time u_com v_com omega_body Fx_h Fy_h Tz_h tail_alpha alpha_max_cycle tail_q AF "
+                << "# iter time u_com v_com omega_body Fx_act Fy_act Tz_act Fx_h Fy_h Tz_h tail_alpha alpha_max_cycle tail_q AF "
                    "Pout Pin Pout_avg Pin_avg eta_F CoT U_mean Re St k_tail_eq F_tail_restore steady"
                 << endl;
         }
@@ -1826,17 +2299,8 @@ main(int argc, char* argv[])
 
             dt = time_integrator->getMaximumTimeStepSize();
 
-            const double theta_prev = eel_data.theta_cur;
-            compute_com_and_rigid_pose(equation_systems,
-                                       coords_system_name,
-                                       mesh,
-                                       eel_data,
-                                       eel_data.xcom_cur,
-                                       eel_data.ycom_cur,
-                                       eel_data.theta_cur,
-                                       theta_prev);
-            pout << "Pose(COM/theta): (" << eel_data.xcom_cur << ", " << eel_data.ycom_cur << ", " << eel_data.theta_cur
-                 << ")\n";
+            pout << "Rigid predictor pose(COM/theta): (" << eel_data.xcom_cur << ", " << eel_data.ycom_cur << ", "
+                 << eel_data.theta_cur << ")\n";
 
             time_integrator->advanceHierarchy(dt);
             loop_time += dt;
@@ -1849,12 +2313,29 @@ main(int argc, char* argv[])
                                        xcom_observed,
                                        ycom_observed,
                                        theta_observed,
-                                       eel_data.theta_cur);
+                                       eel_data.theta_observed_prev);
+
+            double actuation_fx = 0.0, actuation_fy = 0.0, actuation_torque = 0.0;
+            compute_lagrangian_actuation_loads(equation_systems,
+                                               coords_system_name,
+                                               velocity_system_name,
+                                               mesh,
+                                               use_boundary_mesh,
+                                               loop_time,
+                                               eel_data,
+                                               xcom_observed,
+                                               ycom_observed,
+                                               actuation_fx,
+                                               actuation_fy,
+                                               actuation_torque);
 
             double hydrodynamic_fx = 0.0, hydrodynamic_fy = 0.0, hydrodynamic_torque = 0.0;
             compute_hydrodynamic_force_and_torque(xcom_observed,
                                                   ycom_observed,
                                                   theta_observed,
+                                                  actuation_fx,
+                                                  actuation_fy,
+                                                  actuation_torque,
                                                   dt,
                                                   eel_data,
                                                   hydrodynamic_fx,
@@ -1862,15 +2343,24 @@ main(int argc, char* argv[])
                                                   hydrodynamic_torque);
             integrate_linear_momentum(hydrodynamic_fx, hydrodynamic_fy, dt, eel_data);
             integrate_angular_momentum(hydrodynamic_torque, dt, eel_data);
-            update_free_swimming_pose(xcom_observed, ycom_observed, theta_observed, dt, eel_data);
+            update_free_swimming_pose(dt, eel_data);
+            update_observed_pose_history(xcom_observed, ycom_observed, theta_observed, eel_data);
+            eel_data.actuation_force_x = actuation_fx;
+            eel_data.actuation_force_y = actuation_fy;
+            eel_data.actuation_torque_z = actuation_torque;
             eel_data.hydrodynamic_force_x = hydrodynamic_fx;
             eel_data.hydrodynamic_force_y = hydrodynamic_fy;
             eel_data.hydrodynamic_torque_z = hydrodynamic_torque;
 
+            pout << "Observed pose(COM/theta): (" << xcom_observed << ", " << ycom_observed << ", " << theta_observed
+                 << ")\n";
+            pout << "Updated rigid pose(COM/theta): (" << eel_data.xcom_cur << ", " << eel_data.ycom_cur << ", "
+                 << eel_data.theta_cur << ")\n";
+            pout << "Actuation load: (" << actuation_fx << ", " << actuation_fy << ", " << actuation_torque << ")\n";
+            pout << "Hydrodynamic load: (" << hydrodynamic_fx << ", " << hydrodynamic_fy << ", "
+                 << hydrodynamic_torque << ")\n";
             pout << "Rigid velocity: (" << eel_data.u_com_current << ", " << eel_data.v_com_current << ", "
                  << eel_data.omega_body_current << ")\n";
-            pout << "Hydrodynamic load (stage-1 inferred): (" << hydrodynamic_fx << ", " << hydrodynamic_fy << ", "
-                 << hydrodynamic_torque << ")\n";
 
             pout << "\n";
             pout << "At end       of timestep # " << iteration_num << "\n";
@@ -1956,171 +2446,7 @@ postprocess_data(Pointer<Database> input_db,
 {
     Eel2DData eel_data_fallback(input_db);
     Eel2DData* const eel_data = s_eel_data_state ? s_eel_data_state : &eel_data_fallback;
-    void* const eel_data_ptr = reinterpret_cast<void*>(eel_data);
-    bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
-    const unsigned int dim = mesh.mesh_dimension();
-    double F_integral[NDIM];
-    for (unsigned int d = 0; d < NDIM; ++d) F_integral[d] = 0.0;
-
-    System& X_system = equation_systems->get_system(coords_system_name);
-    System& U_system = equation_systems->get_system(velocity_system_name);
-    NumericVector<double>* X_vec = X_system.solution.get();
-    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
-    copy_and_synch(*X_vec, *X_ghost_vec);
-    NumericVector<double>* U_vec = U_system.solution.get();
-    NumericVector<double>* U_ghost_vec = U_system.current_local_solution.get();
-    copy_and_synch(*U_vec, *U_ghost_vec);
-    const DofMap& dof_map = X_system.get_dof_map();
-    std::vector<std::vector<unsigned int> > dof_indices(NDIM);
-
-    std::unique_ptr<FEBase> fe(FEBase::build(dim, dof_map.variable_type(0)));
-    std::unique_ptr<QBase> qrule = QBase::build(QGAUSS, dim, SEVENTH);
-    fe->attach_quadrature_rule(qrule.get());
-    const vector<double>& JxW = fe->get_JxW();
-    const vector<libMesh::Point>& q_point = fe->get_xyz();
-    const vector<vector<double> >& phi = fe->get_phi();
-    const vector<vector<VectorValue<double> > >& dphi = fe->get_dphi();
-
-    std::unique_ptr<FEBase> fe_face(FEBase::build(dim, dof_map.variable_type(0)));
-    std::unique_ptr<QBase> qrule_face = QBase::build(QGAUSS, dim - 1, SEVENTH);
-    fe_face->attach_quadrature_rule(qrule_face.get());
-    const vector<double>& JxW_face = fe_face->get_JxW();
-    const vector<libMesh::Point>& q_point_face = fe_face->get_xyz();
-    const vector<libMesh::Point>& normal_face = fe_face->get_normals();
-    const vector<vector<double> >& phi_face = fe_face->get_phi();
-    const vector<vector<VectorValue<double> > >& dphi_face = fe_face->get_dphi();
-
-    std::vector<double> U_qp_vec(NDIM);
-    std::vector<const std::vector<double>*> var_data(1);
-    var_data[0] = &U_qp_vec;
-    std::vector<const std::vector<libMesh::VectorValue<double> >*> grad_var_data;
-
-    TensorValue<double> FF, FF_inv_trans;
-    boost::multi_array<double, 2> X_node, U_node;
-    VectorValue<double> F, N, U, n, x;
-
-    const auto el_begin = mesh.active_local_elements_begin();
-    const auto el_end = mesh.active_local_elements_end();
-    if (!use_boundary_mesh)
-    {
-        for (auto el_it = el_begin; el_it != el_end; ++el_it)
-        {
-            auto elem = *el_it;
-            fe->reinit(elem);
-            for (unsigned int d = 0; d < NDIM; ++d)
-            {
-                dof_map.dof_indices(elem, dof_indices[d], d);
-            }
-            get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
-            get_values_for_interpolation(U_node, *U_ghost_vec, dof_indices);
-
-            const unsigned int n_qp = qrule->n_points();
-            for (unsigned int qp = 0; qp < n_qp; ++qp)
-            {
-                interpolate(x, qp, X_node, phi);
-                jacobian(FF, qp, X_node, dphi);
-                interpolate(U, qp, U_node, phi);
-                for (unsigned int d = 0; d < NDIM; ++d)
-                {
-                    U_qp_vec[d] = U(d);
-                }
-                eel_body_force_function(F, FF, x, q_point[qp], elem, var_data, grad_var_data, loop_time, eel_data_ptr);
-                for (int d = 0; d < NDIM; ++d)
-                {
-                    F_integral[d] += F(d) * JxW[qp];
-                }
-            }
-            for (unsigned short int side = 0; side < elem->n_sides(); ++side)
-            {
-                if (elem->neighbor_ptr(side)) continue;
-                fe_face->reinit(elem, side);
-                const unsigned int n_qp_face = qrule_face->n_points();
-                for (unsigned int qp = 0; qp < n_qp_face; ++qp)
-                {
-                    interpolate(x, qp, X_node, phi_face);
-                    jacobian(FF, qp, X_node, dphi_face);
-                    interpolate(U, qp, U_node, phi_face);
-                    for (unsigned int d = 0; d < NDIM; ++d)
-                    {
-                        U_qp_vec[d] = U(d);
-                    }
-                    N = normal_face[qp];
-                    tensor_inverse_transpose(FF_inv_trans, FF, NDIM);
-                    n = (FF_inv_trans * N).unit();
-
-                    eel_surface_force_function(F,
-                                          n,
-                                          N,
-                                          FF,
-                                          x,
-                                          q_point_face[qp],
-                                          elem,
-                                          side,
-                                          var_data,
-                                          grad_var_data,
-                                          loop_time,
-                                          eel_data_ptr);
-                    for (int d = 0; d < NDIM; ++d)
-                    {
-                        F_integral[d] += F(d) * JxW_face[qp];
-                    }
-                }
-            }
-        }
-    }
-    else
-    {
-        for (auto el_it = el_begin; el_it != el_end; ++el_it)
-        {
-            auto elem = *el_it;
-            fe->reinit(elem);
-            for (unsigned int d = 0; d < NDIM; ++d)
-            {
-                dof_map.dof_indices(elem, dof_indices[d], d);
-            }
-            get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
-            get_values_for_interpolation(U_node, *U_ghost_vec, dof_indices);
-
-            for (unsigned short int side = 0; side < elem->n_sides(); ++side)
-            {
-                fe_face->reinit(elem, side);
-                const unsigned int n_qp_face = qrule_face->n_points();
-                for (unsigned int qp = 0; qp < n_qp_face; ++qp)
-                {
-                    interpolate(x, qp, X_node, phi_face);
-                    jacobian(FF, qp, X_node, dphi_face);
-                    interpolate(U, qp, U_node, phi_face);
-                    for (unsigned int d = 0; d < NDIM; ++d)
-                    {
-                        U_qp_vec[d] = U(d);
-                    }
-                    N = normal_face[qp];
-                    tensor_inverse_transpose(FF_inv_trans, FF, NDIM);
-                    n = (FF_inv_trans * N).unit();
-
-                    eel_surface_force_function(F,
-                                          n,
-                                          N,
-                                          FF,
-                                          x,
-                                          q_point_face[qp],
-                                          elem,
-                                          side,
-                                          var_data,
-                                          grad_var_data,
-                                          loop_time,
-                                          eel_data_ptr);
-                    for (int d = 0; d < NDIM; ++d)
-                    {
-                        F_integral[d] += F(d) * JxW_face[qp];
-                    }
-                }
-            }
-        }
-    }
-    IBTK_MPI::sumReduction(F_integral, NDIM);
-    F_integral[0] = eel_data->hydrodynamic_force_x;
-    F_integral[1] = eel_data->hydrodynamic_force_y;
+    const bool use_boundary_mesh = input_db->getBoolWithDefault("USE_BOUNDARY_MESH", false);
 
     static double theta_prev_post = std::numeric_limits<double>::quiet_NaN();
     double xcom = 0.0, ycom = 0.0, theta = 0.0;
@@ -2133,24 +2459,54 @@ postprocess_data(Pointer<Database> input_db,
                                theta,
                                theta_prev_post);
     theta_prev_post = theta;
-    const double tail_y = compute_tail_y(equation_systems, coords_system_name, mesh, *eel_data);
 
-    double tail_vx = 0.0, tail_vy = 0.0, tail_heading = 0.0, tail_q = 0.0;
-    const double tail_alpha = compute_tail_attack_angle(loop_time, *eel_data, tail_vx, tail_vy, tail_heading, tail_q);
+    double actuation_fx = 0.0, actuation_fy = 0.0, actuation_torque = 0.0;
+    compute_lagrangian_actuation_loads(equation_systems,
+                                       coords_system_name,
+                                       velocity_system_name,
+                                       mesh,
+                                       use_boundary_mesh,
+                                       loop_time,
+                                       *eel_data,
+                                       xcom,
+                                       ycom,
+                                       actuation_fx,
+                                       actuation_fy,
+                                       actuation_torque);
+
+    double tail_y = std::numeric_limits<double>::quiet_NaN();
+    double tail_q = 0.0, tail_axial_strain = 0.0, tail_curvature = 0.0, tail_q_eff = 0.0;
+    compute_tail_actual_state(equation_systems,
+                              coords_system_name,
+                              mesh,
+                              loop_time,
+                              xcom,
+                              ycom,
+                              theta,
+                              *eel_data,
+                              tail_y,
+                              tail_q,
+                              tail_axial_strain,
+                              tail_curvature,
+                              tail_q_eff);
+
+    double tail_vx = 0.0, tail_vy = 0.0, tail_heading = 0.0, tail_q_kinematic = 0.0;
+    const double tail_alpha =
+        compute_tail_attack_angle(loop_time, *eel_data, tail_vx, tail_vy, tail_heading, tail_q_kinematic);
     const double alpha_max_cycle = compute_alpha_max_over_cycle(tail_alpha, loop_time, *eel_data);
     const double AF = compute_tail_peak_to_peak_amplitude(tail_q, loop_time, *eel_data);
     const double tail_stiff_scale = stiffness_distribution(eel_data->L_mesh, *eel_data);
-    const double tail_k_eq =
-        tail_stiff_scale * tail_equivalent_stiffness(tail_q, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
-    const double tail_restore =
-        tail_stiff_scale * tail_nonlinear_restoring_force(tail_q, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
+    const double tail_k_eq = tail_stiff_scale *
+        tail_equivalent_stiffness(tail_q_eff, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
+    const double tail_restore = tail_stiff_scale *
+        tail_nonlinear_restoring_force(tail_q_eff, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
 
     const double speed_inst =
         std::sqrt(eel_data->u_com_current * eel_data->u_com_current + eel_data->v_com_current * eel_data->v_com_current);
     const double dt_diag =
         eel_data->diagnostics_initialized ? std::max(0.0, loop_time - eel_data->diagnostics_prev_time) : 0.0;
     const double tail_potential =
-        tail_stiff_scale * tail_potential_energy(tail_q, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
+        tail_stiff_scale * tail_potential_energy(tail_q_eff, eel_data->tail_k0, eel_data->tail_a, eel_data->tail_b);
     const double tail_potential_rate =
         (dt_diag > std::numeric_limits<double>::epsilon()) ? (tail_potential - eel_data->tail_potential_prev) / dt_diag : 0.0;
 
@@ -2186,15 +2542,18 @@ postprocess_data(Pointer<Database> input_db,
     eel_data->tail_potential_prev = tail_potential;
     eel_data->diagnostics_initialized = true;
 
-    static const double U_max = 1.0;
-    static const double D = 1.0;
+    const double wave_speed_ref = std::abs(eel_data->wave_frequency_f) * std::max(eel_data->wavelength_lambda, eel_data->L);
+    const double U_ref = std::max(1.0e-8, std::max(wave_speed_ref, std::max(speed_inst, mean_speed)));
+    const double D_ref = std::max(eel_data->L, 1.0e-8);
+    const double coeff_denom = 0.5 * rho * U_ref * U_ref * D_ref;
     if (IBTK_MPI::getRank() == 0)
     {
-        drag_stream << loop_time << " " << -F_integral[0] / (0.5 * rho * U_max * U_max * D) << endl;
-        lift_stream << loop_time << " " << -F_integral[1] / (0.5 * rho * U_max * U_max * D) << endl;
+        drag_stream << loop_time << " " << -eel_data->hydrodynamic_force_x / coeff_denom << endl;
+        lift_stream << loop_time << " " << -eel_data->hydrodynamic_force_y / coeff_denom << endl;
         pose_stream << iteration_num << " " << loop_time << " " << xcom << " " << ycom << " " << theta << " " << tail_y << endl;
         swim_diag_stream << iteration_num << " " << loop_time << " " << eel_data->u_com_current << " "
                          << eel_data->v_com_current << " " << eel_data->omega_body_current << " "
+                         << actuation_fx << " " << actuation_fy << " " << actuation_torque << " "
                          << eel_data->hydrodynamic_force_x << " " << eel_data->hydrodynamic_force_y << " "
                          << eel_data->hydrodynamic_torque_z << " " << tail_alpha << " " << alpha_max_cycle << " "
                          << tail_q << " " << AF << " " << pout_inst << " " << pin_inst << " " << pout_avg << " "
