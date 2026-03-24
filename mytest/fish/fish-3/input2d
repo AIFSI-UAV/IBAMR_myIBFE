@@ -1,23 +1,37 @@
 // physical parameters
 MU  = 0.01
 RHO = 1.0
-L   = 2.0
+L   = 4.0
 
 // grid spacing parameters
 MAX_LEVELS = 2                                 // maximum number of levels in locally refined grid
 REF_RATIO  = 4                                 // refinement ratio between levels
-N = 32                                         // actual    number of grid cells on coarsest grid level
+N = 64                                         // actual    number of grid cells on coarsest grid level
 NFINEST = (REF_RATIO^(MAX_LEVELS - 1))*N       // effective number of grid cells on finest   grid level
 DX0 = L/N                                      // mesh width on coarsest grid level
 DX  = L/NFINEST                                // mesh width on finest   grid level
-MFAC = 2.0                                     // ratio of Lagrangian mesh width to Cartesian mesh width
+MFAC = 1.0                                     // ratio of Lagrangian mesh width to Cartesian mesh width
 ELEM_TYPE = "TRI3"                            // type of element to use for structure discretization
 PK1_DEV_QUAD_ORDER = "FIFTH"
 PK1_DIL_QUAD_ORDER = "THIRD"
 
 // model parameters
 U_MAX = 2.0
-C1_S = 0.5
+
+// target-only kinematics: shape prescribed, y fixed, global x/theta released
+Xcom_fixed = 0.25       // reference body-frame x position
+Ycom_fixed = 0.0        // fixed target-frame y position
+Theta_fixed = 0.0       // reference body-frame orientation
+X_LEADING = -0.1       //fish leading edge
+FISH_LENGTH = 1.1       //fish length
+Y_center0 = 0.0         //fish.mesh Y position 网格中心线
+WAVE_AMPLITUDE = 0.05   
+WAVE_FREQUENCY = 1.0
+WAVE_LAMBDA = 1.0       
+WAVE_PHASE0 = 0.0
+TARGET_WAVE_AUDIT_FILE = "target_wave_audit.curve"
+AUDIT_INTERVAL = 20
+C1_S = 0.05
 P0_S = C1_S
 BETA_S = 1.0*(NFINEST/64.0)
 Kappa_S = 1000.0  
@@ -28,7 +42,7 @@ IB_DELTA_FUNCTION          = "IB_4"            // the type of smoothed delta fun
 SPLIT_FORCES               = TRUE              // whether to split interior and boundary forces
 USE_JUMP_CONDITIONS        = FALSE             // whether to impose pressure jumps at fluid-structure interfaces
 USE_CONSISTENT_MASS_MATRIX = TRUE              // whether to use a consistent or lumped mass matrix
-IB_POINT_DENSITY           = 2.0               // approximate density of IB quadrature points for Lagrangian-Eulerian interaction
+IB_POINT_DENSITY           = 1.0               // approximate density of IB quadrature points for Lagrangian-Eulerian interaction
 SOLVER_TYPE                = "STAGGERED"       // the fluid solver to use (STAGGERED or COLLOCATED)
 START_TIME                 = 0.0e0             // initial simulation time
 END_TIME                   = 4.0            // final simulation time
@@ -39,7 +53,7 @@ CONVECTIVE_OP_TYPE         = "PPM"             // convective differencing discre
 CONVECTIVE_FORM            = "ADVECTIVE"       // how to compute the convective terms
 NORMALIZE_PRESSURE         = FALSE             // whether to explicitly force the pressure to have mean zero
 CFL_MAX                    = 0.3               // maximum CFL number
-DT                         = 1e-3           // maximum timestep size
+DT                         = 5e-4           // maximum timestep size
 ERROR_ON_DT_CHANGE         = TRUE              // whether to emit an error message if the time step size changes
 VORTICITY_TAGGING          = TRUE             // whether to tag cells for refinement based on vorticity thresholds
 TAG_BUFFER                 = 1                 // size of tag buffer used by grid generation algorithm
@@ -185,8 +199,8 @@ Main {
 
 CartesianGeometry {
    domain_boxes = [ (0,0),(N - 1,N - 1) ]
-   x_lo = -.5*L,-.5*L
-   x_up = .5*L,.5*L
+   x_lo = -0.5*L,-0.5*L
+   x_up = 0.5*L,0.5*L
    periodic_dimension = 1,1
 }
 

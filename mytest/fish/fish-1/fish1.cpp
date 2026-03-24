@@ -227,9 +227,12 @@ audit_target_wave(double time)
 inline void
 compute_eel_target_fixed_pose(const libMesh::Point& X,
                               double time,
-                              double xcom0,
-                              double ycom0,
-                              double theta0,
+                              double xcom_ref,
+                              double ycom_ref,
+                              double theta_ref,
+                              double xcom_tar,
+                              double ycom_tar,
+                              double theta_tar,
                               double xlead,
                               double ycenter0,
                               double L,
@@ -241,20 +244,20 @@ compute_eel_target_fixed_pose(const libMesh::Point& X,
                               double& ytar)
 {
     // 1) reference point -> prescribed body frame
-    const double dx_ref = X(0) - xcom0;
-    const double dy_ref = X(1) - ycom0;
+    const double dx_ref = X(0) - xcom_ref;
+    const double dy_ref = X(1) - ycom_ref;
 
-    const double c = std::cos(theta0);
-    const double s = std::sin(theta0);
+    const double c_ref = std::cos(theta_ref);
+    const double s_ref = std::sin(theta_ref);
 
-    const double xhat_ref =  c * dx_ref + s * dy_ref;
-    const double yhat_ref = -s * dx_ref + c * dy_ref;
+    const double xhat_ref =  c_ref * dx_ref + s_ref * dy_ref;
+    const double yhat_ref = -s_ref * dx_ref + c_ref * dy_ref;
 
     // 2) leading point -> prescribed body frame
-    const double dx_lead = xlead - xcom0;
-    const double dy_lead = ycenter0 - ycom0;
-    const double xhat_lead = c * dx_lead + s * dy_lead;
-    const double yhat_lead = -s * dx_lead + c * dy_lead;
+    const double dx_lead = xlead - xcom_ref;
+    const double dy_lead = ycenter0 - ycom_ref;
+    const double xhat_lead = c_ref * dx_lead + s_ref * dy_lead;
+    const double yhat_lead = -s_ref * dx_lead + c_ref * dy_lead;
 
     // 3) body-frame coordinates relative to the undeformed centerline
     const double s_body = xhat_ref - xhat_lead;
@@ -276,9 +279,11 @@ compute_eel_target_fixed_pose(const libMesh::Point& X,
     const double xhat_tar = xhat_center + eta_body * nx;
     const double yhat_tar = yhat_center + eta_body * ny;
 
-    // 5) map back to lab frame
-    xtar = xcom0 + c * xhat_tar - s * yhat_tar;
-    ytar = ycom0 + s * xhat_tar + c * yhat_tar;
+    // 5) map back to lab frame with released global x but fixed y/theta
+    const double c_tar = std::cos(theta_tar);
+    const double s_tar = std::sin(theta_tar);
+    xtar = xcom_tar + c_tar * xhat_tar - s_tar * yhat_tar;
+    ytar = ycom_tar + s_tar * xhat_tar + c_tar * yhat_tar;
 }
 
 // -------------------------------
@@ -299,6 +304,9 @@ target_force_function(libMesh::VectorValue<double>& F,
     double xtar, ytar;
     compute_eel_target_fixed_pose(X,
                                   time,
+                                  xcom_fixed,
+                                  ycom_fixed,
+                                  theta_fixed,
                                   xcom_target_current,
                                   ycom_fixed,
                                   theta_fixed,

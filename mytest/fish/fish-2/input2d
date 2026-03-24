@@ -1,71 +1,61 @@
 // physical parameters
-pi = 3.14159265358979323846
-PI = pi
-
-Re = 200.0
-MU = 1.0/Re
+MU  = 0.01
 RHO = 1.0
+L   = 4.0
 
-// EEL parameters
-EEL_LENGTH      = 1.0
-EEL_A           = 0.125
-EEL_S_SHIFT     = 0.03125
-EEL_OMEGA       = 6.28	
-//0.785/0.125
-EEL_KWAVE       = 6.283185307179586 
-//2*pi
-EEL_X_LEADING   = 0.0
-EEL_Y_CENTER0   = 0.0
-EEL_NUM_S_POINTS = 200
-
-// traveling-wave body kinematics
-WAVE_FREQUENCY_F = EEL_OMEGA/(2*pi)
-WAVELENGTH_LAMBDA = 2*pi/EEL_KWAVE
-WAVE_PHASE0 = 0.0
-ENVELOPE_TYPE = "quadratic"   // "quadratic" or "cubic"
-
-// quadratic amplitude envelope: A(xi) = a0 + a1*xi + a2*xi^2
-QUAD_A0 = EEL_A*EEL_S_SHIFT/(EEL_LENGTH + EEL_S_SHIFT)
-QUAD_A1 = 0.0
-QUAD_A2 = EEL_A - QUAD_A0
-
-// cubic amplitude envelope: A(xi) = b0 + b1*xi + b2*xi^2 + b3*xi^3
-CUBIC_B0 = QUAD_A0
-CUBIC_B1 = 0.0
-CUBIC_B2 = 0.0
-CUBIC_B3 = EEL_A - CUBIC_B0
 // grid spacing parameters
-L = 16.0                                       // width of computational domain
-MAX_LEVELS = 6                                 // maximum number of levels in locally refined grid
-REF_RATIO  = 2                                 // refinement ratio between levels
+MAX_LEVELS = 2                                 // maximum number of levels in locally refined grid
+REF_RATIO  = 4                                 // refinement ratio between levels
 N = 64                                         // actual    number of grid cells on coarsest grid level
 NFINEST = (REF_RATIO^(MAX_LEVELS - 1))*N       // effective number of grid cells on finest   grid level
 DX0 = L/N                                      // mesh width on coarsest grid level
 DX  = L/NFINEST                                // mesh width on finest   grid level
-MFAC = 8.0                                     // ratio of Lagrangian mesh width to Cartesian mesh width
-ELEM_TYPE = "TRI6"                             // type of element to use for structure discretization
-PK1_DEV_QUAD_ORDER = "SEVENTH"
-PK1_DIL_QUAD_ORDER = "FIFTH"
-USE_BOUNDARY_MESH = FALSE                         // must be FALSE for this eel2d_ibfe first version (volume mesh + body/surface force)
+MFAC = 1.0                                     // ratio of Lagrangian mesh width to Cartesian mesh width
+ELEM_TYPE = "TRI3"                            // type of element to use for structure discretization
+PK1_DEV_QUAD_ORDER = "FIFTH"
+PK1_DIL_QUAD_ORDER = "THIRD"
+
+// model parameters
+U_MAX = 2.0
+
+// target-only kinematics: shape prescribed, y fixed, global x/theta released
+Xcom_fixed = 0.25       // reference body-frame x position
+Ycom_fixed = 0.0        // fixed target-frame y position
+Theta_fixed = 0.0       // reference body-frame orientation
+X_LEADING = -0.1       //fish leading edge
+FISH_LENGTH = 1.1       //fish length
+Y_center0 = 0.0         //fish.mesh Y position 网格中心线
+WAVE_AMPLITUDE = 0.05   
+WAVE_FREQUENCY = 1.0
+WAVE_LAMBDA = 1.0       
+WAVE_PHASE0 = 0.0
+TARGET_WAVE_AUDIT_FILE = "target_wave_audit.curve"
+AUDIT_INTERVAL = 20
+C1_S = 0.05
+P0_S = C1_S
+BETA_S = 1.0*(NFINEST/64.0)
+Kappa_S = 1000.0  
 
 // solver parameters
+USE_IB_DELTA_FUNCTIONS     = TRUE              // whether to use smoothed delta functions to mediate Lagrangian-Eulerian interaction
 IB_DELTA_FUNCTION          = "IB_4"            // the type of smoothed delta function to use for Lagrangian-Eulerian interaction
-SPLIT_FORCES               = FALSE             // whether to split interior and boundary forces
+SPLIT_FORCES               = TRUE              // whether to split interior and boundary forces
 USE_JUMP_CONDITIONS        = FALSE             // whether to impose pressure jumps at fluid-structure interfaces
 USE_CONSISTENT_MASS_MATRIX = TRUE              // whether to use a consistent or lumped mass matrix
-IB_POINT_DENSITY           = 4.0               // approximate density of IB quadrature points for Lagrangian-Eulerian interaction
+IB_POINT_DENSITY           = 1.0               // approximate density of IB quadrature points for Lagrangian-Eulerian interaction
 SOLVER_TYPE                = "STAGGERED"       // the fluid solver to use (STAGGERED or COLLOCATED)
-CFL_MAX                    = 0.2               // maximum CFL number
-DT                         = 0.001  // maximum timestep size
 START_TIME                 = 0.0e0             // initial simulation time
-END_TIME                   = 2                  // final simulation time
+END_TIME                   = 4.0            // final simulation time
 GROW_DT                    = 2.0e0             // growth factor for timesteps
+NUM_CYCLES                 = 1                 // number of cycles of fixed-point iteration
 CONVECTIVE_TS_TYPE         = "ADAMS_BASHFORTH" // convective time stepping type
 CONVECTIVE_OP_TYPE         = "PPM"             // convective differencing discretization type
 CONVECTIVE_FORM            = "ADVECTIVE"       // how to compute the convective terms
 NORMALIZE_PRESSURE         = FALSE             // whether to explicitly force the pressure to have mean zero
-ERROR_ON_DT_CHANGE         = FALSE              // whether to emit an error message if the time step size changes
-VORTICITY_TAGGING          = TRUE              // whether to tag cells for refinement based on vorticity thresholds
+CFL_MAX                    = 0.3               // maximum CFL number
+DT                         = 5e-4           // maximum timestep size
+ERROR_ON_DT_CHANGE         = TRUE              // whether to emit an error message if the time step size changes
+VORTICITY_TAGGING          = TRUE             // whether to tag cells for refinement based on vorticity thresholds
 TAG_BUFFER                 = 1                 // size of tag buffer used by grid generation algorithm
 REGRID_CFL_INTERVAL        = 0.5               // regrid whenever any material point could have moved 0.5 meshwidths since previous regrid
 OUTPUT_U                   = TRUE
@@ -75,59 +65,20 @@ OUTPUT_OMEGA               = TRUE
 OUTPUT_DIV_U               = TRUE
 ENABLE_LOGGING             = TRUE
 
-// model parameters
-KAPPA_S = 2.5*DX/DT^2
-ETA_S = 1.5*DX/DT
-
-// tether penalty data
-C1_S            = 1.0e3
-KAPPA_S_BODY    = 5.0e3
-ETA_S_BODY      = 0.0
-KAPPA_S_SURFACE = 0.0
-ETA_S_SURFACE   = 0.0
-
-// active bending stress data
-USE_ACTIVE_STRESS = TRUE
-ACTIVE_STRESS_T0  = KAPPA_S_BODY * EEL_A
-ACTIVE_PHASE0     = 0.0
-ACTIVE_RAMP_TIME  = 0.0
-ACTIVE_XI_START   = 0.0
-ACTIVE_XI_END     = 1.0
-ACTIVE_XI_EPS     = 0.02
-
-// stage-1 free-swimming rigid-body diagnostics
-BODY_DENSITY        = RHO
-STEADY_FORCE_TOL    = 1.0e-4
-STEADY_SPEED_REL_TOL = 5.0e-2
-STEADY_MIN_CYCLES   = 2.0
-
-// stage-1 tail stiffness controls
-STIFFNESS_MODE = "uniform_linear"    // "uniform_linear" or "tail_gradient"
-TAIL_XI_START = 0.7
-TAIL_STIFFNESS_RATIO = 1.0
-TAIL_STIFFNESS_POWER = 1.0
-USE_TAIL_NONLINEAR_STIFFNESS = FALSE
-TAIL_NONLINEAR_K0 = C1_S
-TAIL_NONLINEAR_A = 0.0
-TAIL_NONLINEAR_B = 0.0
-
 // collocated solver parameters
 PROJECTION_METHOD_TYPE = "PRESSURE_UPDATE"
 SECOND_ORDER_PRESSURE_UPDATE = TRUE
 
 VelocityBcCoefs_0 {
-   t_half = 0.5
-   tau = 0.125
-
    acoef_function_0 = "1.0"
-   acoef_function_1 = "0.0"
-   acoef_function_2 = "0.0"
-   acoef_function_3 = "0.0"
+   acoef_function_1 = "1.0"
+   acoef_function_2 = "1.0"
+   acoef_function_3 = "1.0"
 
    bcoef_function_0 = "0.0"
-   bcoef_function_1 = "1.0"
-   bcoef_function_2 = "1.0"
-   bcoef_function_3 = "1.0"
+   bcoef_function_1 = "0.0"
+   bcoef_function_2 = "0.0"
+   bcoef_function_3 = "0.0"
 
    gcoef_function_0 = "0.0"
    gcoef_function_1 = "0.0"
@@ -137,12 +88,12 @@ VelocityBcCoefs_0 {
 
 VelocityBcCoefs_1 {
    acoef_function_0 = "1.0"
-   acoef_function_1 = "0.0"
+   acoef_function_1 = "1.0"
    acoef_function_2 = "1.0"
    acoef_function_3 = "1.0"
 
    bcoef_function_0 = "0.0"
-   bcoef_function_1 = "1.0"
+   bcoef_function_1 = "0.0"
    bcoef_function_2 = "0.0"
    bcoef_function_3 = "0.0"
 
@@ -156,6 +107,7 @@ IBHierarchyIntegrator {
    start_time          = START_TIME
    end_time            = END_TIME
    grow_dt             = GROW_DT
+   num_cycles          = NUM_CYCLES
    regrid_cfl_interval = REGRID_CFL_INTERVAL
    dt_max              = DT
    error_on_dt_change  = ERROR_ON_DT_CHANGE
@@ -163,11 +115,13 @@ IBHierarchyIntegrator {
 }
 
 IBFEMethod {
-   IB_delta_fcn                = IB_DELTA_FUNCTION
-   split_forces                = SPLIT_FORCES
-   use_jump_conditions         = USE_JUMP_CONDITIONS
-   use_consistent_mass_matrix  = USE_CONSISTENT_MASS_MATRIX
-   IB_point_density            = IB_POINT_DENSITY
+   use_IB_spread_operator     = USE_IB_DELTA_FUNCTIONS
+   use_IB_interp_operator     = USE_IB_DELTA_FUNCTIONS
+   IB_delta_fcn               = IB_DELTA_FUNCTION
+   split_forces               = SPLIT_FORCES
+   use_jump_conditions        = USE_JUMP_CONDITIONS
+   use_consistent_mass_matrix = USE_CONSISTENT_MASS_MATRIX
+   IB_point_density           = IB_POINT_DENSITY
 }
 
 INSCollocatedHierarchyIntegrator {
@@ -183,7 +137,7 @@ INSCollocatedHierarchyIntegrator {
    cfl                           = CFL_MAX
    dt_max                        = DT
    using_vorticity_tagging       = VORTICITY_TAGGING
-   vorticity_abs_thresh          = 0.125,0.25,0.5,1,2
+   vorticity_rel_thresh          = 0.125
    tag_buffer                    = TAG_BUFFER
    output_U                      = OUTPUT_U
    output_P                      = OUTPUT_P
@@ -208,7 +162,7 @@ INSStaggeredHierarchyIntegrator {
    cfl                           = CFL_MAX
    dt_max                        = DT
    using_vorticity_tagging       = VORTICITY_TAGGING
-   vorticity_abs_thresh          = 0.125,0.25,0.5,1,2
+   vorticity_rel_thresh          = 0.25,0.125
    tag_buffer                    = TAG_BUFFER
    output_U                      = OUTPUT_U
    output_P                      = OUTPUT_P
@@ -227,7 +181,7 @@ Main {
 
 // visualization dump parameters
    viz_writer                  = "VisIt","ExodusII"
-   viz_dump_interval           = int(0.5/DT)
+   viz_dump_interval           = 100
    viz_dump_dirname            = "viz_IB2d"
    visit_number_procs_per_file = 1
 
@@ -236,7 +190,7 @@ Main {
    restart_dump_dirname        = "restart_IB2d"
 
 // hierarchy data dump parameters
-   data_dump_interval          = 1
+   data_dump_interval          = 0
    data_dump_dirname           = "hier_data_IB2d"
 
 // timer dump parameters
@@ -244,10 +198,10 @@ Main {
 }
 
 CartesianGeometry {
-   domain_boxes = [ (0,0),(2*N - 1,N - 1) ]
-   x_lo = -1.5*L,-0.5*L
-   x_up =  0.5*L, 0.5*L
-   periodic_dimension = 0,0
+   domain_boxes = [ (0,0),(N - 1,N - 1) ]
+   x_lo = -0.5*L,-0.5*L
+   x_up = 0.5*L,0.5*L
+   periodic_dimension = 1,1
 }
 
 GriddingAlgorithm {
@@ -258,8 +212,6 @@ GriddingAlgorithm {
       level_3 = REF_RATIO,REF_RATIO
       level_4 = REF_RATIO,REF_RATIO
       level_5 = REF_RATIO,REF_RATIO
-      level_6 = REF_RATIO,REF_RATIO
-      level_7 = REF_RATIO,REF_RATIO
    }
    largest_patch_size {
       level_0 = 512,512  // all finer levels will use same values as level_0
@@ -267,8 +219,8 @@ GriddingAlgorithm {
    smallest_patch_size {
       level_0 =   8,  8  // all finer levels will use same values as level_0
    }
-   efficiency_tolerance = 0.80e0  // min % of tag cells in new patch level
-   combine_efficiency   = 0.80e0  // chop box if sum of volumes of smaller boxes < efficiency * vol of large box
+   efficiency_tolerance = 0.85e0  // min % of tag cells in new patch level
+   combine_efficiency   = 0.85e0  // chop box if sum of volumes of smaller boxes < efficiency * vol of large box
 }
 
 StandardTagAndInitialize {
@@ -282,8 +234,7 @@ LoadBalancer {
 
 TimerManager{
    print_exclusive = FALSE
-   print_total = TRUE
+   print_total     = TRUE
    print_threshold = 0.1
-
-   timer_list = "IBAMR::*::*","IBTK::*::*","*::*::*"
+   timer_list      = "IBAMR::*::*","IBTK::*::*","*::*::*"
 }

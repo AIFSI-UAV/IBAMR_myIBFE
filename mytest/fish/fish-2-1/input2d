@@ -1,12 +1,12 @@
 // physical parameters
-MU  = .01
+MU  = 0.01
 RHO = 1.0
-L   = 2.0
+L   = 4.0
 
 // grid spacing parameters
 MAX_LEVELS = 2                                 // maximum number of levels in locally refined grid
 REF_RATIO  = 4                                 // refinement ratio between levels
-N = 32                                         // actual    number of grid cells on coarsest grid level
+N = 64                                         // actual    number of grid cells on coarsest grid level
 NFINEST = (REF_RATIO^(MAX_LEVELS - 1))*N       // effective number of grid cells on finest   grid level
 DX0 = L/N                                      // mesh width on coarsest grid level
 DX  = L/NFINEST                                // mesh width on finest   grid level
@@ -17,6 +17,20 @@ PK1_DIL_QUAD_ORDER = "THIRD"
 
 // model parameters
 U_MAX = 2.0
+
+// target-only kinematics: shape prescribed, global x/y/theta released
+Xcom_fixed = 0.25       // reference body-frame x position
+Ycom_fixed = 0.0        // reference body-frame y position
+Theta_fixed = 0.0       // reference body-frame orientation
+X_LEADING = -0.1       //fish leading edge
+FISH_LENGTH = 1.1       //fish length
+Y_center0 = 0.0         //fish.mesh Y position 网格中心线
+WAVE_AMPLITUDE = 0.05   
+WAVE_FREQUENCY = 1.0
+WAVE_LAMBDA = 1.0       
+WAVE_PHASE0 = 0.0
+TARGET_WAVE_AUDIT_FILE = "target_wave_audit.curve"
+AUDIT_INTERVAL = 20
 C1_S = 0.05
 P0_S = C1_S
 BETA_S = 1.0*(NFINEST/64.0)
@@ -185,8 +199,8 @@ Main {
 
 CartesianGeometry {
    domain_boxes = [ (0,0),(N - 1,N - 1) ]
-   x_lo = -.5*L,-.5*L
-   x_up = .5*L,.5*L
+   x_lo = -0.5*L,-0.5*L
+   x_up = 0.5*L,0.5*L
    periodic_dimension = 1,1
 }
 
