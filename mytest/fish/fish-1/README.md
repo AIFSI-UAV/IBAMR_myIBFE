@@ -1,8 +1,27 @@
-This example demonstrates flow past a cylinder using the IBFE method. The cylinder can be modeled in two ways:
+### 3. target-only，只放开 (x) 平移
 
-1. Using only a surface mesh (set `USE_BOUNDARY_MESH=TRUE` in the input file)
-2. Using a mesh that approximates both the boundary and interior of the cylinder (set `USE_BOUNDARY_MESH=FALSE`)
+这一步我很赞同，而且我建议你把它明确叫做：
 
-No-slip boundary conditions on the cylinder are enforced using penalty springs and/or a frictional penalty. The drag and lift coefficients of the cylinder are computed and output at intervals specified by `data_dump_interval`.
+**“net thrust test under constrained attitude”**
 
-For full details, see: Hybrid finite difference/finite element immersed boundary method. *International Journal for Numerical Methods in Biomedical Engineering*, 33(11):e2888, 2017.
+目的：
+
+* 不让偏航和横漂污染判断
+* 先回答最基本的问题：**这套体波有没有净推进趋势**
+
+建议输出：
+
+* `x_com(t)`
+* 一个周期平均的 `u_com`
+* 周期平均流向力或等效推进量
+* `tail_y(t)`
+
+通过标准：
+
+* 有稳定的净前进趋势
+* 不出现反复前后拉扯但平均速度接近 0 的情况
+* 参数变化时推进趋势有可解释响应
+
+这一步很关键，因为 tethered / constrained 与 self-propelled 的结果本来就可能不同，你现在这样分开看是合理的。([科学直接][3])
+
+---
