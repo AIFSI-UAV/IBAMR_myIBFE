@@ -69,7 +69,7 @@ static double beta_s = 0.0;
 // -------------------------------
 static double xcom_fixed = 0.25;
 static double ycom_fixed = 0.00;
-static double theta_fixed = 0.0;
+static double theta_fixed = 0.0;    //三个量定义了鱼体的质心（COM）
 
 static double fish_length = 1.0;
 static double wave_amplitude = 0.05;      // loaded from input2d
@@ -97,6 +97,13 @@ amplitude_envelope(double s, double L, double A0)
     return A0 * xi;
 }
 
+inline double
+amplitude_envelope_derivative(double s, double L, double A0)
+{
+    if (s <= 0.0 || s >= L) return 0.0;
+    return A0 / L;
+}
+
 // -------------------------------
 // Traveling-wave body kinematics
 // y(s,t) = A(s) * sin(omega*t - k*s + phase0)
@@ -112,6 +119,26 @@ body_wave_y(double s,
 {
     const double A = amplitude_envelope(s, L, A0);
     return A * std::sin(omega * t - k_wave * s + phase0);
+}
+
+// -------------------------------
+// Centerline slope
+// dy/ds = A'(s) * sin(omega*t - k*s + phase0)
+//       - k * A(s) * cos(omega*t - k*s + phase0)
+// -------------------------------
+inline double
+body_wave_dyds(double s,
+               double t,
+               double L,
+               double A0,
+               double omega,
+               double k_wave,
+               double phase0)
+{
+    const double A = amplitude_envelope(s, L, A0);
+    const double dA_ds = amplitude_envelope_derivative(s, L, A0);
+    const double phase = omega * t - k_wave * s + phase0;
+    return dA_ds * std::sin(phase) - k_wave * A * std::cos(phase);
 }
 
 // -------------------------------
@@ -149,8 +176,8 @@ audit_target_tail(double time)
 
 // -------------------------------
 // Fixed-pose target generator
-// Reference configuration -> fixed body frame -> add traveling wave
-// -> map back to lab frame
+// Reference configuration -> fixed body frame ->
+// centerline wave + local normal offset -> map back to lab frame
 // -------------------------------
 inline void
 compute_eel_target_fixed_pose(const libMesh::Point& X,
@@ -182,15 +209,27 @@ compute_eel_target_fixed_pose(const libMesh::Point& X,
     const double dx_lead = xlead - xcom0;
     const double dy_lead = ycenter0 - ycom0;
     const double xhat_lead = c * dx_lead + s * dy_lead;
+    const double yhat_lead = -s * dx_lead + c * dy_lead;
 
-    // 3) axial coordinate measured from leading point
+    // 3) body-frame coordinates relative to the undeformed centerline
     const double s_body = xhat_ref - xhat_lead;
+    const double eta_body = yhat_ref - yhat_lead;
 
-    // 4) body-frame traveling wave
+    // 4) deformed centerline and local Frenet frame in the body frame
     const double ywave = body_wave_y(s_body, time, L, A0, omega, k_wave, phase0);
+    const double dywave_ds = body_wave_dyds(s_body, time, L, A0, omega, k_wave, phase0);
 
-    const double xhat_tar = xhat_ref;
-    const double yhat_tar = yhat_ref + ywave;
+    const double tangent_scale = std::sqrt(1.0 + dywave_ds * dywave_ds);
+    const double tx = 1.0 / tangent_scale;
+    const double ty = dywave_ds / tangent_scale;
+    const double nx = -ty;
+    const double ny = tx;
+
+    const double xhat_center = xhat_lead + s_body;
+    const double yhat_center = yhat_lead + ywave;
+
+    const double xhat_tar = xhat_center + eta_body * nx;
+    const double yhat_tar = yhat_center + eta_body * ny;
 
     // 5) map back to lab frame
     xtar = xcom0 + c * xhat_tar - s * yhat_tar;
@@ -360,12 +399,17 @@ main(int argc, char* argv[])
         beta_s = input_db->getDouble("BETA_S");
         kappa_s = input_db->getDouble("Kappa_S");
 
+        xcom_fixed = input_db->getDouble("Xcom_fixed");
+        ycom_fixed  = input_db->getDouble("Ycom_fixed");
+        theta_fixed = input_db->getDouble("Theta_fixed");
+
         fish_length = input_db->getDouble("FISH_LENGTH");
         wave_amplitude = input_db->getDouble("WAVE_AMPLITUDE");
         wave_frequency = input_db->getDouble("WAVE_FREQUENCY");
         wave_lambda = input_db->getDouble("WAVE_LAMBDA");
         wave_phase0 = input_db->getDouble("WAVE_PHASE0");
         x_leading = input_db->getDouble("X_LEADING");
+        y_center0 = input_db->getDouble("Y_center0");
 
         if (fish_length <= 0.0) TBOX_ERROR("FISH_LENGTH must be positive.\n");
         if (wave_lambda <= 0.0) TBOX_ERROR("WAVE_LAMBDA must be positive.\n");

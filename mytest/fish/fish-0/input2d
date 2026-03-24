@@ -19,11 +19,15 @@ PK1_DIL_QUAD_ORDER = "THIRD"
 U_MAX = 2.0
 
 // fixed-pose target kinematics
-X_LEADING = -0.1
-FISH_LENGTH = 1.1
-WAVE_AMPLITUDE = 0.05
+Xcom_fixed = 0.25       // fish X position
+Ycom_fixed = 0.0        // fish Y position
+Theta_fixed = 0.0       // fish orientation
+X_LEADING = -0.1       //fish leading edge
+FISH_LENGTH = 1.1       //fish length
+Y_center0 = 0.0         //fish.mesh Y position 网格中心线
+WAVE_AMPLITUDE = 0.05   
 WAVE_FREQUENCY = 1.0
-WAVE_LAMBDA = 1.0
+WAVE_LAMBDA = 1.0       
 WAVE_PHASE0 = 0.0
 C1_S = 0.05
 P0_S = C1_S
