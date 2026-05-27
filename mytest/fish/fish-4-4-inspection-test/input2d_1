@@ -10,6 +10,7 @@ NY         = N
 NFINEST    = (REF_RATIO^(MAX_LEVELS - 1))*N
 PK1_DEV_QUAD_ORDER = "FIFTH"
 PK1_DIL_QUAD_ORDER = "FIFTH"
+PK1_DAMP_QUAD_ORDER = "FIFTH"
 
 C1_S_PASSIVE                      = 0.5
 C1_S_PASSIVE_ANTERIOR             = 0.5
@@ -20,6 +21,9 @@ C1_S_PASSIVE_BODY_TRANSITION_W    = 0.30
 C1_S_PASSIVE_CAUDAL_TRANSITION_S  = 0.90
 C1_S_PASSIVE_CAUDAL_TRANSITION_W  = 0.05
 KAPPA_VOL_PASSIVE                 = 10.0
+USE_CONTINUUM_DAMPING             = FALSE
+CONTINUUM_DAMPING_FACTOR          = 0.005
+CONTINUUM_DAMPING_STRESS_CAP_OVER_C1 = 50.0
 
 FISH_LENGTH = 1.00
 X_LEADING   = 1.00
@@ -34,6 +38,9 @@ LAPLACE_HEAD_BC_WIDTH_OVER_L = 0.05
 LAPLACE_TAIL_BC_WIDTH_OVER_L = 0.05
 
 BETA_ACT = 0.5
+ACTIVE_MOMENT_MODE = "TRAVELING"
+STATIC_MOMENT_M0 = 0.0
+INITIAL_BEND_AMPLITUDE = 0.0
 LAMBDA_ACT_OVER_LACT = 1.00
 K_SHAPE_MODE = "BELL"
 ACTIVE_PHASE0          = 0.0
@@ -184,7 +191,7 @@ Main {
    log_file_name               = "IB2d.log"
    log_all_nodes               = FALSE
    viz_writer                  = "VisIt","ExodusII"
-   viz_dump_interval           = 100
+   viz_dump_interval           = 0
    viz_dump_dirname            = "viz_IB2d"
    visit_number_procs_per_file = 1
    restart_dump_interval       = 0
