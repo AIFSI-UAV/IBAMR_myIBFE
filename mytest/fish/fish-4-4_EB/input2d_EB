@@ -46,29 +46,19 @@ PK1_PASSIVE_QUAD_ORDER = "FIFTH"
 PK1_EB_QUAD_ORDER = "FIFTH"
 PK1_DAMP_QUAD_ORDER = "FIFTH"
 
-// ω* = ω₀/ω, ω₀ = γ₀√(E_m/(ρL²)), E_m = 4·C1_S_PHYSICS (plane-strain), γ₀ = 0.9257
-// C1_S_PHYSICS=1.25→ω*≈0.33; 5.0→ω*≈0.66; 11.5→ω*≈1.0; 46→ω*≈2.0; 94→ω*≈2.86
-C1_S_PHYSICS                      = 5.0
-C1_S_PHYSICS_ANTERIOR             = 5.0
-C1_S_PHYSICS_PEDUNCLE             = 5.0
-C1_S_PHYSICS_CAUDAL               = 5.0    // uniform stiffness for the first Xu 2024 reproduction case
-C1_S_PHYSICS_BODY_TRANSITION_S    = 0.60   // body→peduncle center; transition spans xi=[0.30, 0.90]
-C1_S_PHYSICS_BODY_TRANSITION_W    = 0.30
-C1_S_PHYSICS_CAUDAL_TRANSITION_S  = 0.90   // peduncle→caudal center; transition spans xi=[0.85, 0.95]
-C1_S_PHYSICS_CAUDAL_TRANSITION_W  = 0.05
-ETA_TOT                           = 0.05   // soft shape maintenance: Pe = eta_tot*(F - F^{-T})
+ETA_TOT   = 0.05   // shape maintenance: Pe = eta_tot*(F - F^{-T})
+EB_KAPPA_B = 5.0   // EB bending stiffness C1 equivalent; E_m = 4*EB_KAPPA_B
 STRUCTURAL_KV_LOSS_FACTOR = 0.02   // literature damping ratio l* = 0.02, represented by the IBFE KV analogue
-STRUCTURAL_KV_STRESS_CAP_OVER_C1 = 50.0 // caps EB passive fiber stress at this multiple of C1_S_PHYSICS
+STRUCTURAL_KV_STRESS_CAP_OVER_C1 = 50.0 // caps EB/KV fiber stress at this multiple of eta_tot
 USE_EB_PASSIVE_BENDING    = TRUE     // main passive physics: E_m*I_e*kappa + eta_m*I_e*kappa_dot
 EB_BENDING_STATIONS       = 101
 EB_ACTIVE_S_END           = 0.98     // exclude blunt-tail cap from EB bending
 
 // ── Fish geometry / wave timing ───────────────────────────────────────────
 FISH_LENGTH = 1.00
-OMEGA_STAR_LENGTH_MODE = "FISH_LENGTH" // explicit: paper/chord length; use REFERENCE_ARC_LENGTH for mesh-length scaling
 X_LEADING   = 1.00        // fish head x; sets reference s=0 and active-wave direction
 WAVE_FREQUENCY = 1.00        // actuation frequency [Hz]
-WAVE_RAMP_TIME = 3.0         // three-beat startup ramp at f=1.0Hz
+WAVE_RAMP_TIME = 2.0         // three-beat startup ramp at f=1.0Hz
 WAVE_TIME_SIGN = 1.0          // literature convention: cos(k*xi - omega*t), xi head→tail, gives head-to-tail activation
 
 // ── Reference coordinates / strict midline extraction ─────────────────────
@@ -150,15 +140,6 @@ GEOMETRY_CONSERVATION_DIAG_FILENAME = "geometry_conservation_diag.csv"
 FIN_PITCH_DIAG_ENABLE   = TRUE
 FIN_PITCH_DIAG_INTERVAL = 100
 FIN_PITCH_DIAG_FILENAME = "fin_pitch_diag.csv"
-
-// ── ω* direct input (optional) ────────────────────────────────────────────
-// Set EM_FROM_OMEGA_STAR=TRUE and OMEGA_STAR=<value> to back-derive C1_S_PHYSICS from
-// the dimensionless frequency ratio ω* = ω₀/ω, ω₀=γ₀√(E_m/(ρL²)), γ₀=0.9257.
-// When active, overrides the C1_S_PHYSICS profile, but not ETA_TOT.
-// OMEGA_STAR_LENGTH_MODE="FISH_LENGTH" (default) uses L_ref=FISH_LENGTH;
-// use "REFERENCE_ARC_LENGTH" to scale by the actual mesh arc length instead.
-EM_FROM_OMEGA_STAR  = TRUE
-OMEGA_STAR          = 0.66        // ω*≈0.66 ↔ C1_S_PHYSICS≈5.0 at f=1Hz, L=1, ρ=1
 
 // ── Beta-act amplitude auto-calibration (optional) ────────────────────────
 // When BETA_ACT_CALIBRATION=TRUE, a runtime bisection loop adjusts BETA_ACT

@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------
 // Phase-2A: Self-propelled fish via active bending moment (IBFE/IBAMR)
-// Input file: input2d_8
+// Input file: input2d_EB
 //
 // Physics basis:
 //   Xu, Zhou & Yu (2024) Phys. Fluids 36, 041908
@@ -28,8 +28,8 @@
 //   The active moment is converted to a through-thickness fiber stress:
 //   T_act(X,t) = sign · w(η) · Mm(s,t) · η(X) / I₂_eff(s),
 //   where I₂_eff = ∫w(η)η²dη.
-//   The sign is exposed as ACTIVE_MOMENT_TO_STRESS_SIGN in this diagnostic
-//   test version so the Mm -> T_act -> kappa chain can be checked directly.
+//   ACTIVE_MOMENT_TO_STRESS_SIGN controls the sign convention so the
+//   Mm -> T_act -> kappa chain can be verified diagnostically.
 //   The fiber direction and through-thickness coordinate are precomputed as a
 //   reference FE field and interpolated at quadrature points. By default that
 //   field is generated from a Laplace/harmonic mesh coordinate: s, t_hat,
@@ -107,34 +107,18 @@
 namespace ModelData
 {
 
-// --- Passive elasticity ---
+// --- Fluid and structural parameters ---
 static double fluid_density = 1.0;
 static double fluid_viscosity = 0.0008;
-static double c1_s_physics = 5.0; // fallback value for the physics profile
-static double c1_s_physics_anterior = 5.0;
-static double c1_s_physics_peduncle = 5.0;
-static double c1_s_physics_caudal = 5.0;
-// xi = (x_leading - x)/L: 0 at head, 1 at tail tip
-// body→peduncle: xi=[0.45,0.75] → x=[0.55,0.25]; peduncle→caudal: xi=[0.80,0.90] → x=[0.20,0.10]
-static double c1_s_body_transition_s = 0.60;    // body→peduncle transition center in xi
-static double c1_s_body_transition_w = 0.30;    // half-extent 0.15: x=[0.55,0.25]
-static double c1_s_caudal_transition_s = 0.85;  // peduncle→caudal transition center in xi
-static double c1_s_caudal_transition_w = 0.10;  // half-extent 0.05: x=[0.20,0.10]
-static double eta_tot = 0.05; // soft shape maintenance: eta_tot*(F - F^{-T})
-static double structural_kv_loss_factor = 0.02; // literature damping ratio l* represented by the IBFE KV analogue
-static double structural_kv_stress_cap_over_c1 = 50.0;
+static double eta_tot = 0.05;    // shape maintenance: Pe = eta_tot*(F - F^{-T})
+static double eb_kappa_b = 5.0;  // EB bending stiffness; E_m = 4*eb_kappa_b
+static double structural_kv_loss_factor = 0.02;       // damping ratio l*
+static double structural_kv_stress_cap_over_c1 = 50.0; // stress cap = this * eta_tot
 static bool   use_eb_passive_bending = true;
 static double eb_active_s_end = 1.0;   // EB bending disabled for s_norm >= this; set <1 for blunt-tail mesh
 
-// ── ω* direct input: set OMEGA_STAR + EM_FROM_OMEGA_STAR=TRUE to back-derive C1_S_PHYSICS ──
-// Formula (Xu 2024): ω* = γ₀√(E_m/(ρL²))/ω, E_m = 4·C1_S_PHYSICS, γ₀ = 0.9257.
-// eta_tot is mesh-only and never participates in this mapping.
-static double omega_star_prescribed = std::numeric_limits<double>::quiet_NaN();
-static bool   em_from_omega_star    = false;
-
 // --- Geometry / actuation frequency ---
 static double fish_length = 1.00;
-static std::string omega_star_length_mode = "FISH_LENGTH";
 static double x_leading   = 1.00;
 static double wave_frequency = 1.00;
 static double wave_ramp_time = 3.0;
@@ -159,7 +143,7 @@ static double wave_time_sign = 1.0;
 //     The literature reproduction uses K_SHAPE_MODE=BELL and lambda_act=L.
 //
 // β_act  : strength factor; bisect to match A/L ≈ 0.10.
-//          Larger C1_S_PHYSICS (stiffer body) requires larger β_act.
+//          Larger eb_kappa_b (stiffer body) requires larger β_act.
 
 static double beta_act  = 5.0;     // strength factor β  [calibrate to target tail amplitude]
 static double active_wavelength_over_L = 1.00; // muscle activation wavelength / active-body length
@@ -181,7 +165,7 @@ static double active_moment_h_power = 0.0; // ignored by XU2024_SIMPLE
 static double active_caudal_gain = 1.0;
 static double active_caudal_gain_start_s = 0.72;
 static double active_caudal_gain_width_s = 0.22;
-static double active_t_act_max_over_c1 = 200.0;
+static double active_t_act_max_over_c1 = 200.0; // T_act_max = this * eta_tot
 static int    reference_profile_bins = 128;
 static std::string wave_head_location = "x_min";
 static double reference_backbone_end_x =
@@ -477,18 +461,6 @@ inline double smoothstep_cosine(const double s, const double s0, const double w)
 
     const double xi = (s - lo) / width;
     return 0.5 * (1.0 - std::cos(M_PI * xi));
-}
-
-inline double get_c1_s_physics_local(const double x_norm)
-{
-    const double xi = clamp01(x_norm);
-    const double w_body =
-        smoothstep_cosine(xi, c1_s_body_transition_s, c1_s_body_transition_w);
-    const double w_caudal =
-        smoothstep_cosine(xi, c1_s_caudal_transition_s, c1_s_caudal_transition_w);
-    return c1_s_physics_anterior
-           + (c1_s_physics_peduncle - c1_s_physics_anterior) * w_body
-           + (c1_s_physics_caudal - c1_s_physics_peduncle) * w_caudal;
 }
 
 inline double wave_ramp(double time)
@@ -1347,16 +1319,6 @@ void fill_reference_geometry_system(MeshBase& mesh, EquationSystems* equation_sy
                      << global_counts[1] << " / " << global_counts[0]
                      << " nodes could not be projected to the reference centerline.\n");
     }
-}
-
-inline double get_c1_s_physics_local_from_reference_point(const libMesh::Point& X_ref)
-{
-    return get_c1_s_physics_local(reference_x_norm_from_point(X_ref));
-}
-
-inline double get_E_m_local_from_reference_point(const libMesh::Point& X_ref)
-{
-    return 4.0 * get_c1_s_physics_local_from_reference_point(X_ref);
 }
 
 void add_halfthickness_sample_to_raw_envelope(std::vector<double>& raw_h,
@@ -2742,63 +2704,17 @@ inline std::string normalize_mode_string(const std::string& mode_raw)
     return mode;
 }
 
-inline double omega_star_reference_length()
-{
-    const std::string mode = normalize_mode_string(omega_star_length_mode);
-    if (mode == "FISH-LENGTH" || mode == "PAPER" || mode == "CHORD")
-    {
-        return std::max(fish_length, 1.0e-12);
-    }
-    if (mode == "REFERENCE-ARC-LENGTH" || mode == "REF-ARC-LENGTH" ||
-        mode == "L-REF")
-    {
-        return std::max(ref_arc_length, 1.0e-12);
-    }
-
-    TBOX_ERROR("Unknown OMEGA_STAR_LENGTH_MODE = \""
-               << omega_star_length_mode
-               << "\". Expected FISH_LENGTH or REFERENCE_ARC_LENGTH.\n");
-    return std::max(fish_length, 1.0e-12);
-}
-
 inline double beam_reference_omega0_from_Em(const double E_m)
 {
     const double gamma_0 = 0.9257;
-    const double L_omega = omega_star_reference_length();
+    const double L_omega = std::max(fish_length, 1.0e-12);
     return gamma_0 * std::sqrt(std::max(E_m, 1.0e-30) /
                                (fluid_density * L_omega * L_omega));
 }
 
 inline double eb_damping_reference_omega0(const double E_m)
 {
-    if (em_from_omega_star &&
-        std::isfinite(omega_star_prescribed) && omega_star_prescribed > 0.0)
-    {
-        return std::max(omega_star_prescribed * std::abs(wave_omega), 1.0e-12);
-    }
     return std::max(beam_reference_omega0_from_Em(E_m), 1.0e-12);
-}
-
-void apply_omega_star_back_calculation()
-{
-    if (!em_from_omega_star) return;
-    if (!std::isfinite(omega_star_prescribed) || omega_star_prescribed <= 0.0)
-    {
-        TBOX_ERROR("EM_FROM_OMEGA_STAR=TRUE requires OMEGA_STAR > 0.\n");
-    }
-
-    const double gamma_0 = 0.9257;
-    const double L_omega = omega_star_reference_length();
-    const double omega_abs = std::max(std::abs(wave_omega), 1.0e-12);
-    const double Em = fluid_density * L_omega * L_omega *
-        std::pow(omega_abs * omega_star_prescribed / gamma_0, 2.0);
-    const double c1 = std::max(1.0e-12, Em / 4.0);
-    c1_s_physics = c1_s_physics_anterior = c1_s_physics_peduncle =
-        c1_s_physics_caudal = c1;
-    pout << "[omega_star] prescribed omega*=" << omega_star_prescribed
-         << "  L=" << L_omega
-         << "  E_m=" << Em
-         << "  -> C1_S_PHYSICS=" << c1_s_physics << "\n";
 }
 
 inline ActiveKShapeMode parse_active_k_shape_mode(const std::string& mode_raw)
@@ -3502,7 +3418,7 @@ inline double paper_section_second_moment(const double h)
 //   M_EB(s,t) = -E_m I_e(s) kappa(s,t)
 //             - eta_m I_e(s) kappa_dot(s,t),
 //
-// with E_m = 4 C1_S_PHYSICS(s) and eta_m = l* E_m / omega0. The section moment is
+// with E_m = 4·eb_kappa_b and eta_m = l* E_m / omega0. The section moment is
 // mapped to a zero-resultant through-thickness fiber stress, using the same
 // curvature-conjugate sign convention as the active moment:
 //
@@ -3538,7 +3454,7 @@ compute_eb_passive_bending_PK1_stress_impl(
     const double I2_use = use_fe_section ? I2_c : I2_eff;
     if (I2_use <= 1.0e-30) return;
 
-    const double E_m = get_E_m_local_from_reference_point(X_ref);
+    const double E_m = 4.0 * eb_kappa_b;
     const double eta_m = structural_kv_loss_factor * E_m /
                          eb_damping_reference_omega0(E_m);
     const double I_e = paper_section_second_moment(h);
@@ -3546,9 +3462,7 @@ compute_eb_passive_bending_PK1_stress_impl(
                                 eta_m * eb_sample.kappa_dot);
 
     const double T_eb_raw = -band_weight * M_eb * eta_c / I2_use;
-    const double T_cap =
-        structural_kv_stress_cap_over_c1 *
-        get_c1_s_physics_local_from_reference_point(X_ref);
+    const double T_cap = structural_kv_stress_cap_over_c1 * eta_tot;
     const double T_eb = (T_cap > 0.0) ?
         std::max(-T_cap, std::min(T_cap, T_eb_raw)) : T_eb_raw;
 
@@ -3630,11 +3544,10 @@ compute_structural_damping_PK1_stress_impl(
     const VectorValue<double> a_hat = a / a_norm;
 
     const double axial_strain_rate = a_hat * (D * a_hat);
-    const double c1_local = get_c1_s_physics_local_from_reference_point(X_ref);
     const double omega_ref = std::max(std::abs(wave_omega), 1.0e-12);
-    const double eta_local = structural_kv_loss_factor * 2.0 * c1_local / omega_ref;
+    const double eta_local = structural_kv_loss_factor * 2.0 * eta_tot / omega_ref;
     const double T_raw = eta_local * axial_strain_rate;
-    const double T_cap = structural_kv_stress_cap_over_c1 * c1_local;
+    const double T_cap = structural_kv_stress_cap_over_c1 * eta_tot;
     const double T_kv = (T_cap > 0.0) ?
         std::max(-T_cap, std::min(T_cap, T_raw)) : T_raw;
 
@@ -3723,10 +3636,7 @@ compute_active_PK1_stress_impl(TensorValue<double>& PP,
     // Both are precomputed by build_fe_section_data(); when not built (symmetric
     // mesh / fallback) eta_c = eta and I2_c = active_band_second_moment(h).
     //
-    // The input sign switch is intentionally exposed in this test version:
-    // it diagnoses whether raw Mm is conjugate to +kappa or -kappa under the
-    // current eta/n_hat convention. Cap is applied to Mm (not T_act) to
-    // preserve T_act(+η) = -T_act(-η) after clamping.
+    // Cap is applied to Mm (not T_act) to preserve T_act(+η) = -T_act(-η).
     const double I2_c    = fe_I2c_from_s_norm(s_norm);
     const bool use_fe_section =
         active_section_correction_enabled() && I2_c > 1.0e-30;
@@ -3735,8 +3645,7 @@ compute_active_PK1_stress_impl(TensorValue<double>& PP,
     const double I2_eff  = active_band_second_moment(h);
     const double I2_use  = use_fe_section ? I2_c : I2_eff;
     if (I2_use <= 1.0e-30) return;
-    const double T_act_max =
-        active_t_act_max_over_c1 * get_c1_s_physics_local_from_reference_point(X_ref);
+    const double T_act_max = active_t_act_max_over_c1 * eta_tot;
     const double Mm_max = T_act_max * I2_use / std::max(h, 1.0e-12);
     // tanh saturation: C∞ continuous, avoids delta-function impulses at hard clip edges
     const double Mm_clamped = Mm_max * std::tanh(Mm / Mm_max);
@@ -5403,7 +5312,7 @@ write_section_moment_decomposition_diagnostics(
 
             TensorValue<double> PP[FORCE_N_COMPONENTS];
             for (int c = 0; c < FORCE_N_COMPONENTS; ++c) PP[c] = 0.0;
-            const double c1_local = get_c1_s_physics_local_from_reference_point(X_ref_qp);
+            const double c1_local = eta_tot;
             compute_passive_PK1_stress_impl(PP[FORCE_PASSIVE], FF);
             compute_eb_passive_bending_PK1_stress_impl(PP[FORCE_EB_PASSIVE],
                                                        FF, X_ref_qp,
@@ -6480,49 +6389,10 @@ int main(int argc, char* argv[])
         fluid_density = std::max(fluid_density, 1.0e-30);
 
         // ── Read passive material parameters ───────────────────────────────
-        const double c1_physics_legacy_default =
-            input_db->keyExists("C1_S") ? input_db->getDouble("C1_S") :
-                                          c1_s_physics;
-        c1_s_physics =
-            input_db->getDoubleWithDefault("C1_S_PHYSICS",
-                                           c1_physics_legacy_default);
-        c1_s_physics_anterior =
-            input_db->getDoubleWithDefault(
-                "C1_S_PHYSICS_ANTERIOR",
-                input_db->getDoubleWithDefault("C1_S_ANTERIOR",
-                                               c1_s_physics));
-        c1_s_physics_peduncle =
-            input_db->getDoubleWithDefault(
-                "C1_S_PHYSICS_PEDUNCLE",
-                input_db->getDoubleWithDefault("C1_S_PEDUNCLE",
-                                               c1_s_physics));
-        c1_s_physics_caudal =
-            input_db->getDoubleWithDefault(
-                "C1_S_PHYSICS_CAUDAL",
-                input_db->getDoubleWithDefault("C1_S_CAUDAL",
-                                               c1_s_physics));
-        c1_s_body_transition_s =
-            input_db->getDoubleWithDefault(
-                "C1_S_PHYSICS_BODY_TRANSITION_S",
-                input_db->getDoubleWithDefault("C1_S_BODY_TRANSITION_S",
-                                               c1_s_body_transition_s));
-        c1_s_body_transition_w =
-            input_db->getDoubleWithDefault(
-                "C1_S_PHYSICS_BODY_TRANSITION_W",
-                input_db->getDoubleWithDefault("C1_S_BODY_TRANSITION_W",
-                                               c1_s_body_transition_w));
-        c1_s_caudal_transition_s =
-            input_db->getDoubleWithDefault(
-                "C1_S_PHYSICS_CAUDAL_TRANSITION_S",
-                input_db->getDoubleWithDefault("C1_S_CAUDAL_TRANSITION_S",
-                                               c1_s_caudal_transition_s));
-        c1_s_caudal_transition_w =
-            input_db->getDoubleWithDefault(
-                "C1_S_PHYSICS_CAUDAL_TRANSITION_W",
-                input_db->getDoubleWithDefault("C1_S_CAUDAL_TRANSITION_W",
-                                               c1_s_caudal_transition_w));
         eta_tot =
             input_db->getDoubleWithDefault("ETA_TOT", eta_tot);
+        eb_kappa_b =
+            input_db->getDoubleWithDefault("EB_KAPPA_B", eb_kappa_b);
         structural_kv_loss_factor =
             input_db->getDoubleWithDefault("STRUCTURAL_KV_LOSS_FACTOR",
                                            structural_kv_loss_factor);
@@ -6537,15 +6407,8 @@ int main(int argc, char* argv[])
         s_eb_bending_stations =
             input_db->getIntegerWithDefault("EB_BENDING_STATIONS",
                                             s_eb_bending_stations);
-        c1_s_physics = std::max(c1_s_physics, 1.0e-12);
-        c1_s_physics_anterior = std::max(c1_s_physics_anterior, 1.0e-12);
-        c1_s_physics_peduncle = std::max(c1_s_physics_peduncle, 1.0e-12);
-        c1_s_physics_caudal = std::max(c1_s_physics_caudal, 1.0e-12);
         eta_tot = std::max(0.0, eta_tot);
-        c1_s_body_transition_s = clamp01(c1_s_body_transition_s);
-        c1_s_body_transition_w = std::max(c1_s_body_transition_w, 1.0e-12);
-        c1_s_caudal_transition_s = clamp01(c1_s_caudal_transition_s);
-        c1_s_caudal_transition_w = std::max(c1_s_caudal_transition_w, 1.0e-12);
+        eb_kappa_b = std::max(1.0e-12, eb_kappa_b);
         structural_kv_loss_factor = std::max(0.0, structural_kv_loss_factor);
         structural_kv_stress_cap_over_c1 =
             std::max(0.0, structural_kv_stress_cap_over_c1);
@@ -6554,9 +6417,6 @@ int main(int argc, char* argv[])
 
         // ── Read geometry / actuation parameters ──────────────────────────
         fish_length  = input_db->getDoubleWithDefault("FISH_LENGTH", fish_length);
-        omega_star_length_mode =
-            input_db->getStringWithDefault("OMEGA_STAR_LENGTH_MODE",
-                                           omega_star_length_mode);
         x_leading    = input_db->getDoubleWithDefault("X_LEADING",   x_leading);
         wave_frequency = input_db->getDoubleWithDefault("WAVE_FREQUENCY", wave_frequency);
         wave_ramp_time = input_db->getDoubleWithDefault("WAVE_RAMP_TIME", wave_ramp_time);
@@ -6641,12 +6501,6 @@ int main(int argc, char* argv[])
         laplace_head_bc_width_over_L = std::max(0.0, laplace_head_bc_width_over_L);
         laplace_tail_bc_width_over_L = std::max(0.0, laplace_tail_bc_width_over_L);
 
-        // ── ω* direct input ────────────────────────────────────────────────
-        omega_star_prescribed =
-            input_db->getDoubleWithDefault("OMEGA_STAR", omega_star_prescribed);
-        em_from_omega_star =
-            input_db->getBoolWithDefault("EM_FROM_OMEGA_STAR", em_from_omega_star);
-
         // ── Beta-act bisection calibration ─────────────────────────────────
         s_beta_cal_enable =
             input_db->getBoolWithDefault("BETA_ACT_CALIBRATION", s_beta_cal_enable);
@@ -6691,7 +6545,6 @@ int main(int argc, char* argv[])
         }
 
         build_reference_profile_from_mesh(mesh);
-        apply_omega_star_back_calculation();
         initialize_tail_tracking_points(mesh);
         initialize_fin_root_tracking_points(mesh);
         if (use_laplace_reference_parameterization && use_fe_active_section_data)
@@ -6798,45 +6651,9 @@ int main(int argc, char* argv[])
         pout << "  fluid rho/mu = " << fluid_density << " / " << fluid_viscosity << "\n";
         pout << "  Re_act = rho*f*lambda_act*L_fish/mu = "
              << Re_act << "\n";
-        {
-            // omega* = omega0/omega, omega0 = gamma0*sqrt(E_m/(rho*L^2)),
-            // E_m=4*C1_S_PHYSICS, gamma0=0.9257.
-            const double L_for_omega = omega_star_reference_length();
-            const double E_m = 4.0 * c1_s_physics;
-            const double omega_0 = beam_reference_omega0_from_Em(E_m);
-            const double omega_star = omega_0 / std::max(std::abs(wave_omega), 1.0e-12);
-            pout << "  omega* length mode = " << omega_star_length_mode
-                 << ", L_for_omega = " << L_for_omega << "\n";
-            pout << "  omega_0 (beam natural freq, C1_S_PHYSICS="
-                 << c1_s_physics << ") = " << omega_0 << " rad/s\n";
-            pout << "  omega* = omega_0/omega = " << omega_star
-                 << "  (paper: omega*~0.67 at C1_S_PHYSICS=5.0, f=1Hz)\n";
-            if (em_from_omega_star)
-            {
-                pout << "  C1_S_PHYSICS was back-derived from prescribed OMEGA_STAR = "
-                     << omega_star_prescribed << "\n";
-            }
-        }
         pout << "  beta_act = " << beta_act << "\n";
         pout << "  active drive model = MUSCLE_MOMENT/" << active_moment_model_name() << "\n";
-        pout << "  C1_S_PHYSICS fallback = " << c1_s_physics << "\n";
-        pout << "  C1_S_PHYSICS profile = THREE_REGION over reference x/L\n";
-        pout << "  C1_S_PHYSICS anterior/peduncle/caudal = "
-             << c1_s_physics_anterior << " / " << c1_s_physics_peduncle
-             << " / " << c1_s_physics_caudal << "\n";
-        pout << "  C1_S_PHYSICS body transition x/L,w = "
-             << c1_s_body_transition_s << ", " << c1_s_body_transition_w << "\n";
-        pout << "  C1_S_PHYSICS caudal transition x/L,w = "
-             << c1_s_caudal_transition_s << ", "
-             << c1_s_caudal_transition_w << "\n";
-        pout << "  C1_S_PHYSICS samples at x/L = 0, 0.45, 0.65, 0.82, 0.86, 0.90, 1: "
-             << get_c1_s_physics_local(0.00) << ", "
-             << get_c1_s_physics_local(0.45) << ", "
-             << get_c1_s_physics_local(0.65) << ", "
-             << get_c1_s_physics_local(0.82) << ", "
-             << get_c1_s_physics_local(0.86) << ", "
-             << get_c1_s_physics_local(0.90) << ", "
-             << get_c1_s_physics_local(1.00) << "\n";
+        pout << "  eb_kappa_b (EB stiffness) = " << eb_kappa_b << "\n";
         pout << "  passive shape maintenance ETA_TOT = " << eta_tot
              << "  (Pe = ETA_TOT*(F - F^{-T}))\n";
         pout << "  EB passive bending = "
@@ -6845,7 +6662,7 @@ int main(int argc, char* argv[])
         pout << "  structural Kelvin-Voigt loss factor = "
              << structural_kv_loss_factor
              << ", stress cap = " << structural_kv_stress_cap_over_c1
-             << " * C1_S_PHYSICS(x)\n";
+             << " * eta_tot\n";
         if (use_eb_passive_bending)
         {
             pout << "  legacy fiber KV stress is disabled because EB passive bending "
@@ -6889,7 +6706,7 @@ int main(int argc, char* argv[])
                  << -active_moment_to_stress_sign << " * Mm\n";
         }
         pout << "  active stress cap = "
-             << active_t_act_max_over_c1 << " * C1_S_PHYSICS(x)\n";
+             << active_t_act_max_over_c1 << " * eta_tot\n";
         pout << "  reference profile bins = " << reference_profile_bins << "\n";
         pout << "  reference parameterization = "
              << (use_laplace_reference_parameterization ?
