@@ -1,0 +1,298 @@
+// ============================================================
+// Xu/Zhou/Yu 2024 reproduction input: active bending moment swimmer
+// C++ source: fish4-4_8.cpp
+// Reference: Phys. Fluids 36, 041908 (2024), DOI 10.1063/5.0202361
+//
+// Retained outputs only:
+//   direction_debug.csv
+//   curvature_phase_diag.csv
+//   force_decomposition_diag.csv
+//   section_moment_decomposition.csv
+//   geometry_conservation_diag.csv
+//   fin_pitch_diag.csv
+//   midline_history.csv
+//   geometry_sign_diag.csv
+//   active_section_consistency.csv
+// ============================================================
+
+// ── Physical parameters ──────────────────────────────────────────────────
+//    
+//    Literature active moment:
+//      M_a(s,t) = beta*w(s)^2*[1-cos(2*pi*s/L)]*cos(2*pi*s/L - omega*t)
+//    Here s/L is represented by the active-body coordinate xi.
+//
+//    L_act = (ACTIVE_S_END - ACTIVE_S_START) * L_ref.
+//    The blunt-tail mesh removes the sharp NACA tail segment but maps the
+//    retained body back to physical x in [0,1], so L_ref≈FISH_LENGTH≈1.
+//    lambda_act = LAMBDA_ACT_OVER_LACT * L_act
+//    Therefore LAMBDA_ACT_OVER_LACT = lambda_act/L_act, not lambda_act/L_ref.
+//    Re_act printed by the code is rho*f*lambda_act*L_FISH/mu.
+
+MU  = 0.0008           // With lambda_act above, Re_act is O(10^3) for large enough lambda_act.
+RHO = 1.0
+L   = 8.0               // L_DOMAIN = 8.0 is the computational domain size;The fish total length is L_FISH = 1.0.
+
+// ── Grid ─────────────────────────────────────────────────────────────────
+// MAX_LEVELS=3 required: tail cap full thickness ~0.014L needs finest Dx~0.004L.
+// At MAX_LEVELS=2 the finest Dx=0.016L > tail thickness → thin-body IBFE error
+// causes backward propulsion. With 3 levels (REF_RATIO=4): Dx=0.004L resolves tail.
+MAX_LEVELS = 3
+REF_RATIO  = 4
+N          = 128
+NX         = 2*N              // wider x-box at same base dx as the old 3*N/2 over 1.5*L
+NY         = N
+NFINEST    = (REF_RATIO^(MAX_LEVELS - 1))*N
+PK1_DEV_QUAD_ORDER  = "FIFTH"
+PK1_DIL_QUAD_ORDER  = "FIFTH"
+PK1_EB_QUAD_ORDER   = "FIFTH"
+PK1_DAMP_QUAD_ORDER = "FIFTH"
+
+// ── Passive shape maintenance: dev + dil split ────────────────────────────
+ETA_DEV   = 0.05    // dev shear stiffness: PP_dev = 2*eta_dev*F
+KAPPA_VOL = 20.0    // dil volume penalty:  PP_dil = 2*(-eta_dev+kappa_vol*lnJ)*F^{-T}
+EB_KAPPA_B = 2.0    // EB bending stiffness C1 equivalent; E_m = 4*EB_KAPPA_B
+STRUCTURAL_KV_LOSS_FACTOR = 0.05   // increased from 0.02 → 0.05 to damp EB oscillations
+STRUCTURAL_KV_STRESS_CAP_OVER_C1 = 50.0 // caps EB/KV fiber stress at this multiple of eta_dev
+USE_EB_PASSIVE_BENDING    = TRUE     // main passive physics: E_m*I_e*kappa + eta_m*I_e*kappa_dot
+EB_BENDING_STATIONS       = 101
+EB_ACTIVE_S_END           = 0.98     // exclude blunt-tail cap from EB bending
+
+// ── Fish geometry / wave timing ───────────────────────────────────────────
+FISH_LENGTH = 1.00
+X_LEADING   = 1.00        // fish head x; sets reference s=0 and active-wave direction
+WAVE_FREQUENCY = 1.00        // actuation frequency [Hz]
+WAVE_RAMP_TIME = 5.0         // increased from 2.0 → 5.0: give more startup stabilization time
+WAVE_TIME_SIGN = 1.0          // literature convention: cos(k*xi - omega*t), xi head→tail, gives head-to-tail activation
+
+// ── Reference coordinates / strict midline extraction ─────────────────────
+REFERENCE_PROFILE_BINS = 128
+REFERENCE_BACKBONE_END_X = 0.0   // blunt-tail cap center; reference body runs from head x=1 to tail x=0
+USE_LAPLACE_REFERENCE_PARAMETERIZATION = TRUE
+LAPLACE_HEAD_BC_WIDTH_OVER_L = 0.05
+LAPLACE_TAIL_BC_WIDTH_OVER_L = 0.05
+
+// ── Phase-2A active bending moment ────────────────────────────────────────
+BETA_ACT = 5.0
+LAMBDA_ACT_OVER_LACT = 1.00
+K_SHAPE_MODE = "BELL"                   // K(xi)=1-cos(2*pi*xi), Xu/Zhou/Yu 2024 Eq. (2)
+ACTIVE_PHASE0          = 0.0
+ACTIVE_MOMENT_TO_STRESS_SIGN = -1.0  // sign=-1: M_curv = +Mm (paper convention M_a>0 → positive curvature)
+ACTIVE_S_START = 0.0
+ACTIVE_S_END = 1.00
+ACTIVE_S_SMOOTH = 0.0
+ACTIVE_BAND_FRACTION = 1.00
+ACTIVE_T_ACT_MAX_OVER_C1 = 1.0e6        // effectively disables stress saturation for the literature baseline
+USE_FE_ACTIVE_SECTION_DATA = TRUE       // FE eta_bar/I2_c enforces discrete zero-resultant section stresses
+
+// ── Solver parameters ─────────────────────────────────────────────────────
+USE_IB_DELTA_FUNCTIONS     = TRUE
+IB_DELTA_FUNCTION          = "IB_4"
+SPLIT_FORCES               = TRUE    // dev→volumetric body force, dil→surface pressure jump
+USE_JUMP_CONDITIONS        = FALSE
+USE_CONSISTENT_MASS_MATRIX = TRUE
+IB_POINT_DENSITY           = 3.0
+SOLVER_TYPE                = "STAGGERED"
+START_TIME                 = 0.0
+END_TIME                   = 12.0        // extended: need 8+ periods post-ramp for steady-state swimming to establish
+GROW_DT                    = 1.05          // conservative dt growth (was 1.2 in Phase-1)
+NUM_CYCLES                 = 1
+CONVECTIVE_TS_TYPE         = "ADAMS_BASHFORTH"
+CONVECTIVE_OP_TYPE         = "PPM"
+CONVECTIVE_FORM            = "ADVECTIVE"
+NORMALIZE_PRESSURE         = TRUE
+CFL_MAX                    = 0.15          // tightened from 0.25: previous run hit 0.40 CFL just before NaN blow-up
+DT                         = 1e-4          // tightened for EB 4th-order CFL stability (from 2e-4 → 1e-4)
+ERROR_ON_DT_CHANGE         = FALSE
+VORTICITY_TAGGING          = TRUE
+TAG_BUFFER                 = 2
+REGRID_CFL_INTERVAL        = 0.5
+ENABLE_LOGGING             = TRUE
+
+// ── Retained diagnostics ──────────────────────────────────────────────────
+CURVATURE_PHASE_DIAG_ENABLE     = TRUE
+CURVATURE_PHASE_DIAG_INTERVAL   = 100
+CURVATURE_PHASE_DIAG_FILENAME   = "curvature_phase_diag.csv"
+CURVATURE_PHASE_DIAG_STATIONS   = 31
+CURVATURE_PHASE_DIAG_START_TIME = 4.0  // ramp ends at t=3.0; start one full period after ramp
+
+DIRECTION_DEBUG_ENABLE   = TRUE
+DIRECTION_DEBUG_INTERVAL = 100
+DIRECTION_DEBUG_FILENAME = "direction_debug.csv"
+
+FORCE_DECOMP_DIAG_ENABLE   = TRUE
+FORCE_DECOMP_DIAG_INTERVAL = 100
+FORCE_DECOMP_DIAG_FILENAME = "force_decomposition_diag.csv"
+FORCE_DECOMP_QUAD_ORDER    = "FIFTH"
+
+SECTION_MOMENT_DIAG_ENABLE   = TRUE
+SECTION_MOMENT_DIAG_INTERVAL = 100
+SECTION_MOMENT_DIAG_FILENAME = "section_moment_decomposition.csv"
+SECTION_MOMENT_DIAG_BINS     = 128
+SECTION_MOMENT_QUAD_ORDER    = "FIFTH"
+
+GEOMETRY_CONSERVATION_DIAG_ENABLE   = TRUE
+GEOMETRY_CONSERVATION_DIAG_INTERVAL = 100
+GEOMETRY_CONSERVATION_DIAG_FILENAME = "geometry_conservation_diag.csv"
+
+FIN_PITCH_DIAG_ENABLE   = TRUE
+FIN_PITCH_DIAG_INTERVAL = 100
+FIN_PITCH_DIAG_FILENAME = "fin_pitch_diag.csv"
+
+// ── Beta-act amplitude auto-calibration (optional) ────────────────────────
+// When BETA_ACT_CALIBRATION=TRUE, a runtime bisection loop adjusts BETA_ACT
+// every BETA_ACT_CAL_MEAS_CYCLES beats until tail amplitude A_tail/L converges
+// to BETA_ACT_TARGET_A ± BETA_ACT_CAL_TOL.  Bisection is over [0, INIT_HI].
+// Use the converged beta_act from this run for a later fixed-beta production run.
+BETA_ACT_CALIBRATION       = TRUE
+BETA_ACT_TARGET_A          = 0.10   // target A_tail/L
+BETA_ACT_CAL_TOL           = 0.005
+BETA_ACT_CAL_SETTLE_CYCLES = 2      // beats to wait after each beta change
+BETA_ACT_CAL_MEAS_CYCLES   = 4      // beats over which amplitude is measured
+BETA_ACT_CAL_MAX_ITER      = 20
+BETA_ACT_CAL_INIT_HI       = 50.0   // upper bound for first bisection bracket
+
+// ── Midline history export (for COD/Fourier post-processing) ──────────────
+// Writes a CSV of instantaneous body midline samples every MIDLINE_HIST_INTERVAL
+// timesteps.  Post-process with post_cod_twi.py (traveling-wave index) and
+// post_fourier_lr.py (left/right energy decomposition).
+MIDLINE_HIST_ENABLE   = TRUE
+MIDLINE_HIST_INTERVAL = 10          // write every 10 steps (10×dt=0.002s at dt=2e-4)
+MIDLINE_HIST_STATIONS = 101         // evenly-spaced stations along arc length
+MIDLINE_HIST_FILENAME = "midline_history.csv"
+
+PROGRESS_PRINT_INTERVAL = 100
+
+// Open-water BCs:
+//   x_lower/x_upper (function_0/1): outflow, Neumann du/dn = 0
+//   y_lower/y_upper (function_2/3): free-slip, Neumann du/dn = 0 (tangential)
+VelocityBcCoefs_0 {
+   acoef_function_0 = "0.0"
+   acoef_function_1 = "0.0"
+   acoef_function_2 = "0.0"
+   acoef_function_3 = "0.0"
+   bcoef_function_0 = "1.0"
+   bcoef_function_1 = "1.0"
+   bcoef_function_2 = "1.0"
+   bcoef_function_3 = "1.0"
+   gcoef_function_0 = "0.0"
+   gcoef_function_1 = "0.0"
+   gcoef_function_2 = "0.0"
+   gcoef_function_3 = "0.0"
+}
+
+// Open-water BCs:
+//   x_lower/x_upper (function_0/1): outflow, Neumann dv/dn = 0
+//   y_lower/y_upper (function_2/3): no penetration, Dirichlet v = 0 (normal)
+VelocityBcCoefs_1 {
+   acoef_function_0 = "0.0"
+   acoef_function_1 = "0.0"
+   acoef_function_2 = "1.0"
+   acoef_function_3 = "1.0"
+   bcoef_function_0 = "1.0"
+   bcoef_function_1 = "1.0"
+   bcoef_function_2 = "0.0"
+   bcoef_function_3 = "0.0"
+   gcoef_function_0 = "0.0"
+   gcoef_function_1 = "0.0"
+   gcoef_function_2 = "0.0"
+   gcoef_function_3 = "0.0"
+}
+
+IBHierarchyIntegrator {
+   start_time          = START_TIME
+   end_time            = END_TIME
+   grow_dt             = GROW_DT
+   num_cycles          = NUM_CYCLES
+   regrid_cfl_interval = REGRID_CFL_INTERVAL
+   dt_max              = DT
+   error_on_dt_change  = ERROR_ON_DT_CHANGE
+   enable_logging      = ENABLE_LOGGING
+}
+
+IBFEMethod {
+   use_IB_spread_operator     = USE_IB_DELTA_FUNCTIONS
+   use_IB_interp_operator     = USE_IB_DELTA_FUNCTIONS
+   IB_delta_fcn               = IB_DELTA_FUNCTION
+   split_forces               = SPLIT_FORCES
+   use_jump_conditions        = USE_JUMP_CONDITIONS
+   use_consistent_mass_matrix = USE_CONSISTENT_MASS_MATRIX
+   IB_point_density           = IB_POINT_DENSITY
+}
+
+INSStaggeredHierarchyIntegrator {
+   mu                            = MU
+   rho                           = RHO
+   start_time                    = START_TIME
+   end_time                      = END_TIME
+   grow_dt                       = GROW_DT
+   convective_time_stepping_type = CONVECTIVE_TS_TYPE
+   convective_op_type            = CONVECTIVE_OP_TYPE
+   convective_difference_form    = CONVECTIVE_FORM
+   normalize_pressure            = NORMALIZE_PRESSURE
+   cfl                           = CFL_MAX
+   dt_max                        = DT
+   using_vorticity_tagging       = VORTICITY_TAGGING
+   vorticity_rel_thresh          = 0.05,0.025
+   tag_buffer                    = TAG_BUFFER
+   output_U                      = TRUE
+   output_P                      = TRUE
+   output_F                      = TRUE
+   output_Omega                  = TRUE
+   output_Div_U                  = TRUE
+   enable_logging                = ENABLE_LOGGING
+}
+
+Main {
+   solver_type = SOLVER_TYPE
+   log_file_name               = "IB2d.log"
+   log_all_nodes               = FALSE
+   viz_writer                  = "VisIt","ExodusII"
+   viz_dump_interval           = 100
+   viz_dump_dirname            = "viz_IB2d"
+   visit_number_procs_per_file = 1
+   restart_dump_interval       = 0
+   restart_dump_dirname        = "restart_IB2d"
+   data_dump_interval          = 0
+   data_dump_dirname           = "hier_data_IB2d"
+   timer_dump_interval         = 0
+}
+
+CartesianGeometry {
+   domain_boxes      = [ (0,0),(NX - 1,NY - 1) ]
+   x_lo              = -0.75*L,-0.5*L
+   x_up              =  1.25*L, 0.5*L
+   periodic_dimension = 0,0   // do not use x-periodic for an isolated self-propelled fish wake
+}
+
+GriddingAlgorithm {
+   max_levels = MAX_LEVELS
+   ratio_to_coarser {
+      level_1 = REF_RATIO,REF_RATIO
+      level_2 = REF_RATIO,REF_RATIO
+      level_3 = REF_RATIO,REF_RATIO
+      level_4 = REF_RATIO,REF_RATIO
+      level_5 = REF_RATIO,REF_RATIO
+   }
+   largest_patch_size {
+      level_0 = 512,512
+   }
+   smallest_patch_size {
+      level_0 =   8,  8
+   }
+   efficiency_tolerance = 0.85e0
+   combine_efficiency   = 0.85e0
+}
+
+StandardTagAndInitialize { tagging_method = "GRADIENT_DETECTOR" }
+
+LoadBalancer {
+   bin_pack_method     = "SPATIAL"
+   max_workload_factor = 1
+}
+
+TimerManager {
+   print_exclusive = FALSE
+   print_total     = TRUE
+   print_threshold = 0.1
+   timer_list      = "IBAMR::*::*","IBTK::*::*","*::*::*"
+}
