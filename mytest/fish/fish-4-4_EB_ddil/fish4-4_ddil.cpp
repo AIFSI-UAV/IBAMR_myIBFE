@@ -1,50 +1,9 @@
-// ---------------------------------------------------------------------
-// Phase-2A: Self-propelled fish via active bending moment (IBFE/IBAMR)
-// Input file: input2d_EB
-//
-// Physics basis:
-//   Xu, Zhou & Yu (2024) Phys. Fluids 36, 041908
-//   "Fluidic undulation effects on carangiform swimmers propelled by internal
-//   active bending moments"
-//
-// Key changes from Phase-1 (fish4-2.cpp):
-//   1. FREE swimming: no position tether
-//   2. ADD active PK1 bending stress          — muscle driving force
-//   3. ADD COM tracking                        — diagnostic / post-process
-//   4. KEEP passive EB bending + soft shape maintenance
-//
-// Active bending moment:
-//   Mm(s,t) = R(t) · env_s(s) · β_act · w(s)^2
-//             · [1 - cos(2πxi)] · cos(2πxi - omega*t)
-//
-//   where xi is the active-body coordinate from ACTIVE_S_START to
-//   ACTIVE_S_END on the current reference backbone, and w(s) is the local
-//   half-width/half-thickness extracted from the reference mesh.
-//
-// The actual midline remains the IBFE-FSI response: no target tether or
-// prescribed kinematic constraint is applied.
-//
-// IBFE PK1 implementation (analogous to Griffith & Luo 2017 Eq.70):
-//   The active moment is converted to a through-thickness fiber stress:
-//   T_act(X,t) = sign · w(η) · Mm(s,t) · η(X) / I₂_eff(s),
-//   where I₂_eff = ∫w(η)η²dη.
-//   ACTIVE_MOMENT_TO_STRESS_SIGN controls the sign convention so the
-//   Mm -> T_act -> kappa chain can be verified diagnostically.
-//   The fiber direction and through-thickness coordinate are precomputed as a
-//   reference FE field and interpolated at quadrature points. By default that
-//   field is generated from a Laplace/harmonic mesh coordinate: s, t_hat,
-//   eta, and h(s) all come from phi.  In the strict mode used here, each
-//   transverse section is the boundary intersection of the isocontour
-//   {phi = const}; its midpoint is the eta=0 origin and half its length is h(s).
-//
-// COM tracking (diagnostic only — actual motion comes from IBFE FSI):
-//   x_cm(t) = ∫ χ(X,t)|J| dX / ∫ |J| dX    (current geometric centroid)
-//
-// Calibration guide (Xu, Zhou & Yu 2024, Sec. III):
-//   β_act is adjusted until tail amplitude ≈ A_target = 0.10L.
-//   In the paper this β adjustment is the outer "tail amplitude restriction"
-//   loop; this executable keeps β_act as an input so sweeps can reproduce it.
-// ---------------------------------------------------------------------
+// IBFE continuum fish with strict variational Euler-Bernoulli/Kirchhoff-rod
+// bending. Physical active/passive bending is assembled directly as a
+// beam-level virtual-work load on an area-averaged backbone and is spread back
+// to the 2D IBFE mesh by the transpose of the same extraction weights. The
+// continuum PK1 stresses below are retained only as weak mesh regularization
+// and optional continuum damping.
 
 #include <SAMRAI_config.h>
 #include <petscsys.h>
@@ -107,21 +66,40 @@
 namespace ModelData
 {
 
-// --- Fluid and structural parameters ---
+// --- Mesh regularization and passive bending ---
 static double fluid_density = 1.0;
 static double fluid_viscosity = 0.0008;
-// ── 被动弹性：dev + dil 分离 (neo-Hookean, Holzapfel 2000 §6.4) ──────────
-// dev：PP_dev = 2·eta_dev·F → 纯剪切抗力，防止单元剪切塌缩
-//   spurious/EB 比值 ≈ 3*eta_dev/eb_kappa_b，不干扰 EB 弯曲物理
-static double eta_dev = 0.05;
-// dil：PP_dil = 2·(−eta_dev + kappa_vol·lnJ)·F⁻ᵀ → 独立体积约束
-//   J→0 时 lnJ→−∞，提供发散恢复力阻止元素反转；kappa_vol ≫ eta_dev
-static double kappa_vol = 50.0;
-static double eb_kappa_b = 5.0;  // EB bending stiffness; E_m = 4*eb_kappa_b
-static double structural_kv_loss_factor = 0.02;       // damping ratio l*
-static double structural_kv_stress_cap_over_c1 = 50.0; // stress cap = this * eta_dev
-static bool   use_eb_passive_bending = true;
-static double eb_active_s_end = 1.0;   // EB bending disabled for s_norm >= this; set <1 for blunt-tail mesh
+static double c1_mesh_reg = 1.0e-5;
+static double kappa_mesh_reg = 1.0e-4;
+static bool   use_physical_bending = true;
+static double passive_bending_B_body = 1.5e-4;
+static double passive_bending_B_peduncle = 7.5e-5;
+static double passive_bending_B_caudal = 1.0e-4;
+static double passive_bending_D_body = 0.0;
+static double passive_bending_D_peduncle = 0.0;
+static double passive_bending_D_caudal = 0.0;
+static double passive_bending_body_transition_s = 0.60;
+static double passive_bending_body_transition_w = 0.30;
+static double passive_bending_caudal_transition_s = 0.85;
+static double passive_bending_caudal_transition_w = 0.10;
+enum class PassiveBendingCurvatureMethod { TANGENT_ANGLE, LOCAL_POLY };
+static PassiveBendingCurvatureMethod passive_bending_curvature_method =
+    PassiveBendingCurvatureMethod::LOCAL_POLY;
+static int    passive_bending_curvature_smooth_passes = 10;
+static int    passive_bending_curvature_poly_window = 7;
+static int    passive_bending_curvature_poly_order = 3;
+static double passive_bending_curvature_cap = 30.0; // <=0 disables cap
+static double passive_bending_kappa_dot_cap = 0.0; // <=0 disables cap
+static double passive_bending_moment_cap = 0.0;    // <=0 disables cap
+static int    strict_eb_force_stations = 0; // <=0 uses reference_profile_bins
+static double strict_eb_fd_epsilon = 1.0e-7;
+static double strict_eb_min_station_area = 1.0e-14;
+static bool   strict_eb_dt_control_enable = true;
+static double strict_eb_dt_safety_factor = 0.5;
+static double strict_eb_dt_max = 0.0; // <=0 disables the absolute cap
+static bool   use_continuum_damping = false;
+static double continuum_damping_factor = 0.005;
+static double continuum_damping_stress_cap_over_c1 = 50.0;
 
 // --- Geometry / actuation frequency ---
 static double fish_length = 1.00;
@@ -129,50 +107,27 @@ static double x_leading   = 1.00;
 static double wave_frequency = 1.00;
 static double wave_ramp_time = 3.0;
 static double wave_omega     = 2.0 * M_PI * 1.00;
-// In phase = k*coord - WAVE_TIME_SIGN*omega*t, +1 is the prescribed
-// literature convention y/L = A(x/L) sin(k*x/L - omega*t), i.e. a wave
-// traveling from head to tail when the phase coordinate increases tailward.
 static double wave_time_sign = 1.0;
 
-// -----------------------------------------------------------------------
-// Phase-2: Active bending moment parameters  (Xu, Zhou & Yu 2024)
-// -----------------------------------------------------------------------
-//
-//   Active drive (MUSCLE_MOMENT, default; Xu, Zhou & Yu 2024 Eq. 1-2):
-//     Mm(s,t) = R(t) · env_s(s) · beta_act
-//               · w(s)^2 · K_shape(xi)
-//               · cos(2*pi*xi/lambda_act - omega*t + phi0)
-//     K_shape(xi) = 0.5 · (1 - cos(pi*xi))     for K_SHAPE_MODE = HALF-BELL
-//                or 1.0 · (1 - cos(2*pi*xi))   for K_SHAPE_MODE = BELL.
-//     xi = 0 at ACTIVE_S_START and xi = 1 at ACTIVE_S_END, both normalized
-//     on the current reference backbone.
-//     The literature reproduction uses K_SHAPE_MODE=BELL and lambda_act=L.
-//
-// β_act  : strength factor; bisect to match A/L ≈ 0.10.
-//          Larger eb_kappa_b (stiffer body) requires larger β_act.
-
-static double beta_act  = 5.0;     // strength factor β  [calibrate to target tail amplitude]
-static double active_wavelength_over_L = 1.00; // muscle activation wavelength / active-body length
+static double beta_act  = 0.0;
+enum class ActiveMomentMode { TRAVELING, STATIC };
+static ActiveMomentMode active_moment_mode = ActiveMomentMode::STATIC;
+static double static_moment_m0 = 0.0;
+static double initial_bend_amplitude = 0.01;
+static double active_wavelength_over_L = 1.00;
 static double active_phase0 = 0.0;
-static double active_moment_to_stress_sign = -1.0; // sign=-1: M_curv=+Mm (paper: M_a>0 drives positive curvature)
 enum class ActiveKShapeMode { HALF_BELL, BELL };
 static ActiveKShapeMode active_k_shape_mode = ActiveKShapeMode::BELL;
-static double active_s_start  = 0.00;  // active zone start, normalized by backbone length
-static double active_s_end    = 1.00;  // active zone end, normalized by backbone length
-static double active_s_smooth = 0.0;   // Xu/Zhou/Yu Eq. (2) already vanishes at both ends
-static double active_band_fraction = 1.0; // apply the internal bending moment over the full section
-// Cached: REFERENCE_BACKBONE_END_X converted to Laplace phi/s_norm after the harmonic solve.
-// This is a reference-end diagnostic/root coordinate, not a cap on ACTIVE_S_END.
+static double active_s_start  = 0.00;
+static double active_s_end    = 1.00;
+static double active_s_smooth = 0.0;
 static double active_end_s_norm =
     std::numeric_limits<double>::quiet_NaN();
-static double active_t_act_max_over_c1 = 200.0; // T_act_max = this * eta_dev
 static int    reference_profile_bins = 128;
 static std::string wave_head_location = "x_min";
 static double reference_backbone_end_x =
     std::numeric_limits<double>::quiet_NaN(); // auto-detect fork root unless set
 static bool   use_laplace_reference_parameterization = true;
-static bool   allow_centerline_fallback = false;
-static bool   use_fe_active_section_data = false;
 static double laplace_head_bc_width_over_L = 0.05;
 static double laplace_tail_bc_width_over_L = 0.05;
 static const boundary_id_type LAPLACE_HEAD_BID = 12001;
@@ -221,25 +176,11 @@ enum RefGeomVar
     REF_GEOM_N_VARS = 4
 };
 
-static const std::string EB_BENDING_SYSTEM_NAME = "eb_bending";
-enum EBBendingVar
-{
-    EB_BENDING_KAPPA = 0,
-    EB_BENDING_KAPPA_DOT = 1,
-    EB_BENDING_N_VARS = 2
-};
-
 struct ReferenceGeometrySample
 {
     double s = 0.0;
     double eta = 0.0;
     VectorValue<double> t_hat = VectorValue<double>(1.0, 0.0);
-};
-
-struct EBBendingSample
-{
-    double kappa = 0.0;
-    double kappa_dot = 0.0;
 };
 
 static std::vector<CenterlineSegment> ref_centerline_segments;
@@ -260,30 +201,8 @@ struct PhiIsoSectionSample
 static std::vector<PhiIsoSectionSample> ref_phi_sections;
 
 // --- Tail diagnostics tracking points on the reference mesh ---
-static dof_id_type ref_tail_upper_node_id =
-    std::numeric_limits<dof_id_type>::max();
-static dof_id_type ref_tail_lower_node_id =
-    std::numeric_limits<dof_id_type>::max();
 static libMesh::Point ref_tail_tip_center_point = libMesh::Point(1.0, 0.0);
 
-// Fin pitch tracking: boundary nodes at the reference backbone end (fin root).
-static dof_id_type ref_fin_root_upper_node_id =
-    std::numeric_limits<dof_id_type>::max();
-static dof_id_type ref_fin_root_lower_node_id =
-    std::numeric_limits<dof_id_type>::max();
-static libMesh::Point ref_fin_root_center_ref = libMesh::Point(0.1, 0.0);
-
-// Fin pitch diagnostic state
-static bool        s_fin_pitch_diag_enable   = true;
-static int         s_fin_pitch_diag_interval = 100;
-static std::string s_fin_pitch_diag_filename = "fin_pitch_diag.csv";
-static double      s_fin_pitch_prev_y_root   = std::numeric_limits<double>::quiet_NaN();
-static double      s_fin_pitch_prev_y_tip    = std::numeric_limits<double>::quiet_NaN();
-static double      s_fin_pitch_prev_time     = std::numeric_limits<double>::quiet_NaN();
-
-// -----------------------------------------------------------------------
-// Phase-2: COM state (diagnostic — actual motion from IBFE FSI)
-// -----------------------------------------------------------------------
 static double xcom_tracked = 0.0;   // last COM x sample used by diagnostics
 static double ycom_tracked = 0.0;   // last COM y sample used by diagnostics
 static double xcom_tracked_time =
@@ -315,15 +234,9 @@ static double s_curvature_phase_last_time =
     std::numeric_limits<double>::quiet_NaN();
 static double s_curvature_phase_positive_work_accum = 0.0;
 static double s_curvature_phase_signed_work_accum = 0.0;
-static double s_curvature_phase_effective_positive_work_accum = 0.0;
-static double s_curvature_phase_effective_signed_work_accum = 0.0;
 static double s_curvature_phase_last_power =
     std::numeric_limits<double>::quiet_NaN();
 static double s_curvature_phase_last_positive_power =
-    std::numeric_limits<double>::quiet_NaN();
-static double s_curvature_phase_last_effective_power =
-    std::numeric_limits<double>::quiet_NaN();
-static double s_curvature_phase_last_effective_positive_power =
     std::numeric_limits<double>::quiet_NaN();
 static int s_curvature_phase_samples = 0;
 
@@ -335,111 +248,54 @@ static std::vector<double> s_y_body_cyc_min; // running min y_body per station
 static std::vector<double> s_y_body_amp;     // half-amplitude from last completed cycle
 static int s_y_body_cyc_idx = -1;            // integer cycle index for reset detection
 
-// ── Euler-Bernoulli passive bending auxiliary state ──────────────────────
-// Stores current body-frame curvature and curvature rate as FE fields so the
-// PK1 callback can impose section-resultant passive bending moments.
-static int s_eb_bending_stations = 101;
-static std::vector<double> s_eb_station_s;
-static std::vector<double> s_eb_prev_kappa;
-static double              s_eb_prev_time    = std::numeric_limits<double>::quiet_NaN();
-static std::vector<double> s_eb_kappa_ref;          // reference (natural) curvature at t=0
-static bool                s_eb_kappa_ref_built = false;
-
-// ── Minimal direction diagnostics ─────────────────────────────────────────
-static bool        s_direction_debug_enable   = true;
-static int         s_direction_debug_interval = 100;
-static std::string s_direction_debug_filename = "direction_debug.csv";
-static double      s_direction_debug_prev_time =
+// Strict EB/Kirchhoff-rod variational force cache.  The backbone stations are
+// area-weighted averages of the 2D FE mesh; station forces are distributed
+// back as a body-force density using the transpose of that averaging map.
+static bool        s_strict_eb_force_cache_ready = false;
+static double      s_strict_eb_force_cache_time =
     std::numeric_limits<double>::quiet_NaN();
-static double      s_direction_debug_prev_v_forward =
+static double      s_strict_eb_force_eval_time =
     std::numeric_limits<double>::quiet_NaN();
-// F_IB-based impulse (kept for reference, NOT the true CM impulse):
-static double      s_direction_debug_fish_impulse_forward = 0.0;
-static double      s_direction_debug_fish_work_forward = 0.0;
-// Correct CM-based impulse = integral of (fluid_density * fish_area * a_cm):
-static double      s_direction_debug_cm_impulse_fwd = 0.0;
-// Sliding window for beat-cycle averaged v_forward (~1.2 cycles at dt_diag=0.05s, f=1.2Hz)
-static const int   VFWD_WIN = 20;
-static double      s_vfwd_win[VFWD_WIN] = {};
-static int         s_vfwd_win_pos   = 0;
-static int         s_vfwd_win_count = 0;
-
-// ── FE-consistent active section data: eta_bar(s), I2_c(s) ───────────────
-// Precomputed from real FE quadrature so that T_act uses eta_c = eta - eta_bar
-// and I2_c = Σ w*eta_c² JxW, ensuring the discrete zero-resultant property.
-static bool        s_fe_section_data_built = false;
-static int         s_fe_n_bins             = 0;   // set to reference_profile_bins at build time
-static std::vector<double> s_fe_sum_w;       // Σ w(eta)*JxW per s-norm bin
-static std::vector<double> s_fe_sum_w_eta;   // Σ w(eta)*eta*JxW per s-norm bin
-static std::vector<double> s_fe_sum_w_eta2;  // Σ w(eta)*eta²*JxW per s-norm bin
-static std::vector<double> s_fe_eta_bar;     // centroid: sum_w_eta/sum_w per bin
-static std::vector<double> s_fe_I2_c;        // section I2_c = (sum_w_eta2 - eta_bar*sum_w_eta)/ds_bin
-static std::string s_fe_section_diag_filename = "fe_active_section.csv";
-
-// ── Force decomposition diagnostics ───────────────────────────────────────
-static bool        s_force_decomp_diag_enable   = true;
-static int         s_force_decomp_diag_interval = 100;
-static std::string s_force_decomp_diag_filename = "force_decomposition_diag.csv";
-static std::string s_force_decomp_quad_order    = "FIFTH";
-static double      s_force_decomp_prev_time =
+static std::vector<double> s_strict_eb_s;
+static std::vector<double> s_strict_eb_station_area;
+static std::vector<libMesh::Point> s_strict_eb_X;
+static std::vector<VectorValue<double> > s_strict_eb_force;
+static std::vector<VectorValue<double> > s_strict_eb_force_phys_bending;
+static std::vector<VectorValue<double> > s_strict_eb_force_active;
+static std::vector<double> s_strict_eb_kappa;
+static std::vector<double> s_strict_eb_kappa_ref;
+static std::vector<double> s_strict_eb_kappa_dot;
+static std::vector<double> s_strict_eb_prev_kappa;
+static std::vector<double> s_strict_eb_prev_s;
+static bool                s_strict_eb_kappa_ref_from_mesh = false;
+static double s_strict_eb_prev_time =
     std::numeric_limits<double>::quiet_NaN();
-static double      s_force_decomp_work_dev      = 0.0;
-static double      s_force_decomp_work_dil      = 0.0;
-static double      s_force_decomp_work_eb_passive = 0.0;
-static double      s_force_decomp_work_damping  = 0.0;
-static double      s_force_decomp_work_active   = 0.0;
-static double      s_force_decomp_work_sum      = 0.0;
-static double      s_force_decomp_work_weak_dev = 0.0;
-static double      s_force_decomp_work_weak_dil = 0.0;
-static double      s_force_decomp_work_weak_eb_passive = 0.0;
-static double      s_force_decomp_work_weak_damping  = 0.0;
-static double      s_force_decomp_work_weak_active   = 0.0;
-static double      s_force_decomp_work_weak_sum      = 0.0;
-static double      s_force_decomp_work_ib_on_fluid   = 0.0;
-
-// ── Section moment diagnostics ───────────────────────────────────────────
-static bool        s_section_moment_diag_enable   = true;
-static int         s_section_moment_diag_interval = 100;
-static std::string s_section_moment_diag_filename = "section_moment_decomposition.csv";
-static std::string s_section_moment_quad_order    = "FIFTH";
-static int         s_section_moment_diag_bins     = 0; // <=0 uses reference_profile_bins
 
 // ── Geometry conservation diagnostics ────────────────────────────────────
 static bool        s_geometry_conservation_diag_enable   = true;
 static int         s_geometry_conservation_diag_interval = 100;
 static std::string s_geometry_conservation_diag_filename = "geometry_conservation_diag.csv";
 
-// ── Beta-act bisection calibration ───────────────────────────────────────────
-// After wave_ramp_time the loop waits settle_cycles beats, then measures the
-// peak-to-peak tail amplitude over meas_cycles beats. If |A/L - target| > tol
-// it bisects beta_act between lo and hi and repeats. At most max_iter rounds.
-static bool   s_beta_cal_enable         = false;   // off by default
-static double s_beta_cal_target         = 0.10;    // A_tail/L target (Xu 2024: 0.10)
-static double s_beta_cal_tol            = 0.005;   // ±0.5 % tolerance
-static int    s_beta_cal_settle_cycles  = 2;       // cycles to wait after each beta change
-static int    s_beta_cal_meas_cycles    = 4;       // cycles to measure over
-static int    s_beta_cal_max_iter       = 20;      // hard stop
-static double s_beta_cal_init_hi        = std::numeric_limits<double>::quiet_NaN(); // NaN → 3×beta_act
-// Run-time state (not input parameters)
-static int    s_beta_cal_iter           = 0;
-static double s_beta_cal_lo             = 0.0;
-static double s_beta_cal_hi             = std::numeric_limits<double>::quiet_NaN();
-static int    s_beta_cal_phase          = 0;       // 0=settling  1=measuring  2=done
-static int    s_beta_cal_ref_cycle      = -1;      // post-ramp cycle when phase last changed
-static double s_last_completed_tail_A_norm = std::numeric_limits<double>::quiet_NaN();
+// -- Force decomposition diagnostics -------------------------------------
+static bool        s_force_decomp_diag_enable   = false;
+static int         s_force_decomp_diag_interval = 100;
+static std::string s_force_decomp_diag_filename = "force_decomposition_diag.csv";
+static std::string s_force_decomp_quad_order    = "FIFTH";
+static double      s_force_decomp_prev_time =
+    std::numeric_limits<double>::quiet_NaN();
 
 // ── Midline history CSV ───────────────────────────────────────────────────────
 // Full per-station midline snapshot at regular step intervals. Columns include
 // both body-frame deformation (y_body) and propulsion-pattern lateral motion
 // (y_prop = y_lab), which preserve recoil/heave for COD and Fourier analysis.
-static bool        s_midline_hist_enable      = false;
-static int         s_midline_hist_interval    = 10;        // write every N timesteps
+static bool        s_midline_hist_enable      = true;
+static int         s_midline_hist_interval    = 100;       // write every N timesteps
 static int         s_midline_hist_stations    = 101;
 static std::string s_midline_hist_filename    = "midline_history.csv";
 static bool        s_midline_hist_header_done = false;
 
 // =========================================================================
-// Helper: cosine ramp  (same as Phase-1)
+// Helper: cosine ramp
 // =========================================================================
 inline double clamp01(double x)
 {
@@ -463,6 +319,47 @@ inline double smoothstep_cosine(const double s, const double s0, const double w)
 
     const double xi = (s - lo) / width;
     return 0.5 * (1.0 - std::cos(M_PI * xi));
+}
+
+inline double get_c1_mesh_reg_local(const double)
+{
+    return c1_mesh_reg;
+}
+
+inline double passive_bending_body_weight(const double s_norm)
+{
+    const double xi = clamp01(s_norm);
+    const double w_body =
+        smoothstep_cosine(xi, passive_bending_body_transition_s,
+                          passive_bending_body_transition_w);
+    return w_body;
+}
+
+inline double passive_bending_caudal_weight(const double s_norm)
+{
+    const double xi = clamp01(s_norm);
+    const double w_caudal =
+        smoothstep_cosine(xi, passive_bending_caudal_transition_s,
+                          passive_bending_caudal_transition_w);
+    return w_caudal;
+}
+
+inline double get_passive_bending_B_local(const double s_norm)
+{
+    const double w_body = passive_bending_body_weight(s_norm);
+    const double w_caudal = passive_bending_caudal_weight(s_norm);
+    return passive_bending_B_body
+           + (passive_bending_B_peduncle - passive_bending_B_body) * w_body
+           + (passive_bending_B_caudal - passive_bending_B_peduncle) * w_caudal;
+}
+
+inline double get_passive_bending_D_local(const double s_norm)
+{
+    const double w_body = passive_bending_body_weight(s_norm);
+    const double w_caudal = passive_bending_caudal_weight(s_norm);
+    return passive_bending_D_body
+           + (passive_bending_D_peduncle - passive_bending_D_body) * w_body
+           + (passive_bending_D_caudal - passive_bending_D_peduncle) * w_caudal;
 }
 
 inline double wave_ramp(double time)
@@ -769,11 +666,11 @@ inline double approximate_s_norm_from_x(const double x_query)
 inline double active_end_s_norm_effective()
 {
     if (std::isfinite(active_end_s_norm)) return clamp01(active_end_s_norm);
-    if (use_laplace_reference_parameterization && !allow_centerline_fallback)
+    if (use_laplace_reference_parameterization)
     {
         TBOX_ERROR("active_end_s_norm_effective(): reference backbone end was not "
-                   "mapped through the Laplace reference field. Refusing x-based fallback "
-                   "because ALLOW_CENTERLINE_FALLBACK is FALSE.\n");
+                   "mapped through the Laplace reference field.\n");
+        return 0.0;
     }
     return approximate_s_norm_from_x(ref_backbone_end_x);
 }
@@ -1205,24 +1102,6 @@ ReferenceGeometrySample reference_geometry_from_system_data(
     return geom;
 }
 
-EBBendingSample eb_bending_from_system_data(
-    const std::vector<const std::vector<double>*>& system_var_data,
-    const std::size_t system_idx)
-{
-    if (system_var_data.size() <= system_idx ||
-        system_var_data[system_idx] == nullptr ||
-        system_var_data[system_idx]->size() < EB_BENDING_N_VARS)
-    {
-        TBOX_ERROR("Euler-Bernoulli bending field is unavailable in PK1 callback.\n");
-    }
-
-    const std::vector<double>& data = *system_var_data[system_idx];
-    EBBendingSample sample;
-    sample.kappa = data[EB_BENDING_KAPPA];
-    sample.kappa_dot = data[EB_BENDING_KAPPA_DOT];
-    return sample;
-}
-
 void add_reference_geometry_system(EquationSystems* equation_systems)
 {
     if (!equation_systems) return;
@@ -1233,19 +1112,6 @@ void add_reference_geometry_system(EquationSystems* equation_systems)
     ref_geom_sys.add_variable("t_ref_y", FIRST, LAGRANGE);
     ref_geom_sys.add_variable("eta_ref", FIRST, LAGRANGE);
     ref_geom_sys.add_variable("s_ref", FIRST, LAGRANGE);
-    // Do NOT call init() here. IBFEMethod::initializeFEData() initializes all
-    // systems in the EquationSystems, including this one.
-}
-
-void add_eb_bending_system(EquationSystems* equation_systems)
-{
-    if (!equation_systems) return;
-
-    ExplicitSystem& eb_sys =
-        equation_systems->add_system<ExplicitSystem>(EB_BENDING_SYSTEM_NAME);
-    eb_sys.add_variable("kappa_body", FIRST, LAGRANGE);
-    eb_sys.add_variable("kappa_dot_body", FIRST, LAGRANGE);
-    // Filled after coordinate data exist; initialized to zero by libMesh.
 }
 
 void fill_reference_geometry_system(MeshBase& mesh, EquationSystems* equation_systems)
@@ -1278,24 +1144,26 @@ void fill_reference_geometry_system(MeshBase& mesh, EquationSystems* equation_sy
 
         if (!have_geom)
         {
-            if (use_laplace_reference_parameterization && !allow_centerline_fallback)
+            if (use_laplace_reference_parameterization)
             {
                 TBOX_ERROR("fill_reference_geometry_system(): missing Laplace reference geometry "
-                           << "for node " << node.id()
-                           << " and ALLOW_CENTERLINE_FALLBACK is FALSE.\n");
-            }
-            const ProjectionResult proj = project_to_reference_centerline(
-                libMesh::Point(node(0), node(1), node(2)));
-            if (proj.valid)
-            {
-                geom.s = std::max(0.0, std::min(proj.s, ref_arc_length));
-                geom.eta = proj.eta;
-                geom.t_hat = proj.t_hat;
-                have_geom = true;
+                           << "for node " << node.id() << ".\n");
             }
             else
             {
-                invalid_projection_count += 1.0;
+                const ProjectionResult proj = project_to_reference_centerline(
+                    libMesh::Point(node(0), node(1), node(2)));
+                if (proj.valid)
+                {
+                    geom.s = std::max(0.0, std::min(proj.s, ref_arc_length));
+                    geom.eta = proj.eta;
+                    geom.t_hat = proj.t_hat;
+                    have_geom = true;
+                }
+                else
+                {
+                    invalid_projection_count += 1.0;
+                }
             }
         }
         local_nodes += 1.0;
@@ -1321,6 +1189,11 @@ void fill_reference_geometry_system(MeshBase& mesh, EquationSystems* equation_sy
                      << global_counts[1] << " / " << global_counts[0]
                      << " nodes could not be projected to the reference centerline.\n");
     }
+}
+
+inline double get_c1_mesh_reg_local_from_reference_point(const libMesh::Point& X_ref)
+{
+    return get_c1_mesh_reg_local(reference_x_norm_from_point(X_ref));
 }
 
 void add_halfthickness_sample_to_raw_envelope(std::vector<double>& raw_h,
@@ -2213,25 +2086,10 @@ void build_reference_laplace_parameterization(MeshBase& mesh)
     if (!(global_phi_min <= 0.05 && global_phi_max >= 0.95 &&
           global_phi_max - global_phi_min >= 0.50))
     {
-        if (!allow_centerline_fallback)
-        {
-            TBOX_ERROR("build_reference_laplace_parameterization(): degenerate harmonic coordinate "
-                       << "range [" << global_phi_min << ", " << global_phi_max
-                       << "], constrained range [" << global_raw_phi_min << ", "
-                       << global_raw_phi_max << "]. ALLOW_CENTERLINE_FALLBACK is FALSE.\n");
-        }
-        TBOX_WARNING("build_reference_laplace_parameterization(): degenerate harmonic coordinate "
-                     << "range [" << global_phi_min << ", " << global_phi_max
-                     << "], constrained range [" << global_raw_phi_min << ", "
-                     << global_raw_phi_max
-                     << "]. Falling back to centerline projection reference geometry.\n");
-        ref_laplace_node_geom.clear();
-        ref_laplace_parameterization_built = false;
-        ref_phi_sections.clear();
-        use_laplace_reference_parameterization = false;
-        active_end_s_norm = std::numeric_limits<double>::quiet_NaN();
-        rebuild_reference_halfthickness_from_projection(mesh);
-        return;
+        TBOX_ERROR("build_reference_laplace_parameterization(): degenerate harmonic coordinate "
+                   << "range [" << global_phi_min << ", " << global_phi_max
+                   << "], constrained range [" << global_raw_phi_min << ", "
+                   << global_raw_phi_max << "].\n");
     }
 
     // Average FE gradients back to nodes. For first-order triangles this is a
@@ -2319,14 +2177,9 @@ void build_reference_laplace_parameterization(MeshBase& mesh)
     }
     else
     {
-        if (!allow_centerline_fallback)
-        {
-            TBOX_ERROR("build_reference_laplace_parameterization(): no Laplace phi nodes "
-                       "found on REFERENCE_BACKBONE_END_X = " << x_cut
-                       << ". Refusing x-based reference-end fallback because "
-                       "ALLOW_CENTERLINE_FALLBACK is FALSE.\n");
-        }
-        active_end_s_norm = approximate_s_norm_from_x(x_cut);
+        TBOX_ERROR("build_reference_laplace_parameterization(): no Laplace phi nodes "
+                   "found on REFERENCE_BACKBONE_END_X = " << x_cut << ".\n");
+        active_end_s_norm = std::numeric_limits<double>::quiet_NaN();
     }
 
     // Strict literature-style geometry: eta=0 and h(s) are not obtained from
@@ -2404,235 +2257,6 @@ void build_reference_profile_from_mesh(MeshBase& mesh)
     }
 }
 
-void initialize_tail_tracking_points(MeshBase& mesh)
-{
-    const double invalid_id = static_cast<double>(std::numeric_limits<dof_id_type>::max());
-    const double x_tol = 1.0e-10 * std::max(1.0, ref_body_length);
-    const double y_tol = 1.0e-10 * std::max(1.0, ref_h_max);
-    const bool tail_at_x_max = (wave_head_location == "x_min");
-
-    double local_tail_x = tail_at_x_max ? -std::numeric_limits<double>::max() :
-                                          std::numeric_limits<double>::max();
-    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
-    {
-        const Node* node = *it;
-        if (!node) continue;
-        local_tail_x = tail_at_x_max ? std::max(local_tail_x, (*node)(0)) :
-                                       std::min(local_tail_x, (*node)(0));
-    }
-    if (tail_at_x_max)
-    {
-        IBTK_MPI::maxReduction(&local_tail_x, 1);
-    }
-    else
-    {
-        IBTK_MPI::minReduction(&local_tail_x, 1);
-    }
-
-    double local_upper_y = -std::numeric_limits<double>::max();
-    double local_lower_y =  std::numeric_limits<double>::max();
-    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
-    {
-        const Node* node = *it;
-        if (!node) continue;
-        if (std::abs((*node)(0) - local_tail_x) > x_tol) continue;
-        local_upper_y = std::max(local_upper_y, (*node)(1));
-        local_lower_y = std::min(local_lower_y, (*node)(1));
-    }
-    IBTK_MPI::maxReduction(&local_upper_y, 1);
-    IBTK_MPI::minReduction(&local_lower_y, 1);
-
-    double local_upper_id = invalid_id;
-    double local_lower_id = invalid_id;
-    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
-    {
-        const Node* node = *it;
-        if (!node) continue;
-        if (std::abs((*node)(0) - local_tail_x) > x_tol) continue;
-        if (std::abs((*node)(1) - local_upper_y) <= y_tol)
-        {
-            local_upper_id = std::min(local_upper_id, static_cast<double>(node->id()));
-        }
-        if (std::abs((*node)(1) - local_lower_y) <= y_tol)
-        {
-            local_lower_id = std::min(local_lower_id, static_cast<double>(node->id()));
-        }
-    }
-    IBTK_MPI::minReduction(&local_upper_id, 1);
-    IBTK_MPI::minReduction(&local_lower_id, 1);
-
-    ref_tail_tip_center_point =
-        libMesh::Point(local_tail_x, 0.5 * (local_upper_y + local_lower_y));
-
-    if (local_upper_id >= invalid_id || local_lower_id >= invalid_id)
-    {
-        TBOX_ERROR("initialize_tail_tracking_points(): failed to locate tail tracking nodes.\n");
-    }
-
-    ref_tail_upper_node_id = static_cast<dof_id_type>(local_upper_id);
-    ref_tail_lower_node_id = static_cast<dof_id_type>(local_lower_id);
-}
-
-void initialize_fin_root_tracking_points(MeshBase& mesh)
-{
-    const double invalid_id = static_cast<double>(std::numeric_limits<dof_id_type>::max());
-    const double y_tol = 1.0e-10 * std::max(1.0, ref_h_max);
-    const double fin_root_x = ref_backbone_end_x;
-
-    // Step 1: find global minimum |x - REFERENCE_BACKBONE_END_X| among boundary nodes.
-    if (!std::isfinite(fin_root_x))
-    {
-        pout << "WARNING: initialize_fin_root_tracking_points(): "
-             << "ref_backbone_end_x is not finite; fin pitch diagnostic disabled.\n";
-        s_fin_pitch_diag_enable = false;
-        return;
-    }
-    double local_best_dist = std::numeric_limits<double>::max();
-    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
-    {
-        const Node* node = *it;
-        if (!node) continue;
-        local_best_dist = std::min(local_best_dist,
-                                   std::abs((*node)(0) - fin_root_x));
-    }
-    IBTK_MPI::minReduction(&local_best_dist, 1);
-    const double snap_tol = 1.5 * local_best_dist +
-                            1.0e-10 * std::max(1.0, ref_body_length);
-
-    // Step 2: find upper/lower y among snapped boundary nodes.
-    double local_upper_y = -std::numeric_limits<double>::max();
-    double local_lower_y =  std::numeric_limits<double>::max();
-    double local_snap_x_sum = 0.0;
-    double local_snap_x_cnt = 0.0;
-    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
-    {
-        const Node* node = *it;
-        if (!node) continue;
-        if (std::abs((*node)(0) - fin_root_x) > snap_tol) continue;
-        local_upper_y = std::max(local_upper_y, (*node)(1));
-        local_lower_y = std::min(local_lower_y, (*node)(1));
-        local_snap_x_sum += (*node)(0);
-        local_snap_x_cnt += 1.0;
-    }
-    IBTK_MPI::maxReduction(&local_upper_y, 1);
-    IBTK_MPI::minReduction(&local_lower_y, 1);
-    IBTK_MPI::sumReduction(&local_snap_x_sum, 1);
-    IBTK_MPI::sumReduction(&local_snap_x_cnt, 1);
-    const double snap_x = (local_snap_x_cnt > 0.5)
-        ? local_snap_x_sum / local_snap_x_cnt : fin_root_x;
-
-    // Step 3: find node IDs for the topmost and bottommost snapped nodes.
-    double local_upper_id = invalid_id;
-    double local_lower_id = invalid_id;
-    for (auto it = mesh.bnd_nodes_begin(); it != mesh.bnd_nodes_end(); ++it)
-    {
-        const Node* node = *it;
-        if (!node) continue;
-        if (std::abs((*node)(0) - fin_root_x) > snap_tol) continue;
-        if (std::abs((*node)(1) - local_upper_y) <= y_tol)
-            local_upper_id = std::min(local_upper_id,
-                                      static_cast<double>(node->id()));
-        if (std::abs((*node)(1) - local_lower_y) <= y_tol)
-            local_lower_id = std::min(local_lower_id,
-                                      static_cast<double>(node->id()));
-    }
-    IBTK_MPI::minReduction(&local_upper_id, 1);
-    IBTK_MPI::minReduction(&local_lower_id, 1);
-
-    if (local_upper_id >= invalid_id || local_lower_id >= invalid_id)
-    {
-        pout << "WARNING: initialize_fin_root_tracking_points(): "
-             << "failed to locate fin root nodes at x=" << fin_root_x
-             << "; fin pitch diagnostic disabled.\n";
-        s_fin_pitch_diag_enable = false;
-        return;
-    }
-
-    ref_fin_root_center_ref = libMesh::Point(snap_x,
-                                              0.5 * (local_upper_y + local_lower_y));
-    ref_fin_root_upper_node_id = static_cast<dof_id_type>(local_upper_id);
-    ref_fin_root_lower_node_id = static_cast<dof_id_type>(local_lower_id);
-
-    pout << "  Fin root tracking: snap_x=" << snap_x
-         << " (target=" << fin_root_x << ")"
-         << ", upper_node=" << ref_fin_root_upper_node_id
-         << ", lower_node=" << ref_fin_root_lower_node_id
-         << ", y_upper=" << local_upper_y
-         << ", y_lower=" << local_lower_y << "\n";
-}
-
-bool get_current_node_position(const DofMap& X_dof_map,
-                               NumericVector<double>& X_ghost_vec,
-                               MeshBase& mesh,
-                               const dof_id_type node_id,
-                               double& x_out,
-                               double& y_out)
-{
-    double local_vals[3] = { 0.0, 0.0, 0.0 };
-    std::vector<unsigned int> dof_idx_x, dof_idx_y;
-
-    for (const Node* node : mesh.local_node_ptr_range())
-    {
-        if (!node || node->id() != node_id) continue;
-        X_dof_map.dof_indices(node, dof_idx_x, 0);
-        X_dof_map.dof_indices(node, dof_idx_y, 1);
-        local_vals[0] = X_ghost_vec(dof_idx_x[0]);
-        local_vals[1] = X_ghost_vec(dof_idx_y[0]);
-        local_vals[2] = 1.0;
-        break;
-    }
-
-    IBTK_MPI::sumReduction(local_vals, 3);
-    if (local_vals[2] < 0.5) return false;
-
-    x_out = local_vals[0];
-    y_out = local_vals[1];
-    return true;
-}
-
-double update_tail_cycle_amplitude(double loop_time, double tail_tip_y_rel)
-{
-    static int s_cycle_id = -1;
-    static double s_cycle_min = std::numeric_limits<double>::quiet_NaN();
-    static double s_cycle_max = std::numeric_limits<double>::quiet_NaN();
-    static double s_last_cycle_A_norm = std::numeric_limits<double>::quiet_NaN();
-
-    if (!(wave_frequency > 0.0)) return std::numeric_limits<double>::quiet_NaN();
-
-    const double period = 1.0 / wave_frequency;
-    const double phase_time = loop_time - wave_ramp_time;
-    if (phase_time < 0.0) return std::numeric_limits<double>::quiet_NaN();
-
-    const int cycle_id = static_cast<int>(std::floor(phase_time / period));
-    if (s_cycle_id < 0)
-    {
-        s_cycle_id = cycle_id;
-        s_cycle_min = tail_tip_y_rel;
-        s_cycle_max = tail_tip_y_rel;
-        return s_last_cycle_A_norm;
-    }
-
-    if (cycle_id != s_cycle_id)
-    {
-        if (std::isfinite(s_cycle_min) && std::isfinite(s_cycle_max))
-        {
-            s_last_cycle_A_norm =
-                0.5 * (s_cycle_max - s_cycle_min) / std::max(fish_length, 1.0e-12);
-            s_last_completed_tail_A_norm = s_last_cycle_A_norm;
-        }
-        s_cycle_id = cycle_id;
-        s_cycle_min = tail_tip_y_rel;
-        s_cycle_max = tail_tip_y_rel;
-    }
-    else
-    {
-        s_cycle_min = std::min(s_cycle_min, tail_tip_y_rel);
-        s_cycle_max = std::max(s_cycle_max, tail_tip_y_rel);
-    }
-
-    return s_last_cycle_A_norm;
-}
-
 inline double body_halfthick_from_s(double s)
 {
     if (ref_profile_s.size() < 2 || ref_halfthickness.size() != ref_profile_s.size()) return 0.0;
@@ -2706,19 +2330,6 @@ inline std::string normalize_mode_string(const std::string& mode_raw)
     return mode;
 }
 
-inline double beam_reference_omega0_from_Em(const double E_m)
-{
-    const double gamma_0 = 0.9257;
-    const double L_omega = std::max(fish_length, 1.0e-12);
-    return gamma_0 * std::sqrt(std::max(E_m, 1.0e-30) /
-                               (fluid_density * L_omega * L_omega));
-}
-
-inline double eb_damping_reference_omega0(const double E_m)
-{
-    return std::max(beam_reference_omega0_from_Em(E_m), 1.0e-12);
-}
-
 inline ActiveKShapeMode parse_active_k_shape_mode(const std::string& mode_raw)
 {
     const std::string mode = normalize_mode_string(mode_raw);
@@ -2728,6 +2339,62 @@ inline ActiveKShapeMode parse_active_k_shape_mode(const std::string& mode_raw)
     TBOX_ERROR("Unknown K_SHAPE_MODE = \"" << mode_raw
                << "\". Expected \"HALF-BELL\" or \"BELL\".\n");
     return ActiveKShapeMode::HALF_BELL;
+}
+
+inline ActiveMomentMode parse_active_moment_mode(const std::string& mode_raw)
+{
+    const std::string mode = normalize_mode_string(mode_raw);
+    if (mode == "TRAVELING") return ActiveMomentMode::TRAVELING;
+    if (mode == "STATIC") return ActiveMomentMode::STATIC;
+
+    TBOX_ERROR("Unknown ACTIVE_MOMENT_MODE = \"" << mode_raw
+               << "\". Expected \"TRAVELING\" or \"STATIC\".\n");
+    return ActiveMomentMode::TRAVELING;
+}
+
+inline PassiveBendingCurvatureMethod
+parse_passive_bending_curvature_method(const std::string& mode_raw)
+{
+    const std::string mode = normalize_mode_string(mode_raw);
+    if (mode == "TANGENT-ANGLE" || mode == "THREE-POINT" ||
+        mode == "3-POINT")
+    {
+        return PassiveBendingCurvatureMethod::TANGENT_ANGLE;
+    }
+    if (mode == "LOCAL-POLY" || mode == "SAVITZKY-GOLAY" ||
+        mode == "SG")
+    {
+        return PassiveBendingCurvatureMethod::LOCAL_POLY;
+    }
+
+    TBOX_ERROR("Unknown PASSIVE_BENDING_CURVATURE_METHOD = \""
+               << mode_raw
+               << "\". Expected \"TANGENT_ANGLE\" or \"LOCAL_POLY\".\n");
+    return PassiveBendingCurvatureMethod::LOCAL_POLY;
+}
+
+inline const char* active_moment_mode_name()
+{
+    switch (active_moment_mode)
+    {
+    case ActiveMomentMode::TRAVELING:
+        return "TRAVELING";
+    case ActiveMomentMode::STATIC:
+        return "STATIC";
+    }
+    return "TRAVELING";
+}
+
+inline const char* passive_bending_curvature_method_name()
+{
+    switch (passive_bending_curvature_method)
+    {
+    case PassiveBendingCurvatureMethod::TANGENT_ANGLE:
+        return "TANGENT_ANGLE";
+    case PassiveBendingCurvatureMethod::LOCAL_POLY:
+        return "LOCAL_POLY";
+    }
+    return "LOCAL_POLY";
 }
 
 inline const char* active_k_shape_mode_name()
@@ -2806,6 +2473,14 @@ inline double active_moment_value_from_sample(const double s,
                                               const double h,
                                               const double time)
 {
+    if (active_moment_mode == ActiveMomentMode::STATIC)
+    {
+        const double s0 = active_s_start_norm_effective();
+        const double s1 = active_s_end_norm_effective();
+        if (s_norm <= s0 || s_norm >= s1) return 0.0;
+        return wave_ramp(time) * static_moment_m0;
+    }
+
     const double prefactor = active_moment_prefactor_from_sample(s_norm, h, time);
     if (prefactor <= 0.0) return 0.0;
 
@@ -2813,11 +2488,15 @@ inline double active_moment_value_from_sample(const double s,
     return prefactor * drive;
 }
 
-inline double active_curvature_moment_from_active_moment(const double Mm)
+void
+coordinate_mapping_function(libMesh::Point& X, const libMesh::Point& s, void*)
 {
-    // Small-strain bending power uses epsilon_ss = -eta*kappa, hence the
-    // curvature-conjugate moment is -int(T_act*eta)dA.
-    return -active_moment_to_stress_sign * Mm;
+    X = s;
+    if (std::abs(initial_bend_amplitude) > 0.0)
+    {
+        const double s_norm = reference_x_norm_from_point(s);
+        X(1) += initial_bend_amplitude * std::sin(0.5 * M_PI * s_norm);
+    }
 }
 
 inline const char* active_phase_time_sign_string()
@@ -2862,658 +2541,131 @@ inline double longitudinal_active_envelope(double s_norm)
     return w;
 }
 
-// Lateral cosine band: weight is zero on the inner (1-f) fraction of half-thickness
-// and rises as a cosine from the inner edge to the outer boundary (q=1).
-inline double active_band_weight_unit(const double q_abs)
-{
-    const double q = clamp01(q_abs);
-    const double f = clamp01(active_band_fraction);
-    if (f <= 1.0e-12) return 0.0;
-    const double inner = std::max(0.0, 1.0 - f);
-    if (q <= inner) return 0.0;
-    const double r = clamp01((q - inner) / f);
-    return 0.5 * (1.0 - std::cos(M_PI * r));
-}
-
-inline double active_band_weight(const double eta, const double h)
-{
-    if (h <= 1.0e-12) return 0.0;
-    const double q = std::abs(eta) / h;
-    if (q > 1.0 + 1.0e-10) return 0.0;
-    return active_band_weight_unit(q);
-}
-
-inline double active_band_second_moment_unit()
-{
-    static double cached_fraction = std::numeric_limits<double>::quiet_NaN();
-    static double cached_value = std::numeric_limits<double>::quiet_NaN();
-
-    if (std::abs(cached_fraction - active_band_fraction) <= 1.0e-14 &&
-        std::isfinite(cached_value))
-    {
-        return cached_value;
-    }
-
-    const int n = 256;
-    const double dq = 2.0 / static_cast<double>(n);
-    double integral = 0.0;
-    for (int i = 0; i < n; ++i)
-    {
-        const double q = -1.0 + (static_cast<double>(i) + 0.5) * dq;
-        const double w = active_band_weight_unit(std::abs(q));
-        integral += w * q * q * dq;
-    }
-
-    cached_fraction = active_band_fraction;
-    cached_value = integral;
-    return cached_value;
-}
-
-inline double active_band_second_moment(const double h)
-{
-    return active_band_second_moment_unit() * h * h * h;
-}
-
-// Linear interpolation from the FE-precomputed eta_bar and I2_c tables.
-// Returns 0 / fallback when the tables have not been built yet.
-inline double fe_eta_bar_from_s_norm(const double s_norm)
-{
-    if (!s_fe_section_data_built || s_fe_eta_bar.empty()) return 0.0;
-    const int nb = static_cast<int>(s_fe_eta_bar.size());
-    const double t = clamp01(s_norm) * (nb - 1);
-    const int i0 = std::min(static_cast<int>(t), nb - 2);
-    const double alpha = t - static_cast<double>(i0);
-    return (1.0 - alpha) * s_fe_eta_bar[i0] + alpha * s_fe_eta_bar[i0 + 1];
-}
-
-inline double fe_I2c_from_s_norm(const double s_norm)
-{
-    if (!s_fe_section_data_built || s_fe_I2_c.empty()) return 0.0;
-    const int nb = static_cast<int>(s_fe_I2_c.size());
-    const double t = clamp01(s_norm) * (nb - 1);
-    const int i0 = std::min(static_cast<int>(t), nb - 2);
-    const double alpha = t - static_cast<double>(i0);
-    return (1.0 - alpha) * s_fe_I2_c[i0] + alpha * s_fe_I2_c[i0 + 1];
-}
-
-inline bool active_section_correction_enabled()
-{
-    return use_fe_active_section_data && s_fe_section_data_built;
-}
-
 // =========================================================================
-// Active section consistency diagnostic (Xu, Zhou & Yu 2024)
-// =========================================================================
-// Writes the full reference centerline to reference_centerline.csv.
+// Mesh regularization PK1 stress.
 //
-// Columns: source, s, s_norm, x, y, h, t_hat_x, t_hat_y
-//   source = "laplace"  → Laplace φ-isocontour sections (active body region)
-//   source = "boundary" → backup boundary-chain midpoint nodes
-//                         (head stub + caudal fin beyond REFERENCE_BACKBONE_END_X)
-//
-// Run this at startup to verify that:
-//   1. The Laplace section midpoints form a smooth centerline.
-//   2. The total arc length and the truncation point match expectations.
-//   3. The boundary-chain extension (caudal fin) is continuous with the Laplace end.
-// =========================================================================
+// Isochoric part: decoupled volumetric-isochoric split
+//   W_iso = c1 * (J^{-2/d} * I1 - d),  d = NDIM
+//   P_iso = 2*c1 * J^{-2/d} * (F - (I1/d) * F^{-T})
+// This is the strict energy-derived isochoric PK1, not the compressible
+// neo-Hookean 2*c1*(F - F^{-T}) which mixes isochoric and volumetric parts.
 static void
-write_reference_centerline_csv()
+compute_raw_reg_dev_PK1_stress(TensorValue<double>& PP,
+                               const TensorValue<double>& FF,
+                               const libMesh::Point& X_ref)
 {
-    if (IBTK_MPI::getRank() != 0) return;
-
-    std::ofstream out("reference_centerline.csv");
-    if (!out.is_open())
-    {
-        TBOX_WARNING("write_reference_centerline_csv(): cannot open reference_centerline.csv\n");
-        return;
-    }
-
-    out << "source,s,s_norm,x,y,h,t_hat_x,t_hat_y\n";
-    out.setf(std::ios::scientific);
-    out.precision(8);
-
-    // ── Laplace φ-isocontour sections (active/body region) ─────────────────
-    const double L_ref = std::max(ref_arc_length, 1.0e-12);
-    for (const PhiIsoSectionSample& sec : ref_phi_sections)
-    {
-        if (!sec.valid) continue;
-        out << "laplace"
-            << "," << sec.s
-            << "," << sec.s_norm
-            << "," << sec.X_mid(0)
-            << "," << sec.X_mid(1)
-            << "," << sec.halfthickness
-            << "," << sec.t_hat(0)
-            << "," << sec.t_hat(1)
-            << "\n";
-    }
-
-    // ── Boundary-chain backup nodes (full body including caudal fin) ────────
-    for (std::size_t k = 0; k < ref_centerline_nodes.size(); ++k)
-    {
-        const double s_k = (ref_profile_s.size() > k) ? ref_profile_s[k] : 0.0;
-        const double h_k = (ref_halfthickness.size() > k) ? ref_halfthickness[k] : 0.0;
-        const double s_norm_k = s_k / L_ref;
-        const libMesh::Point& Xk = ref_centerline_nodes[k];
-
-        double tx = 1.0, ty = 0.0;
-        if (k + 1 < ref_centerline_nodes.size())
-        {
-            const libMesh::Point& Xn = ref_centerline_nodes[k + 1];
-            const double dx = Xn(0) - Xk(0), dy = Xn(1) - Xk(1);
-            const double len = std::sqrt(dx * dx + dy * dy);
-            if (len > 1.0e-14) { tx = dx / len; ty = dy / len; }
-        }
-
-        out << "boundary"
-            << "," << s_k
-            << "," << s_norm_k
-            << "," << Xk(0)
-            << "," << Xk(1)
-            << "," << h_k
-            << "," << tx
-            << "," << ty
-            << "\n";
-    }
-
-    pout << "  reference_centerline.csv written ("
-         << ref_phi_sections.size() << " Laplace sections, "
-         << ref_centerline_nodes.size() << " boundary-chain nodes, "
-         << "arc_length=" << ref_arc_length << ")\n";
-}
-
-// Verifies: ∫ T_act dη ≈ 0 (zero net axial force) and the curvature-conjugate
-// moment -∫T_act η dη reports the actual curvature-conjugate sign for unit Mm.
-// =========================================================================
-static void
-write_active_section_consistency()
-{
-    if (IBTK_MPI::getRank() != 0) return;
-
-    std::ofstream out("active_section_consistency.csv");
-    if (!out.is_open())
-    {
-        TBOX_WARNING("write_active_section_consistency(): cannot open active_section_consistency.csv\n");
-        return;
-    }
-    out << "s_norm,h,I2_eff,N_unit,stress_moment_unit,curvature_moment_unit"
-        << ",expected_curvature_moment_unit,curvature_moment_error"
-        << ",active_moment_to_stress_sign\n";
-    out.setf(std::ios::scientific);
-    out.precision(8);
-
-    const int ns = 101;
-    const int nq = 400;
-    double max_abs_N = 0.0;
-    double max_abs_M_error = 0.0;
-
-    for (int i = 0; i < ns; ++i)
-    {
-        const double s_norm = static_cast<double>(i) / static_cast<double>(ns - 1);
-        const double s = s_norm * std::max(ref_arc_length, 1.0e-12);
-        const double h = body_halfthick_from_s(s);
-        if (h < 1.0e-12) continue;
-        const double I2 = active_band_second_moment(h);
-        if (I2 <= 1.0e-30) continue;
-
-        double N = 0.0, M = 0.0;
-        const double deta = 2.0 * h / static_cast<double>(nq);
-        for (int q = 0; q < nq; ++q)
-        {
-            const double eta = -h + (static_cast<double>(q) + 0.5) * deta;
-            const double w = active_band_weight(eta, h);
-            // Unit raw Mm=1. Since epsilon_ss = -eta*kappa, the
-            // curvature-conjugate moment is -int(T*eta)deta.
-            const double T = active_moment_to_stress_sign * w * eta / I2;
-            N += T * deta;
-            M += T * eta * deta;
-        }
-
-        const double M_curv = -M;
-        const double expected_M_curv = -active_moment_to_stress_sign;
-        const double M_error = M_curv - expected_M_curv;
-        max_abs_N = std::max(max_abs_N, std::abs(N));
-        max_abs_M_error = std::max(max_abs_M_error, std::abs(M_error));
-        out << s_norm << "," << h << "," << I2
-            << "," << N << "," << M << "," << M_curv
-            << "," << expected_M_curv << "," << M_error
-            << "," << active_moment_to_stress_sign << "\n";
-    }
-    out.flush();
-    pout << "  active_section_consistency.csv written (target: |N|<1e-6, "
-         << "|M_curv-expected|<1e-3; expected M_curv="
-         << -active_moment_to_stress_sign << ")\n";
-    pout << "  active section max|N| = " << max_abs_N
-         << ", max|M_curv-expected| = " << max_abs_M_error << "\n";
-    if (max_abs_N > 1.0e-6 || max_abs_M_error > 1.0e-3)
-    {
-        TBOX_WARNING("Active section consistency check failed: max|N| = "
-                     << max_abs_N << ", max|M_curv-expected| = " << max_abs_M_error
-                     << ". Check ACTIVE_BAND_FRACTION / I2_eff.\n");
-    }
-}
-
-// =========================================================================
-// FE-consistent active section data: eta_bar(s) and I2_c(s)
-//
-// Computes from actual FE quadrature points (using ref_laplace_node_geom):
-//   eta_bar(s) = Σ w(eta)*eta*JxW  /  Σ w(eta)*JxW
-//   I2_c(s)    = [Σ_bin w(eta)*eta_c²*JxW] / Δs_bin   where  eta_c = eta - eta_bar
-//
-// For a perfectly symmetric mesh, eta_bar ≈ 0 and the bin-width-normalized I2_c ≈ active_band_second_moment(h).
-// For a mesh with small asymmetry, eta_c = eta - eta_bar re-centers the stress
-// so that Σ T_act * JxW = 0 exactly at the FE quadrature level.
-// =========================================================================
-static void
-write_fe_active_section_diagnostic()
-{
-    if (IBTK_MPI::getRank() != 0 || !s_fe_section_data_built) return;
-
-    std::ofstream out(s_fe_section_diag_filename);
-    if (!out.is_open())
-    {
-        TBOX_WARNING("write_fe_active_section_diagnostic(): cannot open "
-                     << s_fe_section_diag_filename << "\n");
-        return;
-    }
-    out << "s_norm,eta_bar,I2_ideal,I2_c,I2_c_over_I2_ideal,eta_bar_over_h\n";
-    out.setf(std::ios::scientific);
-    out.precision(8);
-
-    const int nb = s_fe_n_bins;
-    double max_abs_eta_bar_over_h = 0.0;
-    double min_I2_ratio = std::numeric_limits<double>::infinity();
-    double max_I2_ratio = 0.0;
-    int    n_I2_ratio   = 0;
-    for (int i = 0; i < nb; ++i)
-    {
-        const double s_norm = (nb > 1) ?
-            static_cast<double>(i) / static_cast<double>(nb - 1) : 0.0;
-        const double s      = s_norm * std::max(ref_arc_length, 1.0e-12);
-        const double h      = body_halfthick_from_s(s);
-        const double I2_ideal = active_band_second_moment(h);
-        const double I2_ratio = (I2_ideal > 1.0e-30) ? s_fe_I2_c[i] / I2_ideal : 0.0;
-        const double ebar_h = (h > 1.0e-12) ? s_fe_eta_bar[i] / h : 0.0;
-        max_abs_eta_bar_over_h = std::max(max_abs_eta_bar_over_h, std::abs(ebar_h));
-        if (I2_ideal > 1.0e-30 && s_fe_I2_c[i] > 1.0e-30)
-        {
-            min_I2_ratio = std::min(min_I2_ratio, I2_ratio);
-            max_I2_ratio = std::max(max_I2_ratio, I2_ratio);
-            ++n_I2_ratio;
-        }
-        out << s_norm << "," << s_fe_eta_bar[i] << "," << I2_ideal
-            << "," << s_fe_I2_c[i] << "," << I2_ratio << "," << ebar_h
-            << "\n";
-    }
-    out.flush();
-    pout << "  fe_active_section.csv written\n";
-    pout << "  max |eta_bar/h| = " << max_abs_eta_bar_over_h << "\n";
-    if (n_I2_ratio > 0)
-    {
-        pout << "  FE I2_c/I2_ideal range = [" << min_I2_ratio
-             << ", " << max_I2_ratio << "] over " << n_I2_ratio << " active bins\n";
-        if (min_I2_ratio < 0.1 || max_I2_ratio > 10.0)
-        {
-            TBOX_WARNING("FE active section: I2_c/I2_ideal is far from O(1) "
-                         << "(range [" << min_I2_ratio << ", " << max_I2_ratio
-                         << "]). Check mesh symmetry, bin width normalization, and active band support.\n");
-        }
-    }
-    if (max_abs_eta_bar_over_h > 1.0e-3)
-    {
-        TBOX_WARNING("FE active section: max |eta_bar/h| = " << max_abs_eta_bar_over_h
-                     << " — mesh asymmetry is significant; eta_c correction is active.\n");
-    }
-    else
-    {
-        pout << "  mesh is nearly symmetric (|eta_bar/h| < 1e-3); "
-                "eta_c correction is small.\n";
-    }
-}
-
-static void
-build_fe_section_data(MeshBase& mesh)
-{
-    if (!ref_laplace_parameterization_built)
-    {
-        pout << "  build_fe_section_data(): Laplace parameterization not built; skipping.\n";
-        return;
-    }
-
-    s_fe_n_bins = std::max(8, reference_profile_bins);
-    const int nb = s_fe_n_bins;
-    s_fe_sum_w.assign(nb, 0.0);
-    s_fe_sum_w_eta.assign(nb, 0.0);
-    s_fe_sum_w_eta2.assign(nb, 0.0);
-    s_fe_eta_bar.assign(nb, 0.0);
-    s_fe_I2_c.assign(nb, 0.0);
-
-    // FIFTH-order quadrature matches PK1_ACT_QUAD_ORDER.
-    const libMesh::Order quad_order = libMesh::FIFTH;
-    const unsigned int dim = mesh.mesh_dimension();
-    // Determine FE type from the first local element.
-    FEType fe_type(FIRST, LAGRANGE);
-    {
-        auto el0 = mesh.active_local_elements_begin();
-        if (el0 != mesh.active_local_elements_end())
-            fe_type = FEType((*el0)->default_order(), LAGRANGE);
-    }
-    std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
-    std::unique_ptr<QBase>  qrule(QBase::build(QGAUSS, dim, quad_order));
-    fe->attach_quadrature_rule(qrule.get());
-    const std::vector<Real>&                    JxW = fe->get_JxW();
-    const std::vector<std::vector<Real>>&       phi = fe->get_phi();
-
-    for (auto el_it = mesh.active_local_elements_begin();
-         el_it != mesh.active_local_elements_end(); ++el_it)
-    {
-        const Elem* elem = *el_it;
-        fe->reinit(elem);
-        const unsigned int nq = static_cast<unsigned int>(JxW.size());
-        const unsigned int nn = elem->n_nodes();
-
-        for (unsigned int qp = 0; qp < nq; ++qp)
-        {
-            double s_qp = 0.0, eta_qp = 0.0;
-            bool ok = true;
-            for (unsigned int k = 0; k < nn; ++k)
-            {
-                auto it = ref_laplace_node_geom.find(elem->node_id(k));
-                if (it == ref_laplace_node_geom.end()) { ok = false; break; }
-                s_qp   += phi[k][qp] * it->second.s;
-                eta_qp += phi[k][qp] * it->second.eta;
-            }
-            if (!ok) continue;
-
-            const double h = body_halfthick_from_s(s_qp);
-            if (h < 1.0e-10) continue;
-
-            const double s_norm =
-                clamp01(s_qp / std::max(ref_arc_length, 1.0e-12));
-            // Round to nearest bin; clamp to valid range.
-            const int bi = std::min(nb - 1,
-                           std::max(0, static_cast<int>(s_norm * (nb - 1) + 0.5)));
-
-            const double jw = JxW[qp];
-            const double w = active_band_weight(eta_qp, h);
-            if (w <= 0.0) continue;
-
-            s_fe_sum_w[bi]     += w * jw;
-            s_fe_sum_w_eta[bi] += w * eta_qp * jw;
-            s_fe_sum_w_eta2[bi]+= w * eta_qp * eta_qp * jw;
-        }
-    }
-
-    // Global reduction across MPI ranks.
-    IBTK_MPI::sumReduction(s_fe_sum_w.data(),     nb);
-    IBTK_MPI::sumReduction(s_fe_sum_w_eta.data(), nb);
-    IBTK_MPI::sumReduction(s_fe_sum_w_eta2.data(),nb);
-
-    for (int i = 0; i < nb; ++i)
-    {
-        const double s_norm_left = (i == 0 || nb <= 1) ?
-            0.0 : (static_cast<double>(i) - 0.5) / static_cast<double>(nb - 1);
-        const double s_norm_right = (i == nb - 1 || nb <= 1) ?
-            1.0 : (static_cast<double>(i) + 0.5) / static_cast<double>(nb - 1);
-        const double ds_bin = std::max((s_norm_right - s_norm_left) *
-                                       std::max(ref_arc_length, 1.0e-12),
-                                       1.0e-12);
-
-        if (s_fe_sum_w[i] <= 1.0e-30)
-        {
-            s_fe_eta_bar[i] = 0.0;
-            s_fe_I2_c[i]    = 0.0;
-        }
-        else
-        {
-            s_fe_eta_bar[i] = s_fe_sum_w_eta[i] / s_fe_sum_w[i];
-            // The FE quadrature sums are area integrals over one s-bin:
-            //   I2_bin ≈ Δs_bin * ∫_section w(eta)*(eta-eta_bar)^2 dη.
-            // Divide by the physical bin width to recover the sectional second
-            // moment required by T_act = sign*w*Mm*eta_c/I2_c.
-            const double I2_bin = std::max(0.0,
-                s_fe_sum_w_eta2[i] - s_fe_eta_bar[i] * s_fe_sum_w_eta[i]);
-            s_fe_I2_c[i] = I2_bin / ds_bin;
-        }
-    }
-
-    // Fill empty bins by nearest-neighbor continuation so interpolation of I2_c
-    // does not blend valid section moments with zeros near sparse regions. The
-    // actual active stress still falls back to the analytic I2 when all bins are empty.
-    int first_valid = -1;
-    for (int i = 0; i < nb; ++i)
-    {
-        if (s_fe_I2_c[i] > 1.0e-30) { first_valid = i; break; }
-    }
-    if (first_valid >= 0)
-    {
-        for (int i = 0; i < first_valid; ++i)
-        {
-            s_fe_eta_bar[i] = s_fe_eta_bar[first_valid];
-            s_fe_I2_c[i]    = s_fe_I2_c[first_valid];
-        }
-        int last_valid = first_valid;
-        for (int i = first_valid + 1; i < nb; ++i)
-        {
-            if (s_fe_I2_c[i] > 1.0e-30)
-            {
-                const int next_valid = i;
-                for (int j = last_valid + 1; j < next_valid; ++j)
-                {
-                    const double a = static_cast<double>(j - last_valid) /
-                                     static_cast<double>(next_valid - last_valid);
-                    s_fe_eta_bar[j] = (1.0 - a) * s_fe_eta_bar[last_valid] +
-                                      a * s_fe_eta_bar[next_valid];
-                    s_fe_I2_c[j]    = (1.0 - a) * s_fe_I2_c[last_valid] +
-                                      a * s_fe_I2_c[next_valid];
-                }
-                last_valid = next_valid;
-            }
-        }
-        for (int i = last_valid + 1; i < nb; ++i)
-        {
-            s_fe_eta_bar[i] = s_fe_eta_bar[last_valid];
-            s_fe_I2_c[i]    = s_fe_I2_c[last_valid];
-        }
-    }
-
-    s_fe_section_data_built = true;
-    write_fe_active_section_diagnostic();
-}
-
-// =========================================================================
-// Dev PK1 stress  (neo-Hookean deviatoric part)
-//
-//   PP_dev = 2·eta_dev·F
-//   对应应变能：W_dev = eta_dev·(I₁ - 3)
-//   纯剪切抗力，防止单元剪切塌缩。eta_dev 极小，不干扰 EB 弯曲。
-//   注：与 dil 合并即为标准 neo-Hookean（Holzapfel 2000, §6.4）
-// =========================================================================
-static void
-compute_dev_PK1_stress_impl(TensorValue<double>& PP,
-                            const TensorValue<double>& FF)
-{
-    PP = 2.0 * eta_dev * FF;
-}
-
-void PK1_dev_stress_function(
-    TensorValue<double>& PP,
-    const TensorValue<double>& FF,
-    const libMesh::Point&,
-    const libMesh::Point&,
-    Elem* const,
-    const std::vector<const std::vector<double>*>&,
-    const std::vector<const std::vector<VectorValue<double> >*>&,
-    double,
-    void*)
-{
-    compute_dev_PK1_stress_impl(PP, FF);
-}
-
-// =========================================================================
-// Dil PK1 stress  (neo-Hookean volumetric part)
-//
-//   PP_dil = 2·(−eta_dev + kappa_vol·lnJ)·F⁻ᵀ
-//   对应应变能：W_dil = −2·eta_dev·lnJ + kappa_vol·(lnJ)²
-//   独立体积约束；J→0 时 lnJ→−∞，提供发散恢复力阻止元素反转。
-//   kappa_vol=0 时退化为旧版 eta_dev*(F−F⁻ᵀ) 的 F⁻ᵀ 项。
-// =========================================================================
-static void
-compute_dil_PK1_stress_impl(TensorValue<double>& PP,
-                            const TensorValue<double>& FF)
-{
+    const double c1_local = get_c1_mesh_reg_local_from_reference_point(X_ref);
     const double J = FF.det();
-    if (J <= 0.0)
-    {
-        // 元素已反转：施加大惩罚力推回
-        PP = -2.0 * kappa_vol * tensor_inverse_transpose(FF, NDIM);
-        return;
-    }
-    const double lnJ = std::log(J);
-    PP = 2.0 * (-eta_dev + kappa_vol * lnJ) * tensor_inverse_transpose(FF, NDIM);
-}
-
-void PK1_dil_stress_function(
-    TensorValue<double>& PP,
-    const TensorValue<double>& FF,
-    const libMesh::Point&,
-    const libMesh::Point&,
-    Elem* const,
-    const std::vector<const std::vector<double>*>&,
-    const std::vector<const std::vector<VectorValue<double> >*>&,
-    double,
-    void*)
-{
-    compute_dil_PK1_stress_impl(PP, FF);
-}
-
-inline double paper_section_second_moment(const double h)
-{
-    const double w = std::max(h, 0.0);
-    const double spine = 0.01 * std::max(fish_length, 1.0e-12);
-    return (2.0 / 3.0) * w * w * w +
-           (20.0 / 3.0) * spine * spine * spine;
-}
-
-// =========================================================================
-// Passive Euler-Bernoulli section-resultant PK1 stress:
-//
-//   M_EB(s,t) = -E_m I_e(s) kappa(s,t)
-//             - eta_m I_e(s) kappa_dot(s,t),
-//
-// with E_m = 4·eb_kappa_b and eta_m = l* E_m / omega0. The section moment is
-// mapped to a zero-resultant through-thickness fiber stress, using the same
-// curvature-conjugate sign convention as the active moment:
-//
-//   T_EB = - M_EB * w(eta) * eta_c / I2_c,
-//   PP_EB = T_EB F (f0 tensor f0).
-// =========================================================================
-static void
-compute_eb_passive_bending_PK1_stress_impl(
-    TensorValue<double>& PP,
-    const TensorValue<double>& FF,
-    const libMesh::Point& X_ref,
-    const ReferenceGeometrySample& ref_geom,
-    const EBBendingSample& eb_sample)
-{
-    PP = 0.0;
-    if (!use_eb_passive_bending) return;
-
-    const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
-    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
-    if (s_norm >= eb_active_s_end) return;   // exclude blunt tail cap region
-    const double h = body_halfthick_from_s(s);
-    if (h < 1.0e-10) return;
-
-    const double band_weight = active_band_weight(ref_geom.eta, h);
-    if (band_weight <= 0.0) return;
-
-    const double I2_c = fe_I2c_from_s_norm(s_norm);
-    const bool use_fe_section =
-        active_section_correction_enabled() && I2_c > 1.0e-30;
-    const double eta_bar = use_fe_section ? fe_eta_bar_from_s_norm(s_norm) : 0.0;
-    const double eta_c = ref_geom.eta - eta_bar;
-    const double I2_eff = active_band_second_moment(h);
-    const double I2_use = use_fe_section ? I2_c : I2_eff;
-    if (I2_use <= 1.0e-30) return;
-
-    const double E_m = 4.0 * eb_kappa_b;
-    const double eta_m = structural_kv_loss_factor * E_m /
-                         eb_damping_reference_omega0(E_m);
-    const double I_e = paper_section_second_moment(h);
-    const double M_eb = -I_e * (E_m * eb_sample.kappa +
-                                eta_m * eb_sample.kappa_dot);
-
-    const double T_eb_raw = -band_weight * M_eb * eta_c / I2_use;
-    const double T_cap = structural_kv_stress_cap_over_c1 * eta_dev;
-    const double T_eb = (T_cap > 0.0) ?
-        std::max(-T_cap, std::min(T_cap, T_eb_raw)) : T_eb_raw;
-
-    TensorValue<double> f_f;
-    outer_product(f_f, ref_geom.t_hat, ref_geom.t_hat);
-    PP = T_eb * FF * f_f;
-}
-
-void PK1_eb_passive_bending_stress_function(
-    TensorValue<double>& PP,
-    const TensorValue<double>& FF,
-    const libMesh::Point&,
-    const libMesh::Point& X_ref,
-    Elem* const,
-    const std::vector<const std::vector<double>*>& system_var_data,
-    const std::vector<const std::vector<VectorValue<double> >*>&,
-    double,
-    void*)
-{
-    PP = 0.0;
-    if (!use_eb_passive_bending) return;
-
-    const ReferenceGeometrySample ref_geom =
-        reference_geometry_from_system_data(system_var_data, 0);
-    const EBBendingSample eb_sample =
-        eb_bending_from_system_data(system_var_data, 1);
-    compute_eb_passive_bending_PK1_stress_impl(PP, FF, X_ref,
-                                               ref_geom, eb_sample);
-}
-
-// =========================================================================
-// Passive structural Kelvin-Voigt PK1 stress:
-//
-//   Xu & Yu's reduced beam balance includes a passive viscous bending moment
-//   proportional to d/dt(d phi/ds). The continuum analogue used here is an
-//   objective fiber-direction Kelvin-Voigt stress:
-//
-//       sigma_kv = eta_s(s) * (a_hat · D · a_hat) * (a_hat ⊗ a_hat),
-//       PP_kv    = J * sigma_kv * F^{-T},
-//
-//   where D is the spatial rate-of-deformation tensor and a_hat is the current
-//   body tangent. In the small-strain beam limit this supplies a bending moment
-//   proportional to the curvature rate without damping rigid translation or
-//   rigid rotation.
-// =========================================================================
-static void
-compute_structural_damping_PK1_stress_impl(
-    TensorValue<double>& PP,
-    const TensorValue<double>& FF,
-    const libMesh::Point& X_ref,
-    const ReferenceGeometrySample& ref_geom,
-    const std::vector<VectorValue<double> >& grad_U)
-{
-    PP = 0.0;
-    if (structural_kv_loss_factor <= 0.0 || use_eb_passive_bending) return;
-
-    TensorValue<double> F_dot;
-    F_dot.zero();
+    const double d = static_cast<double>(NDIM);
+    const TensorValue<double> FinvT = tensor_inverse_transpose(FF, NDIM);
+    double I1 = 0.0;
     for (unsigned int i = 0; i < NDIM; ++i)
-    {
         for (unsigned int j = 0; j < NDIM; ++j)
-        {
-            F_dot(i, j) = grad_U[i](j);
-        }
+            I1 += FF(i, j) * FF(i, j);
+    PP = 2.0 * c1_local * std::pow(J, -2.0 / d) * (FF - (I1 / d) * FinvT);
+}
+
+static void
+compute_raw_reg_dil_PK1_stress(TensorValue<double>& PP,
+                               const TensorValue<double>& FF,
+                               const libMesh::Point& X_ref)
+{
+    const double J = FF.det();
+    if (!(J > 1.0e-14) || !std::isfinite(J))
+    {
+        TBOX_ERROR("Mesh-regularization dilational stress encountered non-positive "
+                   "or non-finite det(F) = " << J
+                   << " at X_ref=(" << X_ref(0) << ", " << X_ref(1)
+                   << ").\n");
     }
 
+    PP = kappa_mesh_reg * std::log(J) * tensor_inverse_transpose(FF, NDIM);
+}
+
+static void
+compute_reg_dev_PK1_stress_impl(TensorValue<double>& PP,
+                                const TensorValue<double>& FF,
+                                const libMesh::Point& X_ref)
+{
     const double J = FF.det();
-    if (std::abs(J) <= 1.0e-14) return;
+    if (!(J > 1.0e-14) || !std::isfinite(J))
+    {
+        TBOX_ERROR("compute_reg_dev_PK1_stress_impl(): non-positive or non-finite "
+                   "det(F) = " << J << " at X_ref=("
+                   << X_ref(0) << ", " << X_ref(1) << "). "
+                   "Mesh is excessively distorted.\n");
+    }
+    compute_raw_reg_dev_PK1_stress(PP, FF, X_ref);
+}
+
+static void
+compute_reg_dil_PK1_stress_impl(TensorValue<double>& PP,
+                                const TensorValue<double>& FF,
+                                const libMesh::Point& X_ref)
+{
+    const double J = FF.det();
+    if (!(J > 1.0e-14) || !std::isfinite(J))
+    {
+        TBOX_ERROR("compute_reg_dil_PK1_stress_impl(): non-positive or non-finite "
+                   "det(F) = " << J << " at X_ref=("
+                   << X_ref(0) << ", " << X_ref(1) << "). "
+                   "Mesh is excessively distorted.\n");
+    }
+    compute_raw_reg_dil_PK1_stress(PP, FF, X_ref);
+}
+
+void PK1_reg_dev_stress_function(TensorValue<double>& PP,
+                                 const TensorValue<double>& FF,
+                                 const libMesh::Point& /*X*/,
+                                 const libMesh::Point& X_ref,
+                                 Elem* const,
+                                 const std::vector<const std::vector<double>*>&,
+                                 const std::vector<const std::vector<VectorValue<double> >*>&,
+                                 double /*time*/,
+                                 void*)
+{
+    compute_reg_dev_PK1_stress_impl(PP, FF, X_ref);
+}
+
+void PK1_reg_dil_stress_function(TensorValue<double>& PP,
+                                 const TensorValue<double>& FF,
+                                 const libMesh::Point& /*X*/,
+                                 const libMesh::Point& X_ref,
+                                 Elem* const,
+                                 const std::vector<const std::vector<double>*>&,
+                                 const std::vector<const std::vector<VectorValue<double> >*>&,
+                                 double /*time*/,
+                                 void*)
+{
+    compute_reg_dil_PK1_stress_impl(PP, FF, X_ref);
+}
+
+// =========================================================================
+// Optional continuum structural damping.
+//
+// This is a continuum viscous stress, not the old EB/KV bending model. It uses
+// the current fiber tangent and spatial rate-of-deformation tensor so rigid
+// translation and rigid rotation do not generate damping stress:
+//
+//     sigma_visc = eta_s(s) * (a_hat . D . a_hat) * (a_hat tensor a_hat)
+//     P_visc    = J * sigma_visc * F^{-T}
+//
+// with eta_s scaled from the local passive shear modulus by
+// CONTINUUM_DAMPING_FACTOR / omega.
+// =========================================================================
+static void
+compute_continuum_damping_PK1_stress_impl(
+    TensorValue<double>& PP,
+    const TensorValue<double>& FF,
+    const libMesh::Point& X_ref,
+    const ReferenceGeometrySample& ref_geom,
+    const TensorValue<double>& F_dot)
+{
+    PP = 0.0;
+    if (!use_continuum_damping || continuum_damping_factor <= 0.0) return;
+
+    const double J = FF.det();
+    if (!(J > 1.0e-14) || !std::isfinite(J)) return;
 
     TensorValue<double> F_inv;
     tensor_inverse(F_inv, FF, NDIM);
@@ -3527,133 +2679,57 @@ compute_structural_damping_PK1_stress_impl(
     const VectorValue<double> a_hat = a / a_norm;
 
     const double axial_strain_rate = a_hat * (D * a_hat);
+    const double c1_local = get_c1_mesh_reg_local_from_reference_point(X_ref);
     const double omega_ref = std::max(std::abs(wave_omega), 1.0e-12);
-    const double eta_local = structural_kv_loss_factor * 2.0 * eta_dev / omega_ref;
+    const double eta_local =
+        continuum_damping_factor * 2.0 * c1_local / omega_ref;
     const double T_raw = eta_local * axial_strain_rate;
-    const double T_cap = structural_kv_stress_cap_over_c1 * eta_dev;
-    const double T_kv = (T_cap > 0.0) ?
+    const double T_cap =
+        continuum_damping_stress_cap_over_c1 * c1_local;
+    const double T_visc = (T_cap > 0.0) ?
         std::max(-T_cap, std::min(T_cap, T_raw)) : T_raw;
 
     TensorValue<double> aa;
     outer_product(aa, a_hat, a_hat);
-    const TensorValue<double> sigma_kv = T_kv * aa;
-    PP = J * sigma_kv * F_inv_trans;
+    const TensorValue<double> sigma_visc = T_visc * aa;
+    PP = J * sigma_visc * F_inv_trans;
 }
 
-void PK1_structural_damping_stress_function(
+void PK1_continuum_damping_stress_function(
     TensorValue<double>& PP,
     const TensorValue<double>& FF,
-    const libMesh::Point& /*x_cur*/,
+    const libMesh::Point&,
     const libMesh::Point& X_ref,
     Elem* const,
     const std::vector<const std::vector<double>*>& system_var_data,
     const std::vector<const std::vector<VectorValue<double> >*>& system_grad_var_data,
-    double /*time*/,
+    double,
     void*)
 {
     PP = 0.0;
-    if (structural_kv_loss_factor <= 0.0 || use_eb_passive_bending) return;
+    if (!use_continuum_damping || continuum_damping_factor <= 0.0) return;
 
     if (system_grad_var_data.size() < 2 || system_grad_var_data[1] == nullptr ||
         system_grad_var_data[1]->size() < NDIM)
     {
-        TBOX_ERROR("PK1_structural_damping_stress_function(): velocity-gradient data are unavailable.\n");
+        TBOX_ERROR("PK1_continuum_damping_stress_function(): "
+                   "velocity-gradient data are unavailable.\n");
+    }
+
+    TensorValue<double> F_dot;
+    F_dot.zero();
+    const std::vector<VectorValue<double> >& grad_U = *system_grad_var_data[1];
+    for (unsigned int i = 0; i < NDIM; ++i)
+    {
+        for (unsigned int j = 0; j < NDIM; ++j)
+        {
+            F_dot(i, j) = grad_U[i](j);
+        }
     }
 
     const ReferenceGeometrySample ref_geom =
         reference_geometry_from_system_data(system_var_data);
-    const std::vector<VectorValue<double> >& grad_U = *system_grad_var_data[1];
-    compute_structural_damping_PK1_stress_impl(PP, FF, X_ref, ref_geom, grad_U);
-}
-
-// =========================================================================
-// Active bending moment PK1 stress   (Xu, Zhou & Yu 2024)
-//
-// Derivation sketch for IBFE:
-//   In the body reference frame, the fish muscle generates a bending
-//   moment Mm(s,t) about the Z-axis (normal to the swim plane).
-//   For an Euler-Bernoulli section with half-thickness h(s):
-//       T_active(X,t) = w(η) · Mm(s,t) · η(X) / I₂_eff(s)
-//   where η(X) is the signed normal distance to the mesh-extracted
-//   reference centerline and I₂_eff(s)=∫w(η)η²dη.
-//   The local active fiber direction follows the reference centerline
-//   tangent, so the PK1 contribution is:
-//       PP_active = T_active · F · (f0 ⊗ f0)
-//
-// Positive Mm is conjugate to positive body curvature: the positive-normal
-// side is driven into axial compression in the small-strain beam limit
-// ε_ss = -ηκ.
-// =========================================================================
-static void
-compute_active_PK1_stress_impl(TensorValue<double>& PP,
-                               const TensorValue<double>& FF,
-                               const libMesh::Point& X_ref,     // material coords
-                               const ReferenceGeometrySample& ref_geom,
-                               const double time)
-{
-    // Always clear the output tensor. This callback must be self-contained.
-    PP = 0.0;
-
-    if (beta_act <= 0.0) return;
-
-    const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
-    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
-    const double eta = ref_geom.eta;
-    const double h = body_halfthick_from_s(s);
-    if (h < 1.0e-10) return;
-
-    const double band_weight = active_band_weight(eta, h);
-    if (band_weight <= 0.0) return;
-
-    // Independent muscle active bending moment. Legacy target-curvature
-    // drive is allowed only when explicitly requested in input.
-    const double Mm = active_moment_value_from_sample(s, s_norm, h, time);
-    if (std::abs(Mm) <= 1.0e-30) return;
-
-    // FE-consistent active fiber stress:
-    //   T_act = sign * w(eta) * Mm * eta_c / I2_c
-    //
-    // eta_c = eta - eta_bar(s): re-centered coordinate so that
-    //   Σ_{qp} band_weight * eta_c * JxW = 0 exactly (discrete zero-resultant).
-    // I2_c = Σ band_weight * eta_c² * JxW: FE second moment about the centroid.
-    // Both are precomputed by build_fe_section_data(); when not built (symmetric
-    // mesh / fallback) eta_c = eta and I2_c = active_band_second_moment(h).
-    //
-    // Cap is applied to Mm (not T_act) to preserve T_act(+η) = -T_act(-η).
-    const double I2_c    = fe_I2c_from_s_norm(s_norm);
-    const bool use_fe_section =
-        active_section_correction_enabled() && I2_c > 1.0e-30;
-    const double eta_bar = use_fe_section ? fe_eta_bar_from_s_norm(s_norm) : 0.0;
-    const double eta_c   = eta - eta_bar;
-    const double I2_eff  = active_band_second_moment(h);
-    const double I2_use  = use_fe_section ? I2_c : I2_eff;
-    if (I2_use <= 1.0e-30) return;
-    const double T_act_max = active_t_act_max_over_c1 * eta_dev;
-    const double Mm_max = T_act_max * I2_use / std::max(h, 1.0e-12);
-    // tanh saturation: C∞ continuous, avoids delta-function impulses at hard clip edges
-    const double Mm_clamped = Mm_max * std::tanh(Mm / Mm_max);
-    const double T_act =
-        active_moment_to_stress_sign * band_weight * Mm_clamped * eta_c / I2_use;
-
-    const VectorValue<double> f0 = ref_geom.t_hat;
-    TensorValue<double> f_f;
-    outer_product(f_f, f0, f0);
-    PP = T_act * FF * f_f;
-}
-
-void PK1_active_stress_function(TensorValue<double>& PP,
-                                const TensorValue<double>& FF,
-                                const libMesh::Point&,
-                                const libMesh::Point& X_ref,
-                                Elem* const,
-                                const std::vector<const std::vector<double>*>& system_var_data,
-                                const std::vector<const std::vector<VectorValue<double> >*>&,
-                                double time,
-                                void*)
-{
-    const ReferenceGeometrySample ref_geom =
-        reference_geometry_from_system_data(system_var_data);
-    compute_active_PK1_stress_impl(PP, FF, X_ref, ref_geom, time);
+    compute_continuum_damping_PK1_stress_impl(PP, FF, X_ref, ref_geom, F_dot);
 }
 
 // =========================================================================
@@ -3927,133 +3003,6 @@ write_geometry_conservation_diagnostics(const int            iteration_num,
     out.flush();
 }
 
-inline double forward_x_from_com(const double x_cm)
-{
-    const double forward_sign = head_is_at_x_min() ? -1.0 : 1.0;
-    return forward_sign * (x_cm - s_reference_xcom);
-}
-
-static void
-write_direction_debug_diagnostics(const int    iteration_num,
-                                  const double loop_time,
-                                  const double F_integral[NDIM],
-                                  const double x_cm,
-                                  const double y_cm,
-                                  const double vcm_x,
-                                  const double vcm_y,
-                                  const double tail_A_norm,
-                                  const double fish_area)
-{
-    if (!s_direction_debug_enable) return;
-    if (s_direction_debug_interval > 1 &&
-        (iteration_num % s_direction_debug_interval != 0)) return;
-    if (IBTK_MPI::getRank() != 0) return;
-
-    const double forward_sign = head_is_at_x_min() ? -1.0 : 1.0;
-    const double x_forward = forward_x_from_com(x_cm);
-    const double v_forward = forward_sign * vcm_x;
-    const double v_lateral = forward_sign * vcm_y;
-
-    // IB Lagrangian force integral (force fish structure exerts ON the fluid).
-    // NOTE: in IBFE with neutral buoyancy this is NOT the net propulsive force
-    // on the fish CM — it includes internal structural forces and does not satisfy
-    // F = m*a for the CM. Kept only for reference.
-    const double F_IB_on_fluid_fwd = forward_sign * F_integral[0];
-    const double F_IB_on_fish_fwd  = -F_IB_on_fluid_fwd;
-    const double F_IB_on_fish_lat  = -forward_sign * F_integral[1];
-
-    double dt_eff    = std::numeric_limits<double>::quiet_NaN();
-    double a_forward = std::numeric_limits<double>::quiet_NaN();
-    if (std::isfinite(s_direction_debug_prev_time))
-    {
-        dt_eff = loop_time - s_direction_debug_prev_time;
-        if (dt_eff > 1.0e-12 && std::isfinite(s_direction_debug_prev_v_forward))
-        {
-            a_forward = (v_forward - s_direction_debug_prev_v_forward) / dt_eff;
-
-            // Legacy IB-based impulse (retained but misleading — see F_IB note above)
-            s_direction_debug_fish_impulse_forward += F_IB_on_fish_fwd * dt_eff;
-            s_direction_debug_fish_work_forward    += F_IB_on_fish_fwd * v_forward * dt_eff;
-        }
-    }
-    s_direction_debug_prev_time      = loop_time;
-    s_direction_debug_prev_v_forward = v_forward;
-
-    // Correct propulsive force from Newton's 2nd law: F_CM = m_eff * a_cm.
-    // m_eff = fluid_density * fish_area (neutrally buoyant IBFE fish).
-    // This IS the net force driving the fish CM; its sign is the thrust direction.
-    const double F_CM_fwd = (std::isfinite(a_forward) && fish_area > 1.0e-30) ?
-        fluid_density * fish_area * a_forward :
-        std::numeric_limits<double>::quiet_NaN();
-
-    // Correct CM impulse = ∫ F_CM dt  =  m_eff * Δv_fwd  (meaningful momentum integral)
-    if (std::isfinite(F_CM_fwd) && std::isfinite(dt_eff))
-        s_direction_debug_cm_impulse_fwd += F_CM_fwd * dt_eff;
-
-    // Sliding-window cycle average of v_forward (~1 beat period)
-    s_vfwd_win[s_vfwd_win_pos] = v_forward;
-    s_vfwd_win_pos   = (s_vfwd_win_pos + 1) % VFWD_WIN;
-    s_vfwd_win_count = std::min(s_vfwd_win_count + 1, VFWD_WIN);
-    double v_fwd_cycle_avg = 0.0;
-    for (int i = 0; i < s_vfwd_win_count; ++i) v_fwd_cycle_avg += s_vfwd_win[i];
-    v_fwd_cycle_avg /= static_cast<double>(s_vfwd_win_count);
-
-    static std::ofstream out;
-    if (!out.is_open())
-    {
-        out.open(s_direction_debug_filename.c_str(), std::ios::out);
-        if (!out.is_open())
-        {
-            TBOX_WARNING("write_direction_debug_diagnostics(): cannot open "
-                         << s_direction_debug_filename << "\n");
-            return;
-        }
-        // Column legend:
-        //   F_IB_*  : Lagrangian IB force integral — NOT the true CM thrust (see note above)
-        //   F_CM_fwd: Newton 2nd law force on fish CM = fluid_density*fish_area*a_fwd  [RELIABLE]
-        //   cm_impulse_fwd: integral of F_CM_fwd — true forward momentum gained  [RELIABLE]
-        //   v_fwd_cycle_avg: sliding-window mean of v_fwd over ~1 beat period    [RELIABLE]
-        out << "step,time,dt_eff,forward_sign"
-            << ",x_cm,y_cm,x_forward,vcm_x,vcm_y,v_forward,v_lateral,a_forward"
-            << ",v_fwd_cycle_avg"
-            << ",fish_area"
-            << ",F_CM_fwd,cm_impulse_fwd"
-            << ",F_IB_on_fluid_fwd,F_IB_on_fish_fwd,F_IB_on_fish_lat"
-            << ",F_IB_impulse_fwd,F_IB_work_fwd"
-            << ",wave_time_sign,active_moment_to_stress_sign,tail_A_norm\n";
-        out.flush();
-    }
-
-    out.setf(std::ios::scientific);
-    out.precision(10);
-    out << iteration_num
-        << "," << loop_time
-        << "," << dt_eff
-        << "," << forward_sign
-        << "," << x_cm
-        << "," << y_cm
-        << "," << x_forward
-        << "," << vcm_x
-        << "," << vcm_y
-        << "," << v_forward
-        << "," << v_lateral
-        << "," << a_forward
-        << "," << v_fwd_cycle_avg
-        << "," << fish_area
-        << "," << F_CM_fwd
-        << "," << s_direction_debug_cm_impulse_fwd
-        << "," << F_IB_on_fluid_fwd
-        << "," << F_IB_on_fish_fwd
-        << "," << F_IB_on_fish_lat
-        << "," << s_direction_debug_fish_impulse_forward
-        << "," << s_direction_debug_fish_work_forward
-        << "," << wave_time_sign
-        << "," << active_moment_to_stress_sign
-        << "," << tail_A_norm
-        << "\n";
-    out.flush();
-}
-
 struct ReferenceFrame
 {
     libMesh::Point X = libMesh::Point();
@@ -4217,12 +3166,12 @@ compute_current_midline_samples_at_s(Pointer<IBFEMethod>        ib_method_ops,
                     const auto it = ref_laplace_node_geom.find(nodeA->id());
                     if (it != ref_laplace_node_geom.end())
                     { sA = it->second.s; haveA = true; }
-                    else if (!allow_centerline_fallback)
+                    else
                         TBOX_ERROR("compute_current_midline_samples_at_s(): missing Laplace "
                                    "reference geometry for boundary node "
                                    << nodeA->id() << ".\n");
                 }
-                if (!haveA)
+                if (!haveA && !use_laplace_reference_parameterization)
                 {
                     const ProjectionResult proj = project_to_reference_centerline(*nodeA);
                     if (!proj.valid) continue;
@@ -4237,12 +3186,12 @@ compute_current_midline_samples_at_s(Pointer<IBFEMethod>        ib_method_ops,
                     const auto it = ref_laplace_node_geom.find(nodeB->id());
                     if (it != ref_laplace_node_geom.end())
                     { sB = it->second.s; haveB = true; }
-                    else if (!allow_centerline_fallback)
+                    else
                         TBOX_ERROR("compute_current_midline_samples_at_s(): missing Laplace "
                                    "reference geometry for boundary node "
                                    << nodeB->id() << ".\n");
                 }
-                if (!haveB)
+                if (!haveB && !use_laplace_reference_parameterization)
                 {
                     const ProjectionResult proj = project_to_reference_centerline(*nodeB);
                     if (!proj.valid) continue;
@@ -4465,7 +3414,8 @@ compute_current_midline_samples(Pointer<IBFEMethod>       ib_method_ops,
                                          samples, theta_body);
 }
 
-std::vector<double> compute_body_midline_curvature(const std::vector<MidlineSample>& samples)
+static std::vector<double>
+compute_body_midline_curvature_tangent_angle(const std::vector<MidlineSample>& samples)
 {
     const int n = static_cast<int>(samples.size());
     std::vector<double> kappa(static_cast<std::size_t>(n),
@@ -4506,6 +3456,199 @@ std::vector<double> compute_body_midline_curvature(const std::vector<MidlineSamp
     return kappa;
 }
 
+static bool
+solve_small_linear_system(std::vector<double> A,
+                          std::vector<double> b,
+                          std::vector<double>& x)
+{
+    const int n = static_cast<int>(b.size());
+    if (A.size() != static_cast<std::size_t>(n * n)) return false;
+
+    for (int col = 0; col < n; ++col)
+    {
+        int pivot = col;
+        double pivot_abs = std::abs(A[static_cast<std::size_t>(col * n + col)]);
+        for (int row = col + 1; row < n; ++row)
+        {
+            const double value_abs =
+                std::abs(A[static_cast<std::size_t>(row * n + col)]);
+            if (value_abs > pivot_abs)
+            {
+                pivot = row;
+                pivot_abs = value_abs;
+            }
+        }
+        if (pivot_abs <= 1.0e-18 || !std::isfinite(pivot_abs)) return false;
+
+        if (pivot != col)
+        {
+            for (int j = col; j < n; ++j)
+            {
+                std::swap(A[static_cast<std::size_t>(col * n + j)],
+                          A[static_cast<std::size_t>(pivot * n + j)]);
+            }
+            std::swap(b[static_cast<std::size_t>(col)],
+                      b[static_cast<std::size_t>(pivot)]);
+        }
+
+        const double diag = A[static_cast<std::size_t>(col * n + col)];
+        for (int row = col + 1; row < n; ++row)
+        {
+            const double factor =
+                A[static_cast<std::size_t>(row * n + col)] / diag;
+            A[static_cast<std::size_t>(row * n + col)] = 0.0;
+            for (int j = col + 1; j < n; ++j)
+            {
+                A[static_cast<std::size_t>(row * n + j)] -=
+                    factor * A[static_cast<std::size_t>(col * n + j)];
+            }
+            b[static_cast<std::size_t>(row)] -=
+                factor * b[static_cast<std::size_t>(col)];
+        }
+    }
+
+    x.assign(static_cast<std::size_t>(n), 0.0);
+    for (int row = n - 1; row >= 0; --row)
+    {
+        double rhs = b[static_cast<std::size_t>(row)];
+        for (int j = row + 1; j < n; ++j)
+        {
+            rhs -= A[static_cast<std::size_t>(row * n + j)] *
+                   x[static_cast<std::size_t>(j)];
+        }
+        const double diag = A[static_cast<std::size_t>(row * n + row)];
+        if (std::abs(diag) <= 1.0e-18 || !std::isfinite(diag)) return false;
+        x[static_cast<std::size_t>(row)] = rhs / diag;
+    }
+    return true;
+}
+
+static bool
+fit_local_polynomial_coefficients(const std::vector<double>& z,
+                                  const std::vector<double>& values,
+                                  const int                  order,
+                                  std::vector<double>&       coeffs)
+{
+    const int m = static_cast<int>(z.size());
+    if (m != static_cast<int>(values.size()) || m <= order || order < 2)
+        return false;
+
+    const int n = order + 1;
+    std::vector<double> A(static_cast<std::size_t>(n * n), 0.0);
+    std::vector<double> b(static_cast<std::size_t>(n), 0.0);
+    std::vector<double> powers(static_cast<std::size_t>(2 * order + 1), 1.0);
+
+    for (int row = 0; row < m; ++row)
+    {
+        powers[0] = 1.0;
+        for (int p = 1; p <= 2 * order; ++p)
+        {
+            powers[static_cast<std::size_t>(p)] =
+                powers[static_cast<std::size_t>(p - 1)] *
+                z[static_cast<std::size_t>(row)];
+        }
+        for (int p = 0; p <= order; ++p)
+        {
+            b[static_cast<std::size_t>(p)] +=
+                values[static_cast<std::size_t>(row)] *
+                powers[static_cast<std::size_t>(p)];
+            for (int q = 0; q <= order; ++q)
+            {
+                A[static_cast<std::size_t>(p * n + q)] +=
+                    powers[static_cast<std::size_t>(p + q)];
+            }
+        }
+    }
+
+    return solve_small_linear_system(A, b, coeffs);
+}
+
+static std::vector<double>
+compute_body_midline_curvature_local_poly(const std::vector<MidlineSample>& samples)
+{
+    const int n = static_cast<int>(samples.size());
+    std::vector<double> kappa =
+        compute_body_midline_curvature_tangent_angle(samples);
+    if (n < 3) return kappa;
+
+    int window = std::max(3, passive_bending_curvature_poly_window);
+    if (window % 2 == 0) ++window;
+    const int order_requested =
+        std::max(2, passive_bending_curvature_poly_order);
+
+    for (int i = 0; i < n; ++i)
+    {
+        const int use_window = std::min(window, n);
+        int left = i - use_window / 2;
+        left = std::max(0, std::min(left, n - use_window));
+        const int right = left + use_window - 1;
+        const int m = right - left + 1;
+        const int order = std::min(order_requested, m - 1);
+        if (order < 2) continue;
+
+        const double s_center = samples[static_cast<std::size_t>(i)].s;
+        double scale = 0.0;
+        for (int j = left; j <= right; ++j)
+        {
+            scale = std::max(scale,
+                             std::abs(samples[static_cast<std::size_t>(j)].s -
+                                      s_center));
+        }
+        if (!(scale > 1.0e-14) || !std::isfinite(scale)) continue;
+
+        std::vector<double> z;
+        std::vector<double> x_values;
+        std::vector<double> y_values;
+        z.reserve(static_cast<std::size_t>(m));
+        x_values.reserve(static_cast<std::size_t>(m));
+        y_values.reserve(static_cast<std::size_t>(m));
+        for (int j = left; j <= right; ++j)
+        {
+            const MidlineSample& sample = samples[static_cast<std::size_t>(j)];
+            z.push_back((sample.s - s_center) / scale);
+            x_values.push_back(sample.x_body);
+            y_values.push_back(sample.y_body);
+        }
+
+        std::vector<double> x_coeffs;
+        std::vector<double> y_coeffs;
+        if (!fit_local_polynomial_coefficients(z, x_values, order, x_coeffs) ||
+            !fit_local_polynomial_coefficients(z, y_values, order, y_coeffs))
+        {
+            continue;
+        }
+
+        const double dx_ds = x_coeffs[1] / scale;
+        const double dy_ds = y_coeffs[1] / scale;
+        const double d2x_ds2 = 2.0 * x_coeffs[2] / (scale * scale);
+        const double d2y_ds2 = 2.0 * y_coeffs[2] / (scale * scale);
+        const double speed2 = dx_ds * dx_ds + dy_ds * dy_ds;
+        const double denom = speed2 * std::sqrt(std::max(speed2, 0.0));
+        if (denom <= 1.0e-30 || !std::isfinite(denom)) continue;
+
+        const double value =
+            (dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / denom;
+        if (std::isfinite(value))
+        {
+            kappa[static_cast<std::size_t>(i)] = value;
+        }
+    }
+
+    return kappa;
+}
+
+std::vector<double> compute_body_midline_curvature(const std::vector<MidlineSample>& samples)
+{
+    switch (passive_bending_curvature_method)
+    {
+    case PassiveBendingCurvatureMethod::TANGENT_ANGLE:
+        return compute_body_midline_curvature_tangent_angle(samples);
+    case PassiveBendingCurvatureMethod::LOCAL_POLY:
+        return compute_body_midline_curvature_local_poly(samples);
+    }
+    return compute_body_midline_curvature_local_poly(samples);
+}
+
 double interpolate_station_scalar(const std::vector<double>& s_values,
                                   const std::vector<double>& values,
                                   const double s_query)
@@ -4527,186 +3670,1062 @@ double interpolate_station_scalar(const std::vector<double>& s_values,
 }
 
 static void
-update_eb_bending_system(Pointer<IBFEMethod>  ib_method_ops,
-                         MeshBase&            mesh,
-                         EquationSystems*     equation_systems,
-                         const double         loop_time,
-                         const double         x_cm,
-                         const double         y_cm)
+smooth_station_scalar_field(std::vector<double>& values, const int passes)
 {
-    if (!use_eb_passive_bending || !equation_systems) return;
-    if (std::isfinite(s_eb_prev_time) &&
-        std::abs(loop_time - s_eb_prev_time) <= 1.0e-14)
+    const int n = static_cast<int>(values.size());
+    if (n < 3 || passes <= 0) return;
+
+    std::vector<double> tmp(values.size(), 0.0);
+    for (int pass = 0; pass < passes; ++pass)
     {
-        return;
-    }
-
-    const int n = std::max(s_eb_bending_stations, 3);
-    std::vector<MidlineSample> samples;
-    double theta_body = 0.0;
-    compute_current_midline_samples(ib_method_ops, mesh, equation_systems,
-                                    n, x_cm, y_cm, samples, theta_body);
-    std::vector<double> kappa = compute_body_midline_curvature(samples);
-    for (double& value : kappa)
-        if (!std::isfinite(value)) value = 0.0;
-
-    // Store the natural (reference) curvature on the first call so that the
-    // EB bending moment is M = I_e*(E_m*(κ - κ_ref) + η_m*κ̇).
-    // Without this, a blunt-tail cap (κ_ref ≠ 0) generates a large spurious
-    // restoring moment from t=0 that inverts the mesh within a few steps.
-    if (!s_eb_kappa_ref_built)
-    {
-        s_eb_kappa_ref       = kappa;   // kappa_ref = initial geometry
-        s_eb_kappa_ref_built = true;
-        pout << "[eb_bending] reference curvature stored: "
-             << kappa.size() << " stations, max|kappa_ref|="
-             << *std::max_element(kappa.begin(), kappa.end(),
-                    [](double a, double b){ return std::abs(a) < std::abs(b); })
-             << "\n";
-    }
-
-    // Relative curvature stored in the FE system (= 0 at the natural state)
-    std::vector<double> kappa_rel(kappa.size(), 0.0);
-    for (std::size_t k = 0; k < kappa.size(); ++k)
-        kappa_rel[k] = kappa[k]
-            - (k < s_eb_kappa_ref.size() ? s_eb_kappa_ref[k] : 0.0);
-
-    std::vector<double> station_s(samples.size(), 0.0);
-    for (std::size_t k = 0; k < samples.size(); ++k) station_s[k] = samples[k].s;
-
-    // kappa_dot = d(kappa)/dt = d(kappa_rel)/dt  (kappa_ref is constant)
-    std::vector<double> kappa_dot(kappa.size(), 0.0);
-    const double dt_eff = std::isfinite(s_eb_prev_time) ?
-        loop_time - s_eb_prev_time : std::numeric_limits<double>::quiet_NaN();
-    if (std::isfinite(dt_eff) && dt_eff > 1.0e-12 &&
-        s_eb_prev_kappa.size() == kappa.size())
-    {
-        for (std::size_t k = 0; k < kappa.size(); ++k)
-            kappa_dot[k] = (kappa[k] - s_eb_prev_kappa[k]) / dt_eff;
-    }
-
-    ExplicitSystem& eb_sys =
-        equation_systems->get_system<ExplicitSystem>(EB_BENDING_SYSTEM_NAME);
-    NumericVector<double>* eb_vec = eb_sys.solution.get();
-    const DofMap& dof_map = eb_sys.get_dof_map();
-    std::vector<dof_id_type> dof_indices;
-
-    for (auto node_it = mesh.local_nodes_begin(); node_it != mesh.local_nodes_end(); ++node_it)
-    {
-        const Node& node = **node_it;
-        double s_node = 0.0;
-        bool have_s = false;
-        if (use_laplace_reference_parameterization && ref_laplace_parameterization_built)
+        tmp = values;
+        values.front() = 0.75 * tmp.front() + 0.25 * tmp[1];
+        for (int i = 1; i + 1 < n; ++i)
         {
-            const auto it = ref_laplace_node_geom.find(node.id());
-            if (it != ref_laplace_node_geom.end())
-            {
-                s_node = it->second.s;
-                have_s = true;
-            }
+            values[static_cast<std::size_t>(i)] =
+                0.25 * tmp[static_cast<std::size_t>(i - 1)] +
+                0.50 * tmp[static_cast<std::size_t>(i)] +
+                0.25 * tmp[static_cast<std::size_t>(i + 1)];
         }
-        if (!have_s)
-        {
-            if (use_laplace_reference_parameterization && !allow_centerline_fallback)
-            {
-                TBOX_ERROR("update_eb_bending_system(): missing Laplace reference geometry "
-                           << "for node " << node.id()
-                           << " and ALLOW_CENTERLINE_FALLBACK is FALSE.\n");
-            }
-            const ProjectionResult proj = project_to_reference_centerline(
-                libMesh::Point(node(0), node(1), node(2)));
-            if (!proj.valid) continue;
-            s_node = proj.s;
-        }
-        s_node = std::max(0.0, std::min(s_node, ref_arc_length));
-
-        dof_map.dof_indices(&node, dof_indices, EB_BENDING_KAPPA);
-        eb_vec->set(dof_indices[0],
-                    interpolate_station_scalar(station_s, kappa_rel, s_node));
-        dof_map.dof_indices(&node, dof_indices, EB_BENDING_KAPPA_DOT);
-        eb_vec->set(dof_indices[0],
-                    interpolate_station_scalar(station_s, kappa_dot, s_node));
+        values.back() = 0.25 * tmp[static_cast<std::size_t>(n - 2)] +
+                        0.75 * tmp.back();
     }
-
-    eb_vec->close();
-    eb_sys.update();
-
-    s_eb_station_s  = station_s;
-    s_eb_prev_kappa = kappa;        // store absolute kappa for next kappa_dot computation
-    s_eb_prev_time  = loop_time;
 }
 
 static void
-write_geometry_sign_diagnostics()
+cap_station_scalar_field(std::vector<double>& values, const double cap_abs)
 {
-    if (IBTK_MPI::getRank() != 0) return;
-
-    std::ofstream out("geometry_sign_diag.csv");
-    if (!out.is_open())
+    if (!(cap_abs > 0.0) || !std::isfinite(cap_abs)) return;
+    for (double& value : values)
     {
-        TBOX_WARNING("write_geometry_sign_diagnostics(): cannot open geometry_sign_diag.csv\n");
+        if (!std::isfinite(value))
+        {
+            value = 0.0;
+            continue;
+        }
+        value = std::max(-cap_abs, std::min(cap_abs, value));
+    }
+}
+
+static std::vector<double>
+compute_reference_midline_curvature_at_s(const std::vector<double>& s_values)
+{
+    std::vector<MidlineSample> ref_samples(s_values.size());
+    for (std::size_t k = 0; k < s_values.size(); ++k)
+    {
+        const ReferenceFrame frame = reference_frame_at_s(s_values[k]);
+        MidlineSample& sample = ref_samples[k];
+        sample.s = s_values[k];
+        sample.s_norm = clamp01(s_values[k] / std::max(ref_arc_length, 1.0e-12));
+        sample.ref = frame;
+        sample.x_body = frame.X(0);
+        sample.y_body = frame.X(1);
+    }
+
+    std::vector<double> kappa_ref = compute_body_midline_curvature(ref_samples);
+    for (double& value : kappa_ref)
+    {
+        if (!std::isfinite(value)) value = 0.0;
+    }
+    smooth_station_scalar_field(kappa_ref,
+                                passive_bending_curvature_smooth_passes);
+    return kappa_ref;
+}
+
+inline int strict_eb_station_count()
+{
+    if (strict_eb_force_stations > 0) return std::max(3, strict_eb_force_stations);
+    return std::max(3, reference_profile_bins);
+}
+
+inline double strict_eb_B_max()
+{
+    return std::max(passive_bending_B_body,
+                    std::max(passive_bending_B_peduncle,
+                             passive_bending_B_caudal));
+}
+
+static double
+estimate_strict_eb_dt()
+{
+    if (!use_physical_bending)
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    const double B_max = strict_eb_B_max();
+    const int n = strict_eb_station_count();
+    const double ds_min = std::max(ref_arc_length, 1.0e-12) /
+                          static_cast<double>(std::max(n - 1, 1));
+    const double rho_A =
+        fluid_density * M_PI * ref_h_max * ref_h_max / 4.0;
+    const double dt_eb = (B_max > 0.0 && rho_A > 0.0) ?
+        0.5 * ds_min * ds_min * std::sqrt(rho_A / B_max) :
+        std::numeric_limits<double>::quiet_NaN();
+    return (std::isfinite(dt_eb) && dt_eb > 0.0) ?
+        dt_eb : std::numeric_limits<double>::quiet_NaN();
+}
+
+static double
+strict_eb_dt_limit()
+{
+    double dt_limit = std::numeric_limits<double>::infinity();
+    if (strict_eb_dt_control_enable && strict_eb_dt_safety_factor > 0.0)
+    {
+        const double dt_eb = estimate_strict_eb_dt();
+        if (std::isfinite(dt_eb) && dt_eb > 0.0)
+        {
+            dt_limit = std::min(dt_limit,
+                                strict_eb_dt_safety_factor * dt_eb);
+        }
+    }
+    if (strict_eb_dt_max > 0.0 && std::isfinite(strict_eb_dt_max))
+    {
+        dt_limit = std::min(dt_limit, strict_eb_dt_max);
+    }
+    return std::isfinite(dt_limit) ?
+        dt_limit : std::numeric_limits<double>::quiet_NaN();
+}
+
+static double
+apply_strict_eb_dt_control(const double dt_requested)
+{
+    if (!(dt_requested > 0.0) || !std::isfinite(dt_requested))
+    {
+        return dt_requested;
+    }
+
+    const double dt_limit = strict_eb_dt_limit();
+    if (std::isfinite(dt_limit) && dt_limit > 0.0)
+    {
+        return std::min(dt_requested, dt_limit);
+    }
+    return dt_requested;
+}
+
+inline double wrap_angle_difference(double dtheta)
+{
+    while (dtheta > M_PI) dtheta -= 2.0 * M_PI;
+    while (dtheta < -M_PI) dtheta += 2.0 * M_PI;
+    return dtheta;
+}
+
+inline double stable_log_cosh(const double x)
+{
+    const double ax = std::abs(x);
+    if (ax < 20.0) return std::log(std::cosh(x));
+    return ax - std::log(2.0);
+}
+
+static void
+strict_eb_station_hat_weights(const double s_query,
+                              const std::vector<double>& s_values,
+                              std::vector<std::pair<int, double> >& weights)
+{
+    weights.clear();
+    const int n = static_cast<int>(s_values.size());
+    if (n <= 0) return;
+    if (n == 1)
+    {
+        weights.push_back(std::make_pair(0, 1.0));
         return;
     }
 
-    const int n = 41;
     const double Lref = std::max(ref_arc_length, 1.0e-12);
-    const double eps = 1.0e-4 * Lref;
-    std::vector<MidlineSample> samples(static_cast<std::size_t>(n));
-
-    for (int k = 0; k < n; ++k)
+    const double xi = clamp01(s_query / Lref) * static_cast<double>(n - 1);
+    const int i0 = std::min(n - 1, std::max(0, static_cast<int>(std::floor(xi))));
+    const int i1 = std::min(n - 1, i0 + 1);
+    const double a = std::min(1.0, std::max(0.0, xi - static_cast<double>(i0)));
+    if (i0 == i1)
     {
-        const double s_norm = (n > 1) ?
-            static_cast<double>(k) / static_cast<double>(n - 1) : 0.0;
-        const double s = s_norm * Lref;
-        const ReferenceFrame frame = reference_frame_at_s(s);
-        const double eta_test = eps * std::sin(2.0 * M_PI * s_norm);
+        weights.push_back(std::make_pair(i0, 1.0));
+    }
+    else
+    {
+        weights.push_back(std::make_pair(i0, 1.0 - a));
+        weights.push_back(std::make_pair(i1, a));
+    }
+}
 
-        MidlineSample& sample = samples[static_cast<std::size_t>(k)];
-        sample.s = s;
-        sample.s_norm = s_norm;
-        sample.ref = frame;
-        sample.x_body = frame.X(0) - s_reference_xcom + eta_test * frame.n_hat(0);
-        sample.y_body = frame.X(1) - s_reference_ycom + eta_test * frame.n_hat(1);
-        sample.h = eta_test;
+static std::vector<double>
+compute_turning_angle_curvature(const std::vector<libMesh::Point>& X,
+                                const std::vector<double>&         s_values)
+{
+    const int n = static_cast<int>(X.size());
+    std::vector<double> kappa(static_cast<std::size_t>(n), 0.0);
+    if (n < 3 || s_values.size() != X.size()) return kappa;
+
+    std::vector<double> theta(static_cast<std::size_t>(n - 1), 0.0);
+    for (int i = 0; i + 1 < n; ++i)
+    {
+        const double dx = X[static_cast<std::size_t>(i + 1)](0) -
+                          X[static_cast<std::size_t>(i)](0);
+        const double dy = X[static_cast<std::size_t>(i + 1)](1) -
+                          X[static_cast<std::size_t>(i)](1);
+        theta[static_cast<std::size_t>(i)] = std::atan2(dy, dx);
     }
 
-    const std::vector<double> kappa = compute_body_midline_curvature(samples);
+    for (int i = 1; i + 1 < n; ++i)
+    {
+        const double ds =
+            std::max(s_values[static_cast<std::size_t>(i + 1)] -
+                     s_values[static_cast<std::size_t>(i - 1)], 1.0e-12);
+        const double dtheta = wrap_angle_difference(
+            theta[static_cast<std::size_t>(i)] -
+            theta[static_cast<std::size_t>(i - 1)]);
+        kappa[static_cast<std::size_t>(i)] = 2.0 * dtheta / ds;
+    }
+    kappa.front() = kappa[1];
+    kappa.back() = kappa[static_cast<std::size_t>(n - 2)];
+    return kappa;
+}
 
-    out << "s_norm,x_ref,y_ref,t_x,t_y,n_x,n_y,t_cross_n"
-        << ",eta_test,eta_second_derivative,kappa_synthetic"
-        << ",kappa_over_eta_second\n";
+static std::vector<double>
+compute_strict_eb_reference_curvature(const std::vector<double>& s_values)
+{
+    std::vector<libMesh::Point> X_ref(s_values.size());
+    for (std::size_t i = 0; i < s_values.size(); ++i)
+    {
+        X_ref[i] = reference_frame_at_s(s_values[i]).X;
+    }
+    return compute_turning_angle_curvature(X_ref, s_values);
+}
+
+enum StrictEBPotentialComponent
+{
+    STRICT_EB_POTENTIAL_PHYS_BENDING = 0,
+    STRICT_EB_POTENTIAL_ACTIVE = 1,
+    STRICT_EB_POTENTIAL_TOTAL = 2
+};
+
+static double
+strict_eb_discrete_potential_component(
+    const std::vector<libMesh::Point>& X,
+    const double                       time,
+    const StrictEBPotentialComponent   component)
+{
+    const int n = static_cast<int>(X.size());
+    if (n < 3 ||
+        s_strict_eb_s.size() != X.size() ||
+        s_strict_eb_kappa_ref.size() != X.size() ||
+        s_strict_eb_kappa_dot.size() != X.size())
+    {
+        return 0.0;
+    }
+
+    const std::vector<double> kappa =
+        compute_turning_angle_curvature(X, s_strict_eb_s);
+    const double Lref = std::max(ref_arc_length, 1.0e-12);
+    double Pi = 0.0;
+    for (int i = 1; i + 1 < n; ++i)
+    {
+        const std::size_t j = static_cast<std::size_t>(i);
+        const double s = std::max(0.0, std::min(s_strict_eb_s[j], Lref));
+        const double s_norm = clamp01(s / Lref);
+        const double ds_w =
+            0.5 * std::max(s_strict_eb_s[static_cast<std::size_t>(i + 1)] -
+                           s_strict_eb_s[static_cast<std::size_t>(i - 1)],
+                           1.0e-12);
+        const double B = use_physical_bending ?
+            get_passive_bending_B_local(s_norm) : 0.0;
+        const double D = use_physical_bending ?
+            get_passive_bending_D_local(s_norm) : 0.0;
+        const double k_rel = kappa[j] - s_strict_eb_kappa_ref[j];
+        const double k_dot = s_strict_eb_kappa_dot[j];
+        const double M_res_raw = B * k_rel + D * k_dot;
+        double passive_density = 0.5 * B * k_rel * k_rel + D * k_dot * kappa[j];
+        if (passive_bending_moment_cap > 0.0 &&
+            std::isfinite(passive_bending_moment_cap))
+        {
+            const double cap = passive_bending_moment_cap;
+            if (B > 1.0e-30)
+            {
+                passive_density =
+                    cap * cap / B * stable_log_cosh(M_res_raw / cap);
+            }
+            else
+            {
+                passive_density =
+                    cap * std::tanh(M_res_raw / cap) * kappa[j];
+            }
+        }
+
+        const double h = body_halfthick_from_s(s);
+        const double M_active =
+            active_moment_value_from_sample(s, s_norm, h, time);
+        double density = 0.0;
+        if (component == STRICT_EB_POTENTIAL_PHYS_BENDING ||
+            component == STRICT_EB_POTENTIAL_TOTAL)
+        {
+            density += passive_density;
+        }
+        if (component == STRICT_EB_POTENTIAL_ACTIVE ||
+            component == STRICT_EB_POTENTIAL_TOTAL)
+        {
+            density -= M_active * kappa[j];
+        }
+        Pi += density * ds_w;
+    }
+    return Pi;
+}
+
+static void
+compute_strict_eb_station_force_component_for_time(
+    std::vector<VectorValue<double> >& force,
+    const double                       time,
+    const StrictEBPotentialComponent   component)
+{
+    const int n = static_cast<int>(s_strict_eb_X.size());
+    force.assign(static_cast<std::size_t>(std::max(n, 0)),
+                 VectorValue<double>(0.0, 0.0));
+    if (n < 3) return;
+
+    const double Lref = std::max(ref_arc_length, 1.0e-12);
+    const double eps = std::max(strict_eb_fd_epsilon, 1.0e-12);
+    std::vector<libMesh::Point> X_plus = s_strict_eb_X;
+    std::vector<libMesh::Point> X_minus = s_strict_eb_X;
+
+    for (int i = 0; i < n; ++i)
+    {
+        for (unsigned int d = 0; d < NDIM; ++d)
+        {
+            const std::size_t j = static_cast<std::size_t>(i);
+            const double x_scale =
+                std::max(std::max(std::abs(s_strict_eb_X[j](d)), Lref), 1.0);
+            const double h = eps * x_scale;
+            X_plus[j](d) += h;
+            X_minus[j](d) -= h;
+            const double Pi_plus =
+                strict_eb_discrete_potential_component(X_plus, time, component);
+            const double Pi_minus =
+                strict_eb_discrete_potential_component(X_minus, time, component);
+            force[j](d) = -(Pi_plus - Pi_minus) / (2.0 * h);
+            X_plus[j](d) = s_strict_eb_X[j](d);
+            X_minus[j](d) = s_strict_eb_X[j](d);
+        }
+    }
+
+    // Remove roundoff-level rigid translation residual from the internal beam
+    // load. The variational load is invariant to translations analytically.
+    VectorValue<double> F_sum(0.0, 0.0);
+    for (const VectorValue<double>& f : force) F_sum += f;
+    const VectorValue<double> F_mean = F_sum / static_cast<double>(n);
+    for (VectorValue<double>& f : force) f -= F_mean;
+}
+
+static void
+compute_strict_eb_station_forces_for_time(const double time)
+{
+    compute_strict_eb_station_force_component_for_time(
+        s_strict_eb_force_phys_bending, time,
+        STRICT_EB_POTENTIAL_PHYS_BENDING);
+    compute_strict_eb_station_force_component_for_time(
+        s_strict_eb_force_active, time,
+        STRICT_EB_POTENTIAL_ACTIVE);
+
+    const int n = static_cast<int>(s_strict_eb_X.size());
+    s_strict_eb_force.assign(static_cast<std::size_t>(std::max(n, 0)),
+                             VectorValue<double>(0.0, 0.0));
+    for (int i = 0; i < n; ++i)
+    {
+        const std::size_t j = static_cast<std::size_t>(i);
+        if (j < s_strict_eb_force_phys_bending.size())
+            s_strict_eb_force[j] += s_strict_eb_force_phys_bending[j];
+        if (j < s_strict_eb_force_active.size())
+            s_strict_eb_force[j] += s_strict_eb_force_active[j];
+    }
+
+    s_strict_eb_force_eval_time = time;
+}
+
+static VectorValue<double>
+strict_eb_body_force_density_from_station_force(
+    const double                              s,
+    const std::vector<VectorValue<double> >& station_force)
+{
+    VectorValue<double> F(0.0, 0.0);
+    if (s_strict_eb_s.empty() ||
+        s_strict_eb_station_area.size() != s_strict_eb_s.size())
+    {
+        return F;
+    }
+
+    std::vector<std::pair<int, double> > hat_weights;
+    strict_eb_station_hat_weights(s, s_strict_eb_s, hat_weights);
+    for (const std::pair<int, double>& entry : hat_weights)
+    {
+        const int i = entry.first;
+        if (i < 0 || i >= static_cast<int>(station_force.size())) continue;
+        const std::size_t j = static_cast<std::size_t>(i);
+        const double area = s_strict_eb_station_area[j];
+        if (!(area > strict_eb_min_station_area)) continue;
+        F += (entry.second / area) * station_force[j];
+    }
+    return F;
+}
+
+static void
+update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
+                             MeshBase&            mesh,
+                             EquationSystems*     equation_systems,
+                             const double         loop_time)
+{
+    if (!equation_systems)
+    {
+        s_strict_eb_force_cache_ready = false;
+        return;
+    }
+
+    const int n = strict_eb_station_count();
+    const double Lref = std::max(ref_arc_length, 1.0e-12);
+    s_strict_eb_s.assign(static_cast<std::size_t>(n), 0.0);
+    for (int i = 0; i < n; ++i)
+    {
+        s_strict_eb_s[static_cast<std::size_t>(i)] =
+            (n > 1 ? Lref * static_cast<double>(i) /
+                         static_cast<double>(n - 1) : 0.0);
+    }
+
+    std::vector<double> station_area(static_cast<std::size_t>(n), 0.0);
+    std::vector<double> station_x(static_cast<std::size_t>(n), 0.0);
+    std::vector<double> station_y(static_cast<std::size_t>(n), 0.0);
+
+    System& X_sys = equation_systems->get_system(
+        ib_method_ops->getCurrentCoordinatesSystemName());
+    NumericVector<double>* X_vec = X_sys.solution.get();
+    NumericVector<double>* X_ghost_vec = X_sys.current_local_solution.get();
+    X_vec->close();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+
+    System& ref_geom_sys = equation_systems->get_system(REF_GEOM_SYSTEM_NAME);
+    NumericVector<double>* ref_geom_vec = ref_geom_sys.solution.get();
+    NumericVector<double>* ref_geom_ghost_vec =
+        ref_geom_sys.current_local_solution.get();
+    ref_geom_vec->close();
+    copy_and_synch(*ref_geom_vec, *ref_geom_ghost_vec);
+
+    const unsigned int dim = mesh.mesh_dimension();
+    const DofMap& X_dof_map = X_sys.get_dof_map();
+    const DofMap& ref_geom_dof_map = ref_geom_sys.get_dof_map();
+    const FEType fe_type = X_dof_map.variable_type(0);
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
+    std::unique_ptr<QBase> qrule(new QGauss(dim, FIFTH));
+    fe->attach_quadrature_rule(qrule.get());
+
+    const std::vector<double>& JxW = fe->get_JxW();
+    const std::vector<std::vector<double> >& phi = fe->get_phi();
+    const std::vector<std::vector<RealGradient> >& dphi = fe->get_dphi();
+    std::vector<std::vector<unsigned int> > X_dof_indices(NDIM);
+    std::vector<std::vector<unsigned int> > ref_geom_dof_indices(REF_GEOM_N_VARS);
+    boost::multi_array<double, 2> X_node;
+    std::vector<std::pair<int, double> > hat_weights;
+
+    for (auto el_it = mesh.active_local_elements_begin();
+         el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        if (!elem) continue;
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d)
+            X_dof_map.dof_indices(elem, X_dof_indices[d], d);
+        for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
+            ref_geom_dof_map.dof_indices(elem, ref_geom_dof_indices[v], v);
+        get_values_for_interpolation(X_node, *X_ghost_vec, X_dof_indices);
+
+        const unsigned int n_nodes = elem->n_nodes();
+        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
+        {
+            VectorValue<double> x_qp(0.0, 0.0);
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                x_qp(0) += phi[k][qp] * X_node[k][0];
+                x_qp(1) += phi[k][qp] * X_node[k][1];
+            }
+
+            double s_qp = 0.0;
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                s_qp += phi[k][qp] *
+                    (*ref_geom_ghost_vec)(ref_geom_dof_indices[REF_GEOM_S][k]);
+            }
+            s_qp = std::max(0.0, std::min(s_qp, Lref));
+            strict_eb_station_hat_weights(s_qp, s_strict_eb_s, hat_weights);
+
+            for (const std::pair<int, double>& entry : hat_weights)
+            {
+                const int i = entry.first;
+                const double w = entry.second;
+                if (i < 0 || i >= n || w <= 0.0) continue;
+                const std::size_t j = static_cast<std::size_t>(i);
+                const double dA = w * JxW[qp];
+                station_area[j] += dA;
+                station_x[j] += dA * x_qp(0);
+                station_y[j] += dA * x_qp(1);
+            }
+        }
+    }
+
+    std::vector<double> reduced;
+    reduced.reserve(static_cast<std::size_t>(3 * n));
+    for (int i = 0; i < n; ++i)
+    {
+        const std::size_t j = static_cast<std::size_t>(i);
+        reduced.push_back(station_area[j]);
+        reduced.push_back(station_x[j]);
+        reduced.push_back(station_y[j]);
+    }
+    IBTK_MPI::sumReduction(reduced.data(), static_cast<int>(reduced.size()));
+
+    s_strict_eb_station_area.assign(static_cast<std::size_t>(n), 0.0);
+    s_strict_eb_X.assign(static_cast<std::size_t>(n), libMesh::Point());
+    std::size_t r = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const std::size_t j = static_cast<std::size_t>(i);
+        const double area = reduced[r++];
+        const double x_sum = reduced[r++];
+        const double y_sum = reduced[r++];
+        s_strict_eb_station_area[j] = area;
+        if (area > strict_eb_min_station_area)
+        {
+            s_strict_eb_X[j] = libMesh::Point(x_sum / area, y_sum / area);
+        }
+        else
+        {
+            s_strict_eb_X[j] = reference_frame_at_s(s_strict_eb_s[j]).X;
+        }
+    }
+
+    s_strict_eb_kappa =
+        compute_turning_angle_curvature(s_strict_eb_X, s_strict_eb_s);
+    for (double& value : s_strict_eb_kappa)
+        if (!std::isfinite(value)) value = 0.0;
+
+    // Seed kappa_ref once from the RAW (pre-smoothing) backbone curvature on
+    // the very first call.  The potential function always evaluates kappa via
+    // raw compute_turning_angle_curvature(), so the reference must also be raw
+    // to guarantee k_rel = 0 at t = 0 regardless of mesh irregularity near the
+    // head / tail (non-uniform triangulation creates spurious apparent curvature
+    // in the area-weighted backbone).  The reference is then frozen: all
+    // subsequent updates measure departure from this initial mesh state, which
+    // is the physically correct stress-free configuration.
+    if (!s_strict_eb_kappa_ref_from_mesh)
+    {
+        s_strict_eb_kappa_ref = s_strict_eb_kappa;   // raw kappa, before smooth/cap
+        s_strict_eb_kappa_ref_from_mesh = true;
+    }
+
+    smooth_station_scalar_field(s_strict_eb_kappa,
+                                passive_bending_curvature_smooth_passes);
+    cap_station_scalar_field(s_strict_eb_kappa, passive_bending_curvature_cap);
+
+    s_strict_eb_kappa_dot.assign(s_strict_eb_kappa.size(), 0.0);
+    const double dt_eff = std::isfinite(s_strict_eb_prev_time) ?
+        loop_time - s_strict_eb_prev_time : std::numeric_limits<double>::quiet_NaN();
+    if (std::isfinite(dt_eff) && dt_eff > 1.0e-12 &&
+        s_strict_eb_prev_kappa.size() == s_strict_eb_kappa.size() &&
+        s_strict_eb_prev_s.size() == s_strict_eb_s.size())
+    {
+        for (std::size_t i = 0; i < s_strict_eb_kappa.size(); ++i)
+        {
+            const double kappa_prev =
+                interpolate_station_scalar(s_strict_eb_prev_s,
+                                           s_strict_eb_prev_kappa,
+                                           s_strict_eb_s[i]);
+            s_strict_eb_kappa_dot[i] =
+                (s_strict_eb_kappa[i] - kappa_prev) / dt_eff;
+        }
+        smooth_station_scalar_field(s_strict_eb_kappa_dot,
+                                    passive_bending_curvature_smooth_passes);
+        cap_station_scalar_field(s_strict_eb_kappa_dot,
+                                 passive_bending_kappa_dot_cap);
+    }
+
+    s_strict_eb_prev_s = s_strict_eb_s;
+    s_strict_eb_prev_kappa = s_strict_eb_kappa;
+    s_strict_eb_prev_time = loop_time;
+    s_strict_eb_force_cache_time = loop_time;
+    s_strict_eb_force_cache_ready = true;
+    compute_strict_eb_station_forces_for_time(loop_time);
+}
+
+void strict_eb_variational_body_force_function(
+    VectorValue<double>& F,
+    const TensorValue<double>&,
+    const libMesh::Point&,
+    const libMesh::Point&,
+    Elem* const,
+    const std::vector<const std::vector<double>*>& system_var_data,
+    const std::vector<const std::vector<VectorValue<double> >*>&,
+    double data_time,
+    void*)
+{
+    F = 0.0;
+    if (!s_strict_eb_force_cache_ready ||
+        s_strict_eb_s.empty() ||
+        s_strict_eb_station_area.size() != s_strict_eb_s.size())
+    {
+        return;
+    }
+
+    if (!std::isfinite(s_strict_eb_force_eval_time) ||
+        std::abs(data_time - s_strict_eb_force_eval_time) >
+            1.0e-12 * std::max(1.0, std::abs(data_time)))
+    {
+        compute_strict_eb_station_forces_for_time(data_time);
+    }
+
+    const ReferenceGeometrySample ref_geom =
+        reference_geometry_from_system_data(system_var_data);
+    F = strict_eb_body_force_density_from_station_force(ref_geom.s,
+                                                        s_strict_eb_force);
+}
+
+// =========================================================================
+// Force decomposition diagnostic
+// =========================================================================
+struct ForceDecompAccumulator
+{
+    double Fx = 0.0;
+    double Fy = 0.0;
+    double L1 = 0.0;
+    double abs_x = 0.0;
+    double abs_y = 0.0;
+    double P = 0.0;
+    double P_abs = 0.0;
+    double P_weak = 0.0;
+    double P_weak_abs = 0.0;
+};
+
+enum ForceDecompComponent
+{
+    FORCE_REG_DEV = 0,
+    FORCE_REG_DIL = 1,
+    FORCE_PHYS_BENDING = 2,
+    FORCE_ACTIVE = 3,
+    FORCE_DAMPING = 4,
+    FORCE_SUM = 5,
+    FORCE_N_COMPONENTS = 6
+};
+
+inline const char*
+force_decomp_component_name(const int c)
+{
+    switch (c)
+    {
+    case FORCE_REG_DEV:      return "reg_dev";
+    case FORCE_REG_DIL:      return "reg_dil";
+    case FORCE_PHYS_BENDING: return "phys_bending";
+    case FORCE_ACTIVE:       return "active";
+    case FORCE_DAMPING:      return "cont_damping";
+    case FORCE_SUM:          return "sum";
+    default:                 return "unknown";
+    }
+}
+
+struct StrictEBForceCacheSnapshot
+{
+    bool ready = false;
+    double cache_time = std::numeric_limits<double>::quiet_NaN();
+    double eval_time = std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> s;
+    std::vector<double> station_area;
+    std::vector<libMesh::Point> X;
+    std::vector<VectorValue<double> > force;
+    std::vector<VectorValue<double> > force_phys_bending;
+    std::vector<VectorValue<double> > force_active;
+    std::vector<double> kappa;
+    std::vector<double> kappa_ref;
+    std::vector<double> kappa_dot;
+    std::vector<double> prev_kappa;
+    std::vector<double> prev_s;
+    double prev_time = std::numeric_limits<double>::quiet_NaN();
+    bool kappa_ref_from_mesh = false;
+};
+
+static StrictEBForceCacheSnapshot
+save_strict_eb_force_cache()
+{
+    StrictEBForceCacheSnapshot snapshot;
+    snapshot.ready = s_strict_eb_force_cache_ready;
+    snapshot.cache_time = s_strict_eb_force_cache_time;
+    snapshot.eval_time = s_strict_eb_force_eval_time;
+    snapshot.s = s_strict_eb_s;
+    snapshot.station_area = s_strict_eb_station_area;
+    snapshot.X = s_strict_eb_X;
+    snapshot.force = s_strict_eb_force;
+    snapshot.force_phys_bending = s_strict_eb_force_phys_bending;
+    snapshot.force_active = s_strict_eb_force_active;
+    snapshot.kappa = s_strict_eb_kappa;
+    snapshot.kappa_ref = s_strict_eb_kappa_ref;
+    snapshot.kappa_dot = s_strict_eb_kappa_dot;
+    snapshot.prev_kappa = s_strict_eb_prev_kappa;
+    snapshot.prev_s = s_strict_eb_prev_s;
+    snapshot.prev_time = s_strict_eb_prev_time;
+    snapshot.kappa_ref_from_mesh = s_strict_eb_kappa_ref_from_mesh;
+    return snapshot;
+}
+
+static void
+restore_strict_eb_force_cache(const StrictEBForceCacheSnapshot& snapshot)
+{
+    s_strict_eb_force_cache_ready = snapshot.ready;
+    s_strict_eb_force_cache_time = snapshot.cache_time;
+    s_strict_eb_force_eval_time = snapshot.eval_time;
+    s_strict_eb_s = snapshot.s;
+    s_strict_eb_station_area = snapshot.station_area;
+    s_strict_eb_X = snapshot.X;
+    s_strict_eb_force = snapshot.force;
+    s_strict_eb_force_phys_bending = snapshot.force_phys_bending;
+    s_strict_eb_force_active = snapshot.force_active;
+    s_strict_eb_kappa = snapshot.kappa;
+    s_strict_eb_kappa_ref = snapshot.kappa_ref;
+    s_strict_eb_kappa_dot = snapshot.kappa_dot;
+    s_strict_eb_prev_kappa = snapshot.prev_kappa;
+    s_strict_eb_prev_s = snapshot.prev_s;
+    s_strict_eb_prev_time = snapshot.prev_time;
+    s_strict_eb_kappa_ref_from_mesh = snapshot.kappa_ref_from_mesh;
+}
+
+static void
+write_force_decomposition_diagnostics(const int            iteration_num,
+                                      const double         loop_time,
+                                      Pointer<IBFEMethod>  ib_method_ops,
+                                      MeshBase&            mesh,
+                                      EquationSystems*     equation_systems,
+                                      const double         x_cm,
+                                      const double         y_cm,
+                                      const double         vcm_x,
+                                      const double         vcm_y)
+{
+    if (!s_force_decomp_diag_enable) return;
+    if (s_force_decomp_diag_interval > 1 &&
+        (iteration_num % s_force_decomp_diag_interval != 0)) return;
+    if (!equation_systems) return;
+
+    const StrictEBForceCacheSnapshot strict_eb_snapshot =
+        save_strict_eb_force_cache();
+    update_strict_eb_force_cache(ib_method_ops, mesh, equation_systems,
+                                 loop_time);
+
+    const unsigned int dim = mesh.mesh_dimension();
+
+    System& X_sys = equation_systems->get_system(
+        ib_method_ops->getCurrentCoordinatesSystemName());
+    NumericVector<double>* X_vec = X_sys.solution.get();
+    NumericVector<double>* X_ghost_vec = X_sys.current_local_solution.get();
+    X_vec->close();
+    copy_and_synch(*X_vec, *X_ghost_vec);
+
+    System& U_sys = equation_systems->get_system(
+        ib_method_ops->getVelocitySystemName());
+    NumericVector<double>* U_vec = U_sys.solution.get();
+    NumericVector<double>* U_ghost_vec = U_sys.current_local_solution.get();
+    U_vec->close();
+    copy_and_synch(*U_vec, *U_ghost_vec);
+
+    System& ref_geom_sys = equation_systems->get_system(REF_GEOM_SYSTEM_NAME);
+    NumericVector<double>* ref_geom_vec = ref_geom_sys.solution.get();
+    NumericVector<double>* ref_geom_ghost_vec =
+        ref_geom_sys.current_local_solution.get();
+    ref_geom_vec->close();
+    copy_and_synch(*ref_geom_vec, *ref_geom_ghost_vec);
+
+    const DofMap& X_dof_map = X_sys.get_dof_map();
+    const DofMap& U_dof_map = U_sys.get_dof_map();
+    const DofMap& ref_geom_dof_map = ref_geom_sys.get_dof_map();
+    const FEType fe_type = X_dof_map.variable_type(0);
+    const libMesh::Order quad_order =
+        Utility::string_to_enum<libMesh::Order>(s_force_decomp_quad_order);
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
+    std::unique_ptr<QBase> qrule(new QGauss(dim, quad_order));
+    fe->attach_quadrature_rule(qrule.get());
+
+    const std::vector<double>& JxW = fe->get_JxW();
+    const std::vector<std::vector<double> >& phi = fe->get_phi();
+    const std::vector<std::vector<RealGradient> >& dphi = fe->get_dphi();
+    std::vector<std::vector<unsigned int> > X_dof_indices(NDIM);
+    std::vector<std::vector<unsigned int> > U_dof_indices(NDIM);
+    std::vector<std::vector<unsigned int> > ref_geom_dof_indices(REF_GEOM_N_VARS);
+    boost::multi_array<double, 2> X_node;
+    boost::multi_array<double, 2> U_node;
+    std::vector<ForceDecompAccumulator> acc(FORCE_N_COMPONENTS);
+
+    auto accumulate_power =
+        [&](const int c, const double p)
+        {
+            acc[c].P += p;
+            acc[c].P_abs += std::abs(p);
+            acc[FORCE_SUM].P += p;
+            acc[FORCE_SUM].P_abs += std::abs(p);
+        };
+
+    auto add_node_load =
+        [&](const int c,
+            const unsigned int k,
+            const VectorValue<double>& f,
+            std::vector<std::vector<VectorValue<double> > >& elem_loads)
+        {
+            elem_loads[c][k] += f;
+            elem_loads[FORCE_SUM][k] += f;
+        };
+
+    auto accumulate_stress_qp =
+        [&](const int c,
+            const TensorValue<double>& PP,
+            const TensorValue<double>& F_dot,
+            const double JxW_qp,
+            const unsigned int n_nodes,
+            const unsigned int qp,
+            std::vector<std::vector<VectorValue<double> > >& elem_loads)
+        {
+            double p = 0.0;
+            for (unsigned int i = 0; i < NDIM; ++i)
+                for (unsigned int j = 0; j < NDIM; ++j)
+                    p += PP(i, j) * F_dot(i, j);
+            accumulate_power(c, p * JxW_qp);
+
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                VectorValue<double> f_node(0.0, 0.0);
+                for (unsigned int i = 0; i < NDIM; ++i)
+                {
+                    double f_i = 0.0;
+                    for (unsigned int j = 0; j < NDIM; ++j)
+                        f_i -= PP(i, j) * dphi[k][qp](j) * JxW_qp;
+                    f_node(i) = f_i;
+                }
+                add_node_load(c, k, f_node, elem_loads);
+            }
+        };
+
+    auto accumulate_body_qp =
+        [&](const int c,
+            const VectorValue<double>& F_qp,
+            const VectorValue<double>& U_qp,
+            const double JxW_qp,
+            const unsigned int n_nodes,
+            const unsigned int qp,
+            std::vector<std::vector<VectorValue<double> > >& elem_loads)
+        {
+            accumulate_power(c, (F_qp * U_qp) * JxW_qp);
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                const VectorValue<double> f_node =
+                    (phi[k][qp] * JxW_qp) * F_qp;
+                add_node_load(c, k, f_node, elem_loads);
+            }
+        };
+
+    for (auto el_it = mesh.active_local_elements_begin();
+         el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        if (!elem) continue;
+
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d)
+        {
+            X_dof_map.dof_indices(elem, X_dof_indices[d], d);
+            U_dof_map.dof_indices(elem, U_dof_indices[d], d);
+        }
+        for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
+            ref_geom_dof_map.dof_indices(elem, ref_geom_dof_indices[v], v);
+        get_values_for_interpolation(X_node, *X_ghost_vec, X_dof_indices);
+        get_values_for_interpolation(U_node, *U_ghost_vec, U_dof_indices);
+
+        const unsigned int n_nodes = elem->n_nodes();
+        std::vector<std::vector<VectorValue<double> > > elem_loads(
+            FORCE_N_COMPONENTS);
+        for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
+            elem_loads[c].assign(n_nodes, VectorValue<double>(0.0, 0.0));
+
+        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
+        {
+            TensorValue<double> FF;
+            jacobian(FF, qp, X_node, dphi);
+
+            TensorValue<double> F_dot;
+            F_dot.zero();
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                for (unsigned int i = 0; i < NDIM; ++i)
+                {
+                    const double u_ki = U_node[k][i];
+                    for (unsigned int j = 0; j < NDIM; ++j)
+                        F_dot(i, j) += u_ki * dphi[k][qp](j);
+                }
+            }
+
+            VectorValue<double> U_qp(0.0, 0.0);
+            interpolate(U_qp, qp, U_node, phi);
+
+            libMesh::Point X_ref_qp(0.0, 0.0, 0.0);
+            double ref_geom_values[REF_GEOM_N_VARS] = { 0.0, 0.0, 0.0, 0.0 };
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                for (unsigned int d = 0; d < NDIM; ++d)
+                    X_ref_qp(d) += phi[k][qp] * elem->point(k)(d);
+                for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
+                    ref_geom_values[v] +=
+                        phi[k][qp] *
+                        (*ref_geom_ghost_vec)(ref_geom_dof_indices[v][k]);
+            }
+
+            ReferenceGeometrySample ref_geom;
+            ref_geom.s = std::max(0.0, std::min(ref_geom_values[REF_GEOM_S],
+                                                ref_arc_length));
+            ref_geom.eta = ref_geom_values[REF_GEOM_ETA];
+            const VectorValue<double> t_raw(ref_geom_values[REF_GEOM_T_X],
+                                            ref_geom_values[REF_GEOM_T_Y]);
+            const double t_norm = std::sqrt(std::max(t_raw * t_raw, 0.0));
+            if (t_norm <= 1.0e-14) continue;
+            ref_geom.t_hat = t_raw / t_norm;
+
+            TensorValue<double> PP_reg_dev(0.0), PP_reg_dil(0.0);
+            TensorValue<double> PP_damping(0.0);
+            compute_reg_dev_PK1_stress_impl(PP_reg_dev, FF, X_ref_qp);
+            compute_reg_dil_PK1_stress_impl(PP_reg_dil, FF, X_ref_qp);
+            compute_continuum_damping_PK1_stress_impl(PP_damping, FF,
+                                                      X_ref_qp, ref_geom,
+                                                      F_dot);
+
+            accumulate_stress_qp(FORCE_REG_DEV, PP_reg_dev, F_dot, JxW[qp],
+                                 n_nodes, qp, elem_loads);
+            accumulate_stress_qp(FORCE_REG_DIL, PP_reg_dil, F_dot, JxW[qp],
+                                 n_nodes, qp, elem_loads);
+            accumulate_stress_qp(FORCE_DAMPING, PP_damping, F_dot, JxW[qp],
+                                 n_nodes, qp, elem_loads);
+
+            const VectorValue<double> F_phys_bending =
+                strict_eb_body_force_density_from_station_force(
+                    ref_geom.s, s_strict_eb_force_phys_bending);
+            const VectorValue<double> F_active =
+                strict_eb_body_force_density_from_station_force(
+                    ref_geom.s, s_strict_eb_force_active);
+            accumulate_body_qp(FORCE_PHYS_BENDING, F_phys_bending, U_qp,
+                               JxW[qp], n_nodes, qp, elem_loads);
+            accumulate_body_qp(FORCE_ACTIVE, F_active, U_qp,
+                               JxW[qp], n_nodes, qp, elem_loads);
+        }
+
+        for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
+        {
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                const VectorValue<double>& f = elem_loads[c][k];
+                const VectorValue<double> u(U_node[k][0], U_node[k][1]);
+                const double p_weak = f * u;
+                acc[c].Fx += f(0);
+                acc[c].Fy += f(1);
+                acc[c].L1 += std::sqrt(std::max(f * f, 0.0));
+                acc[c].abs_x += std::abs(f(0));
+                acc[c].abs_y += std::abs(f(1));
+                acc[c].P_weak += p_weak;
+                acc[c].P_weak_abs += std::abs(p_weak);
+            }
+        }
+    }
+
+    std::vector<double> reduced;
+    reduced.reserve(FORCE_N_COMPONENTS * 9);
+    for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
+    {
+        reduced.push_back(acc[c].Fx);
+        reduced.push_back(acc[c].Fy);
+        reduced.push_back(acc[c].L1);
+        reduced.push_back(acc[c].abs_x);
+        reduced.push_back(acc[c].abs_y);
+        reduced.push_back(acc[c].P);
+        reduced.push_back(acc[c].P_abs);
+        reduced.push_back(acc[c].P_weak);
+        reduced.push_back(acc[c].P_weak_abs);
+    }
+    IBTK_MPI::sumReduction(reduced.data(), static_cast<int>(reduced.size()));
+
+    std::size_t r = 0;
+    for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
+    {
+        acc[c].Fx = reduced[r++];
+        acc[c].Fy = reduced[r++];
+        acc[c].L1 = reduced[r++];
+        acc[c].abs_x = reduced[r++];
+        acc[c].abs_y = reduced[r++];
+        acc[c].P = reduced[r++];
+        acc[c].P_abs = reduced[r++];
+        acc[c].P_weak = reduced[r++];
+        acc[c].P_weak_abs = reduced[r++];
+    }
+
+    const double dt_eff = std::isfinite(s_force_decomp_prev_time) ?
+        loop_time - s_force_decomp_prev_time :
+        std::numeric_limits<double>::quiet_NaN();
+    s_force_decomp_prev_time = loop_time;
+
+    double component_sum_x = 0.0;
+    double component_sum_y = 0.0;
+    for (int c = FORCE_REG_DEV; c <= FORCE_DAMPING; ++c)
+    {
+        component_sum_x += acc[c].Fx;
+        component_sum_y += acc[c].Fy;
+    }
+
+    restore_strict_eb_force_cache(strict_eb_snapshot);
+
+    if (IBTK_MPI::getRank() != 0) return;
+    static std::ofstream out;
+    if (!out.is_open())
+    {
+        out.open(s_force_decomp_diag_filename.c_str(), std::ios::out);
+        if (!out.is_open())
+        {
+            TBOX_WARNING("write_force_decomposition_diagnostics(): cannot open "
+                         << s_force_decomp_diag_filename << "\n");
+            return;
+        }
+        out << "step,time,dt_eff,x_cm,y_cm,vcm_x,vcm_y";
+        for (int c = FORCE_REG_DEV; c <= FORCE_SUM; ++c)
+        {
+            const char* name = force_decomp_component_name(c);
+            out << ",F_" << name << "_x"
+                << ",F_" << name << "_y"
+                << ",F_L1_" << name
+                << ",F_abs_x_" << name
+                << ",F_abs_y_" << name
+                << ",P_density_" << name
+                << ",P_density_abs_" << name
+                << ",P_weak_" << name
+                << ",P_weak_abs_" << name;
+        }
+        out << ",sum_check_error_x,sum_check_error_y\n";
+        out.flush();
+    }
+
     out.setf(std::ios::scientific);
     out.precision(10);
-    for (int k = 0; k < n; ++k)
+    out << iteration_num
+        << "," << loop_time
+        << "," << dt_eff
+        << "," << x_cm
+        << "," << y_cm
+        << "," << vcm_x
+        << "," << vcm_y;
+    for (int c = FORCE_REG_DEV; c <= FORCE_SUM; ++c)
     {
-        const MidlineSample& sample = samples[static_cast<std::size_t>(k)];
-        const double eta_test = sample.h;
-        const double eta_second =
-            -std::pow(2.0 * M_PI, 2.0) * eta_test / (Lref * Lref);
-        const double ratio =
-            (std::abs(eta_second) > 1.0e-30 && std::isfinite(kappa[static_cast<std::size_t>(k)])) ?
-            kappa[static_cast<std::size_t>(k)] / eta_second :
-            std::numeric_limits<double>::quiet_NaN();
-        const double t_cross_n =
-            sample.ref.t_hat(0) * sample.ref.n_hat(1) -
-            sample.ref.t_hat(1) * sample.ref.n_hat(0);
-        out << sample.s_norm
-            << "," << sample.ref.X(0)
-            << "," << sample.ref.X(1)
-            << "," << sample.ref.t_hat(0)
-            << "," << sample.ref.t_hat(1)
-            << "," << sample.ref.n_hat(0)
-            << "," << sample.ref.n_hat(1)
-            << "," << t_cross_n
-            << "," << eta_test
-            << "," << eta_second
-            << "," << kappa[static_cast<std::size_t>(k)]
-            << "," << ratio
-            << "\n";
+        out << "," << acc[c].Fx
+            << "," << acc[c].Fy
+            << "," << acc[c].L1
+            << "," << acc[c].abs_x
+            << "," << acc[c].abs_y
+            << "," << acc[c].P
+            << "," << acc[c].P_abs
+            << "," << acc[c].P_weak
+            << "," << acc[c].P_weak_abs;
     }
+    out << "," << (acc[FORCE_SUM].Fx - component_sum_x)
+        << "," << (acc[FORCE_SUM].Fy - component_sum_y)
+        << "\n";
     out.flush();
-    pout << "  geometry_sign_diag.csv written (expect t_cross_n ~= +1 and "
-         << "kappa/eta_second ~= +1 away from nodes where eta_second=0)\n";
 }
 
 inline double phase_from_fourier_coeffs(const double c, const double s)
@@ -4848,19 +4867,13 @@ write_curvature_phase_diagnostics(const int            iteration_num,
         s_curvature_phase_last_time = std::numeric_limits<double>::quiet_NaN();
         s_curvature_phase_positive_work_accum = 0.0;
         s_curvature_phase_signed_work_accum = 0.0;
-        s_curvature_phase_effective_positive_work_accum = 0.0;
-        s_curvature_phase_effective_signed_work_accum = 0.0;
         s_curvature_phase_last_power = std::numeric_limits<double>::quiet_NaN();
         s_curvature_phase_last_positive_power = std::numeric_limits<double>::quiet_NaN();
-        s_curvature_phase_last_effective_power = std::numeric_limits<double>::quiet_NaN();
-        s_curvature_phase_last_effective_positive_power = std::numeric_limits<double>::quiet_NaN();
         s_curvature_phase_samples = 0;
     }
 
     double signed_power = std::numeric_limits<double>::quiet_NaN();
     double positive_power = std::numeric_limits<double>::quiet_NaN();
-    double effective_signed_power = std::numeric_limits<double>::quiet_NaN();
-    double effective_positive_power = std::numeric_limits<double>::quiet_NaN();
     if (update_accum)
     {
         const double dt_eff = std::isfinite(s_curvature_phase_last_time) ?
@@ -4872,8 +4885,6 @@ write_curvature_phase_diagnostics(const int            iteration_num,
         {
             signed_power = 0.0;
             positive_power = 0.0;
-            effective_signed_power = 0.0;
-            effective_positive_power = 0.0;
             const double ds_station =
                 samples.size() > 1 ? std::max(ref_arc_length, 1.0e-12) /
                                       static_cast<double>(samples.size() - 1) :
@@ -4887,17 +4898,15 @@ write_curvature_phase_diagnostics(const int            iteration_num,
                                                     samples[k].s_norm,
                                                     h_geo,
                                                     loop_time);
-                const double M_kappa =
-                    active_curvature_moment_from_active_moment(Mm);
                 if (std::isfinite(kappa_body[k]))
                 {
                     s_curvature_cos_accum[k] += kappa_body[k] * c_t * dt_eff;
                     s_curvature_sin_accum[k] += kappa_body[k] * s_t * dt_eff;
                 }
-                if (std::abs(M_kappa) > 1.0e-30)
+                if (std::abs(Mm) > 1.0e-30)
                 {
-                    s_activation_cos_accum[k] += M_kappa * c_t * dt_eff;
-                    s_activation_sin_accum[k] += M_kappa * s_t * dt_eff;
+                    s_activation_cos_accum[k] += Mm * c_t * dt_eff;
+                    s_activation_sin_accum[k] += Mm * s_t * dt_eff;
                 }
 
                 if (std::isfinite(kappa_body[k]) &&
@@ -4906,27 +4915,16 @@ write_curvature_phase_diagnostics(const int            iteration_num,
                     const double kappa_dot =
                         (kappa_body[k] - s_prev_curvature_body[k]) / dt_eff;
                     const double p_density = Mm * kappa_dot;
-                    const double p_density_effective = M_kappa * kappa_dot;
                     signed_power += p_density * ds_station;
                     positive_power += std::max(p_density, 0.0) * ds_station;
-                    effective_signed_power += p_density_effective * ds_station;
-                    effective_positive_power +=
-                        std::max(p_density_effective, 0.0) * ds_station;
                 }
             }
 
             s_curvature_phase_accum_time += dt_eff;
             s_curvature_phase_signed_work_accum += signed_power * dt_eff;
             s_curvature_phase_positive_work_accum += positive_power * dt_eff;
-            s_curvature_phase_effective_signed_work_accum +=
-                effective_signed_power * dt_eff;
-            s_curvature_phase_effective_positive_work_accum +=
-                effective_positive_power * dt_eff;
             s_curvature_phase_last_power = signed_power;
             s_curvature_phase_last_positive_power = positive_power;
-            s_curvature_phase_last_effective_power = effective_signed_power;
-            s_curvature_phase_last_effective_positive_power =
-                effective_positive_power;
             ++s_curvature_phase_samples;
         }
 
@@ -4985,18 +4983,13 @@ write_curvature_phase_diagnostics(const int            iteration_num,
             << ",A_body_norm"
             << ",kappa_body,kappa_body_L,activation_drive,activation_drive_amp"
             << ",active_envelope,active_moment_prefactor"
-            << ",active_moment,active_stress_section_moment,curvature_conjugate_moment"
-            << ",active_moment_to_stress_sign"
+            << ",active_moment"
             << ",curvature_phase,activation_phase,phase_lag"
             << ",curvature_phase_unwrapped,curvature_phase_slope"
             << ",active_phase_slope_abs,active_phase_slope_expected"
             << ",traveling_wave_index,signed_traveling_wave_index,drive_following_index"
             << ",theta_body,x_cm,y_cm,y_cm_relative"
-            << ",raw_active_power,raw_active_positive_power"
-            << ",raw_active_signed_work,raw_active_positive_work"
             << ",active_power,active_positive_power,active_signed_work,active_positive_work"
-            << ",effective_active_power,effective_active_positive_power"
-            << ",effective_active_signed_work,effective_active_positive_work"
             << "\n";
         out.flush();
     }
@@ -5018,10 +5011,6 @@ write_curvature_phase_diagnostics(const int            iteration_num,
                                             samples[k].s_norm,
                                             h_geo,
                                             loop_time);
-        const double active_stress_section_moment =
-            active_moment_to_stress_sign * active_moment;
-        const double curvature_conjugate_moment =
-            active_curvature_moment_from_active_moment(active_moment);
         out << iteration_num
             << "," << loop_time
             << "," << (wave_frequency > 0.0 ? loop_time * wave_frequency :
@@ -5048,9 +5037,6 @@ write_curvature_phase_diagnostics(const int            iteration_num,
             << "," << active_envelope
             << "," << active_moment_prefactor
             << "," << active_moment
-            << "," << active_stress_section_moment
-            << "," << curvature_conjugate_moment
-            << "," << active_moment_to_stress_sign
             << "," << curvature_phase[k]
             << "," << activation_phase[k]
             << "," << phase_lag[k]
@@ -5069,992 +5055,9 @@ write_curvature_phase_diagnostics(const int            iteration_num,
             << "," << s_curvature_phase_last_positive_power
             << "," << s_curvature_phase_signed_work_accum
             << "," << s_curvature_phase_positive_work_accum
-            << "," << s_curvature_phase_last_effective_power
-            << "," << s_curvature_phase_last_effective_positive_power
-            << "," << s_curvature_phase_effective_signed_work_accum
-            << "," << s_curvature_phase_effective_positive_work_accum
-            << "," << s_curvature_phase_last_effective_power
-            << "," << s_curvature_phase_last_effective_positive_power
-            << "," << s_curvature_phase_effective_signed_work_accum
-            << "," << s_curvature_phase_effective_positive_work_accum
             << "\n";
     }
     out.flush();
-}
-
-// =========================================================================
-// Force decomposition diagnostic
-//
-// The net weak load from an internal stress field can be small even when that
-// stress is dynamically important. Therefore this diagnostic reports both:
-//   1) weak-form resultant loads for sign checks, and
-//   2) local weak-load L1 measures and stress power PP:dF/dt for dominance.
-// =========================================================================
-struct ForceDecompAccumulator
-{
-    double Fx = 0.0;
-    double Fy = 0.0;
-    double L1 = 0.0;
-    double forward_abs = 0.0;
-    double lateral_abs = 0.0;
-    double P = 0.0;
-    double P_pos = 0.0;
-    double P_neg = 0.0;
-    double P_abs = 0.0;
-    double P_weak = 0.0;
-    double P_weak_abs = 0.0;
-};
-
-enum ForceDecompComponent
-{
-    FORCE_DEV = 0,         // dev:  PP_dev = 2·eta_dev·F
-    FORCE_DIL = 1,         // dil:  PP_dil = 2·(-eta_dev + kappa_vol·lnJ)·F⁻ᵀ
-    FORCE_EB_PASSIVE = 2,
-    FORCE_DAMPING = 3,
-    FORCE_ACTIVE = 4,
-    FORCE_SUM = 5,
-    FORCE_N_COMPONENTS = 6
-};
-
-inline const char*
-force_decomp_component_name(const int c)
-{
-    switch (c)
-    {
-    case FORCE_DEV:        return "dev";
-    case FORCE_DIL:        return "dil";
-    case FORCE_EB_PASSIVE: return "eb_passive";
-    case FORCE_DAMPING:    return "damping";
-    case FORCE_ACTIVE:     return "active";
-    case FORCE_SUM:        return "sum";
-    default:               return "unknown";
-    }
-}
-
-inline double
-section_moment_bin_width(const int i, const int nb)
-{
-    if (nb <= 1) return std::max(ref_arc_length, 1.0e-12);
-    const double left = (i == 0) ?
-        0.0 : (static_cast<double>(i) - 0.5) / static_cast<double>(nb - 1);
-    const double right = (i == nb - 1) ?
-        1.0 : (static_cast<double>(i) + 0.5) / static_cast<double>(nb - 1);
-    return std::max((right - left) * std::max(ref_arc_length, 1.0e-12),
-                    1.0e-12);
-}
-
-inline double
-axial_fiber_stress_from_PK1(const TensorValue<double>& PP,
-                            const TensorValue<double>& FF,
-                            const VectorValue<double>& f0)
-{
-    const VectorValue<double> a = FF * f0;
-    const double a2 = std::max(a * a, 0.0);
-    if (a2 <= 1.0e-24) return 0.0;
-    return (a * (PP * f0)) / a2;
-}
-
-struct SectionMomentBin
-{
-    double area = 0.0;
-    double s_sum = 0.0;
-    double x_sum = 0.0;
-    double h_sum = 0.0;
-    double c1_sum = 0.0;
-    double N[FORCE_N_COMPONENTS] = {};
-    double M[FORCE_N_COMPONENTS] = {};
-};
-
-static void
-write_section_moment_decomposition_diagnostics(
-    const int            iteration_num,
-    const double         loop_time,
-    Pointer<IBFEMethod>  ib_method_ops,
-    MeshBase&            mesh,
-    EquationSystems*     equation_systems)
-{
-    if (!s_section_moment_diag_enable) return;
-    if (s_section_moment_diag_interval > 1 &&
-        (iteration_num % s_section_moment_diag_interval != 0)) return;
-    if (!equation_systems) return;
-
-    const unsigned int dim = mesh.mesh_dimension();
-    const int nb = std::max(3, (s_section_moment_diag_bins > 0) ?
-                            s_section_moment_diag_bins : reference_profile_bins);
-    std::vector<SectionMomentBin> bins(static_cast<std::size_t>(nb));
-
-    System& X_sys = equation_systems->get_system(
-        ib_method_ops->getCurrentCoordinatesSystemName());
-    NumericVector<double>* X_vec       = X_sys.solution.get();
-    NumericVector<double>* X_ghost_vec = X_sys.current_local_solution.get();
-    X_vec->close();
-    copy_and_synch(*X_vec, *X_ghost_vec);
-
-    System& U_sys = equation_systems->get_system(
-        ib_method_ops->getVelocitySystemName());
-    NumericVector<double>* U_vec       = U_sys.solution.get();
-    NumericVector<double>* U_ghost_vec = U_sys.current_local_solution.get();
-    U_vec->close();
-    copy_and_synch(*U_vec, *U_ghost_vec);
-
-    System& ref_geom_sys = equation_systems->get_system(REF_GEOM_SYSTEM_NAME);
-    NumericVector<double>* ref_geom_vec = ref_geom_sys.solution.get();
-    NumericVector<double>* ref_geom_ghost_vec =
-        ref_geom_sys.current_local_solution.get();
-    ref_geom_vec->close();
-    copy_and_synch(*ref_geom_vec, *ref_geom_ghost_vec);
-
-    System& eb_sys = equation_systems->get_system(EB_BENDING_SYSTEM_NAME);
-    NumericVector<double>* eb_vec = eb_sys.solution.get();
-    NumericVector<double>* eb_ghost_vec = eb_sys.current_local_solution.get();
-    eb_vec->close();
-    copy_and_synch(*eb_vec, *eb_ghost_vec);
-
-    const DofMap& X_dof_map = X_sys.get_dof_map();
-    const DofMap& U_dof_map = U_sys.get_dof_map();
-    const DofMap& ref_geom_dof_map = ref_geom_sys.get_dof_map();
-    const DofMap& eb_dof_map = eb_sys.get_dof_map();
-    const FEType fe_type = X_dof_map.variable_type(0);
-    const libMesh::Order quad_order =
-        Utility::string_to_enum<libMesh::Order>(s_section_moment_quad_order);
-    std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
-    std::unique_ptr<QBase> qrule(new QGauss(dim, quad_order));
-    fe->attach_quadrature_rule(qrule.get());
-
-    const std::vector<double>& JxW = fe->get_JxW();
-    const std::vector<std::vector<double> >& phi = fe->get_phi();
-    const std::vector<std::vector<RealGradient> >& dphi = fe->get_dphi();
-    std::vector<std::vector<unsigned int> > X_dof_indices(NDIM);
-    std::vector<std::vector<unsigned int> > U_dof_indices(NDIM);
-    std::vector<std::vector<unsigned int> > ref_geom_dof_indices(REF_GEOM_N_VARS);
-    std::vector<std::vector<unsigned int> > eb_dof_indices(EB_BENDING_N_VARS);
-    boost::multi_array<double, 2> X_node;
-    boost::multi_array<double, 2> U_node;
-
-    for (auto el_it = mesh.active_local_elements_begin();
-         el_it != mesh.active_local_elements_end(); ++el_it)
-    {
-        const Elem* elem = *el_it;
-        if (!elem) continue;
-
-        fe->reinit(elem);
-        for (unsigned int d = 0; d < NDIM; ++d)
-        {
-            X_dof_map.dof_indices(elem, X_dof_indices[d], d);
-            U_dof_map.dof_indices(elem, U_dof_indices[d], d);
-        }
-        for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
-            ref_geom_dof_map.dof_indices(elem, ref_geom_dof_indices[v], v);
-        for (unsigned int v = 0; v < EB_BENDING_N_VARS; ++v)
-            eb_dof_map.dof_indices(elem, eb_dof_indices[v], v);
-        get_values_for_interpolation(X_node, *X_ghost_vec, X_dof_indices);
-        get_values_for_interpolation(U_node, *U_ghost_vec, U_dof_indices);
-
-        const unsigned int n_nodes = elem->n_nodes();
-        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
-        {
-            TensorValue<double> FF;
-            jacobian(FF, qp, X_node, dphi);
-
-            std::vector<VectorValue<double> > grad_U(NDIM, VectorValue<double>(0.0, 0.0));
-            for (unsigned int k = 0; k < n_nodes; ++k)
-            {
-                for (unsigned int i = 0; i < NDIM; ++i)
-                {
-                    const double u_ki = U_node[k][i];
-                    for (unsigned int j = 0; j < NDIM; ++j)
-                        grad_U[i](j) += u_ki * dphi[k][qp](j);
-                }
-            }
-
-            libMesh::Point X_ref_qp(0.0, 0.0, 0.0);
-            double ref_geom_values[REF_GEOM_N_VARS] = { 0.0, 0.0, 0.0, 0.0 };
-            double eb_values[EB_BENDING_N_VARS] = { 0.0, 0.0 };
-            for (unsigned int k = 0; k < n_nodes; ++k)
-            {
-                for (unsigned int d = 0; d < NDIM; ++d)
-                    X_ref_qp(d) += phi[k][qp] * elem->point(k)(d);
-                for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
-                    ref_geom_values[v] +=
-                        phi[k][qp] * (*ref_geom_ghost_vec)(ref_geom_dof_indices[v][k]);
-                for (unsigned int v = 0; v < EB_BENDING_N_VARS; ++v)
-                    eb_values[v] +=
-                        phi[k][qp] * (*eb_ghost_vec)(eb_dof_indices[v][k]);
-            }
-
-            ReferenceGeometrySample ref_geom;
-            ref_geom.s = std::max(0.0, std::min(ref_geom_values[REF_GEOM_S],
-                                                ref_arc_length));
-            ref_geom.eta = ref_geom_values[REF_GEOM_ETA];
-            const VectorValue<double> t_raw(ref_geom_values[REF_GEOM_T_X],
-                                            ref_geom_values[REF_GEOM_T_Y]);
-            const double t_norm = std::sqrt(std::max(t_raw * t_raw, 0.0));
-            if (t_norm <= 1.0e-14) continue;
-            ref_geom.t_hat = t_raw / t_norm;
-            EBBendingSample eb_sample;
-            eb_sample.kappa = eb_values[EB_BENDING_KAPPA];
-            eb_sample.kappa_dot = eb_values[EB_BENDING_KAPPA_DOT];
-
-            TensorValue<double> PP[FORCE_N_COMPONENTS];
-            for (int c = 0; c < FORCE_N_COMPONENTS; ++c) PP[c] = 0.0;
-            const double c1_local = eta_dev;
-            compute_dev_PK1_stress_impl(PP[FORCE_DEV], FF);
-            compute_dil_PK1_stress_impl(PP[FORCE_DIL], FF);
-            compute_eb_passive_bending_PK1_stress_impl(PP[FORCE_EB_PASSIVE],
-                                                       FF, X_ref_qp,
-                                                       ref_geom, eb_sample);
-            compute_structural_damping_PK1_stress_impl(PP[FORCE_DAMPING],
-                                                       FF, X_ref_qp,
-                                                       ref_geom, grad_U);
-            compute_active_PK1_stress_impl(PP[FORCE_ACTIVE], FF, X_ref_qp,
-                                           ref_geom, loop_time);
-            PP[FORCE_SUM] = PP[FORCE_DEV] + PP[FORCE_DIL] +
-                            PP[FORCE_EB_PASSIVE] +
-                            PP[FORCE_DAMPING] + PP[FORCE_ACTIVE];
-
-            const double s_norm = clamp01(ref_geom.s /
-                                          std::max(ref_arc_length, 1.0e-12));
-            const int bi = std::min(nb - 1, std::max(0,
-                static_cast<int>(s_norm * static_cast<double>(nb - 1) + 0.5)));
-            SectionMomentBin& bin = bins[static_cast<std::size_t>(bi)];
-            const double jw = JxW[qp];
-            const double h = body_halfthick_from_s(ref_geom.s);
-            bin.area += jw;
-            bin.s_sum += ref_geom.s * jw;
-            bin.x_sum += X_ref_qp(0) * jw;
-            bin.h_sum += h * jw;
-            bin.c1_sum += c1_local * jw;
-
-            for (int c = FORCE_DEV; c <= FORCE_SUM; ++c)
-            {
-                const double T_tt =
-                    axial_fiber_stress_from_PK1(PP[c], FF, ref_geom.t_hat);
-                bin.N[c] += T_tt * jw;
-                // Curvature-conjugate sign matches active_curvature_moment_from_active_moment():
-                // epsilon_ss = -eta*kappa, so M_kappa = -int T_tt*eta dA.
-                bin.M[c] += -T_tt * ref_geom.eta * jw;
-            }
-        }
-    }
-
-    const int n_values_per_bin = 5 + 2 * FORCE_N_COMPONENTS;
-    std::vector<double> reduced(static_cast<std::size_t>(nb * n_values_per_bin), 0.0);
-    std::size_t r = 0;
-    for (int i = 0; i < nb; ++i)
-    {
-        const SectionMomentBin& bin = bins[static_cast<std::size_t>(i)];
-        reduced[r++] = bin.area;
-        reduced[r++] = bin.s_sum;
-        reduced[r++] = bin.x_sum;
-        reduced[r++] = bin.h_sum;
-        reduced[r++] = bin.c1_sum;
-        for (int c = 0; c < FORCE_N_COMPONENTS; ++c) reduced[r++] = bin.N[c];
-        for (int c = 0; c < FORCE_N_COMPONENTS; ++c) reduced[r++] = bin.M[c];
-    }
-    IBTK_MPI::sumReduction(reduced.data(), static_cast<int>(reduced.size()));
-
-    r = 0;
-    for (int i = 0; i < nb; ++i)
-    {
-        SectionMomentBin& bin = bins[static_cast<std::size_t>(i)];
-        bin.area = reduced[r++];
-        bin.s_sum = reduced[r++];
-        bin.x_sum = reduced[r++];
-        bin.h_sum = reduced[r++];
-        bin.c1_sum = reduced[r++];
-        for (int c = 0; c < FORCE_N_COMPONENTS; ++c) bin.N[c] = reduced[r++];
-        for (int c = 0; c < FORCE_N_COMPONENTS; ++c) bin.M[c] = reduced[r++];
-    }
-
-    if (IBTK_MPI::getRank() != 0) return;
-    static std::ofstream out;
-    if (!out.is_open())
-    {
-        out.open(s_section_moment_diag_filename.c_str(), std::ios::out);
-        if (!out.is_open())
-        {
-            TBOX_WARNING("write_section_moment_decomposition_diagnostics(): cannot open "
-                         << s_section_moment_diag_filename << "\n");
-            return;
-        }
-        out << "step,time,bin,s_norm,s_mean,x_ref_mean,h_mean,c1_mean,area,ds_bin";
-        for (int c = FORCE_DEV; c <= FORCE_SUM; ++c)
-            out << ",N_" << force_decomp_component_name(c);
-        for (int c = FORCE_DEV; c <= FORCE_SUM; ++c)
-            out << ",M_" << force_decomp_component_name(c);
-        out << ",M_devdil,M_resist,M_active_model,M_active_error,R_active_resist\n";
-        out.flush();
-    }
-
-    out.setf(std::ios::scientific);
-    out.precision(10);
-    for (int i = 0; i < nb; ++i)
-    {
-        const SectionMomentBin& bin = bins[static_cast<std::size_t>(i)];
-        const double ds_bin = section_moment_bin_width(i, nb);
-        const double s_norm_center = (nb > 1) ?
-            static_cast<double>(i) / static_cast<double>(nb - 1) : 0.0;
-        const double inv_area = (bin.area > 1.0e-30) ? 1.0 / bin.area : 0.0;
-        const double s_mean = (bin.area > 1.0e-30) ?
-            bin.s_sum * inv_area : s_norm_center * std::max(ref_arc_length, 1.0e-12);
-        const double x_ref_mean = (bin.area > 1.0e-30) ?
-            bin.x_sum * inv_area : std::numeric_limits<double>::quiet_NaN();
-        const double h_mean = (bin.area > 1.0e-30) ?
-            bin.h_sum * inv_area : body_halfthick_from_s(s_mean);
-        const double c1_mean = (bin.area > 1.0e-30) ?
-            bin.c1_sum * inv_area : std::numeric_limits<double>::quiet_NaN();
-
-        double N_sec[FORCE_N_COMPONENTS];
-        double M_sec[FORCE_N_COMPONENTS];
-        for (int c = 0; c < FORCE_N_COMPONENTS; ++c)
-        {
-            N_sec[c] = bin.N[c] / ds_bin;
-            M_sec[c] = bin.M[c] / ds_bin;
-        }
-        const double s_model = std::max(0.0, std::min(s_mean, ref_arc_length));
-        const double s_model_norm = clamp01(s_model / std::max(ref_arc_length, 1.0e-12));
-        const double h_model = body_halfthick_from_s(s_model);
-        const double Mm_model =
-            active_moment_value_from_sample(s_model, s_model_norm, h_model, loop_time);
-        const double M_active_model =
-            active_curvature_moment_from_active_moment(Mm_model);
-        const double M_devdil = M_sec[FORCE_DEV] + M_sec[FORCE_DIL] +
-                                M_sec[FORCE_EB_PASSIVE];
-        const double M_resist = M_devdil + M_sec[FORCE_DAMPING];
-        const double R_active_resist =
-            M_sec[FORCE_ACTIVE] / (std::abs(M_resist) + 1.0e-30);
-
-        out << iteration_num
-            << "," << loop_time
-            << "," << i
-            << "," << s_norm_center
-            << "," << s_mean
-            << "," << x_ref_mean
-            << "," << h_mean
-            << "," << c1_mean
-            << "," << bin.area
-            << "," << ds_bin;
-        for (int c = FORCE_DEV; c <= FORCE_SUM; ++c)
-            out << "," << N_sec[c];
-        for (int c = FORCE_DEV; c <= FORCE_SUM; ++c)
-            out << "," << M_sec[c];
-        out << "," << M_devdil
-            << "," << M_resist
-            << "," << M_active_model
-            << "," << (M_sec[FORCE_ACTIVE] - M_active_model)
-            << "," << R_active_resist
-            << "\n";
-    }
-    out.flush();
-}
-
-static void
-write_force_decomposition_diagnostics(const int            iteration_num,
-                                      const double         loop_time,
-                                      Pointer<IBFEMethod>  ib_method_ops,
-                                      MeshBase&            mesh,
-                                      EquationSystems*     equation_systems,
-                                      const double         F_integral[NDIM],
-                                      const double         F_power_on_fluid,
-                                      const double         x_cm,
-                                      const double         y_cm,
-                                      const double         vcm_x,
-                                      const double         vcm_y)
-{
-    if (!s_force_decomp_diag_enable) return;
-    if (s_force_decomp_diag_interval > 1 &&
-        (iteration_num % s_force_decomp_diag_interval != 0)) return;
-    if (!equation_systems) return;
-
-    const double forward_sign = head_is_at_x_min() ? -1.0 : 1.0;
-    const unsigned int dim = mesh.mesh_dimension();
-
-    System& X_sys = equation_systems->get_system(
-        ib_method_ops->getCurrentCoordinatesSystemName());
-    NumericVector<double>* X_vec       = X_sys.solution.get();
-    NumericVector<double>* X_ghost_vec = X_sys.current_local_solution.get();
-    X_vec->close();
-    copy_and_synch(*X_vec, *X_ghost_vec);
-
-    System& U_sys = equation_systems->get_system(
-        ib_method_ops->getVelocitySystemName());
-    NumericVector<double>* U_vec       = U_sys.solution.get();
-    NumericVector<double>* U_ghost_vec = U_sys.current_local_solution.get();
-    U_vec->close();
-    copy_and_synch(*U_vec, *U_ghost_vec);
-
-    System& ref_geom_sys = equation_systems->get_system(REF_GEOM_SYSTEM_NAME);
-    NumericVector<double>* ref_geom_vec = ref_geom_sys.solution.get();
-    NumericVector<double>* ref_geom_ghost_vec =
-        ref_geom_sys.current_local_solution.get();
-    ref_geom_vec->close();
-    copy_and_synch(*ref_geom_vec, *ref_geom_ghost_vec);
-
-    System& eb_sys = equation_systems->get_system(EB_BENDING_SYSTEM_NAME);
-    NumericVector<double>* eb_vec = eb_sys.solution.get();
-    NumericVector<double>* eb_ghost_vec = eb_sys.current_local_solution.get();
-    eb_vec->close();
-    copy_and_synch(*eb_vec, *eb_ghost_vec);
-
-    const DofMap& X_dof_map = X_sys.get_dof_map();
-    const DofMap& U_dof_map = U_sys.get_dof_map();
-    const DofMap& ref_geom_dof_map = ref_geom_sys.get_dof_map();
-    const DofMap& eb_dof_map = eb_sys.get_dof_map();
-    const FEType fe_type = X_dof_map.variable_type(0);
-    const libMesh::Order quad_order =
-        Utility::string_to_enum<libMesh::Order>(s_force_decomp_quad_order);
-    std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
-    std::unique_ptr<QBase> qrule(new QGauss(dim, quad_order));
-    fe->attach_quadrature_rule(qrule.get());
-
-    const std::vector<double>& JxW = fe->get_JxW();
-    const std::vector<std::vector<double> >& phi = fe->get_phi();
-    const std::vector<std::vector<RealGradient> >& dphi = fe->get_dphi();
-    std::vector<std::vector<unsigned int> > X_dof_indices(NDIM);
-    std::vector<std::vector<unsigned int> > U_dof_indices(NDIM);
-    std::vector<std::vector<unsigned int> > ref_geom_dof_indices(REF_GEOM_N_VARS);
-    std::vector<std::vector<unsigned int> > eb_dof_indices(EB_BENDING_N_VARS);
-    boost::multi_array<double, 2> X_node;
-    boost::multi_array<double, 2> U_node;
-    std::vector<ForceDecompAccumulator> acc(FORCE_N_COMPONENTS);
-
-    auto accumulate_qp =
-        [&](const int c,
-            const TensorValue<double>& PP,
-            const TensorValue<double>& F_dot,
-            const double JxW_qp,
-            const std::vector<RealGradient>& dphi_qp,
-            std::vector<std::vector<VectorValue<double> > >& elem_loads)
-        {
-            double p = 0.0;
-            for (unsigned int i = 0; i < NDIM; ++i)
-                for (unsigned int j = 0; j < NDIM; ++j)
-                    p += PP(i, j) * F_dot(i, j);
-            p *= JxW_qp;
-
-            acc[c].P += p;
-            acc[c].P_pos += std::max(p, 0.0);
-            acc[c].P_neg += std::min(p, 0.0);
-            acc[c].P_abs += std::abs(p);
-            acc[FORCE_SUM].P += p;
-            acc[FORCE_SUM].P_pos += std::max(p, 0.0);
-            acc[FORCE_SUM].P_neg += std::min(p, 0.0);
-            acc[FORCE_SUM].P_abs += std::abs(p);
-
-            for (std::size_t k = 0; k < dphi_qp.size(); ++k)
-            {
-                VectorValue<double> f_node(0.0, 0.0);
-                for (unsigned int i = 0; i < NDIM; ++i)
-                {
-                    double f_i = 0.0;
-                    for (unsigned int j = 0; j < NDIM; ++j)
-                        f_i -= PP(i, j) * dphi_qp[k](j) * JxW_qp;
-                    f_node(i) = f_i;
-                }
-                elem_loads[c][k] += f_node;
-                elem_loads[FORCE_SUM][k] += f_node;
-            }
-        };
-
-    for (auto el_it = mesh.active_local_elements_begin();
-         el_it != mesh.active_local_elements_end(); ++el_it)
-    {
-        const Elem* elem = *el_it;
-        if (!elem) continue;
-
-        fe->reinit(elem);
-        for (unsigned int d = 0; d < NDIM; ++d)
-        {
-            X_dof_map.dof_indices(elem, X_dof_indices[d], d);
-            U_dof_map.dof_indices(elem, U_dof_indices[d], d);
-        }
-        for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
-            ref_geom_dof_map.dof_indices(elem, ref_geom_dof_indices[v], v);
-        for (unsigned int v = 0; v < EB_BENDING_N_VARS; ++v)
-            eb_dof_map.dof_indices(elem, eb_dof_indices[v], v);
-        get_values_for_interpolation(X_node, *X_ghost_vec, X_dof_indices);
-        get_values_for_interpolation(U_node, *U_ghost_vec, U_dof_indices);
-
-        const unsigned int n_nodes = elem->n_nodes();
-        std::vector<std::vector<VectorValue<double> > > elem_loads(FORCE_N_COMPONENTS);
-        for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
-            elem_loads[c].assign(n_nodes, VectorValue<double>(0.0, 0.0));
-
-        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
-        {
-            TensorValue<double> FF;
-            jacobian(FF, qp, X_node, dphi);
-
-            TensorValue<double> F_dot;
-            F_dot.zero();
-            std::vector<VectorValue<double> > grad_U(NDIM, VectorValue<double>(0.0, 0.0));
-            for (unsigned int k = 0; k < n_nodes; ++k)
-            {
-                for (unsigned int i = 0; i < NDIM; ++i)
-                {
-                    const double u_ki = U_node[k][i];
-                    for (unsigned int j = 0; j < NDIM; ++j)
-                    {
-                        grad_U[i](j) += u_ki * dphi[k][qp](j);
-                        F_dot(i, j) += u_ki * dphi[k][qp](j);
-                    }
-                }
-            }
-
-            libMesh::Point X_ref_qp(0.0, 0.0, 0.0);
-            double ref_geom_values[REF_GEOM_N_VARS] = { 0.0, 0.0, 0.0, 0.0 };
-            double eb_values[EB_BENDING_N_VARS] = { 0.0, 0.0 };
-            for (unsigned int k = 0; k < n_nodes; ++k)
-            {
-                for (unsigned int d = 0; d < NDIM; ++d)
-                    X_ref_qp(d) += phi[k][qp] * elem->point(k)(d);
-                for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
-                    ref_geom_values[v] +=
-                        phi[k][qp] * (*ref_geom_ghost_vec)(ref_geom_dof_indices[v][k]);
-                for (unsigned int v = 0; v < EB_BENDING_N_VARS; ++v)
-                    eb_values[v] +=
-                        phi[k][qp] * (*eb_ghost_vec)(eb_dof_indices[v][k]);
-            }
-
-            ReferenceGeometrySample ref_geom;
-            ref_geom.s = std::max(0.0, std::min(ref_geom_values[REF_GEOM_S],
-                                                ref_arc_length));
-            ref_geom.eta = ref_geom_values[REF_GEOM_ETA];
-            const VectorValue<double> t_raw(ref_geom_values[REF_GEOM_T_X],
-                                            ref_geom_values[REF_GEOM_T_Y]);
-            const double t_norm = std::sqrt(std::max(t_raw * t_raw, 0.0));
-            if (t_norm <= 1.0e-14) continue;
-            ref_geom.t_hat = t_raw / t_norm;
-            EBBendingSample eb_sample;
-            eb_sample.kappa = eb_values[EB_BENDING_KAPPA];
-            eb_sample.kappa_dot = eb_values[EB_BENDING_KAPPA_DOT];
-
-            TensorValue<double> PP_dev(0.0), PP_dil(0.0), PP_damping(0.0), PP_active(0.0);
-            TensorValue<double> PP_eb_passive(0.0);
-            compute_dev_PK1_stress_impl(PP_dev, FF);
-            compute_dil_PK1_stress_impl(PP_dil, FF);
-            compute_eb_passive_bending_PK1_stress_impl(PP_eb_passive, FF,
-                                                       X_ref_qp, ref_geom,
-                                                       eb_sample);
-            compute_structural_damping_PK1_stress_impl(PP_damping, FF, X_ref_qp,
-                                                       ref_geom, grad_U);
-            compute_active_PK1_stress_impl(PP_active, FF, X_ref_qp, ref_geom,
-                                           loop_time);
-
-            std::vector<RealGradient> dphi_qp(n_nodes);
-            for (unsigned int k = 0; k < n_nodes; ++k) dphi_qp[k] = dphi[k][qp];
-            accumulate_qp(FORCE_DEV, PP_dev, F_dot, JxW[qp], dphi_qp, elem_loads);
-            accumulate_qp(FORCE_DIL, PP_dil, F_dot, JxW[qp], dphi_qp, elem_loads);
-            accumulate_qp(FORCE_EB_PASSIVE, PP_eb_passive, F_dot, JxW[qp], dphi_qp, elem_loads);
-            accumulate_qp(FORCE_DAMPING, PP_damping, F_dot, JxW[qp], dphi_qp, elem_loads);
-            accumulate_qp(FORCE_ACTIVE, PP_active, F_dot, JxW[qp], dphi_qp, elem_loads);
-        }
-
-        for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
-        {
-            for (unsigned int k = 0; k < n_nodes; ++k)
-            {
-                const VectorValue<double>& f = elem_loads[c][k];
-                const VectorValue<double> u(U_node[k][0], U_node[k][1]);
-                const double p_weak = f * u;
-                acc[c].Fx += f(0);
-                acc[c].Fy += f(1);
-                acc[c].L1 += std::sqrt(std::max(f * f, 0.0));
-                acc[c].forward_abs += std::abs(forward_sign * f(0));
-                acc[c].lateral_abs += std::abs(forward_sign * f(1));
-                acc[c].P_weak += p_weak;
-                acc[c].P_weak_abs += std::abs(p_weak);
-            }
-        }
-    }
-
-    std::vector<double> reduced;
-    reduced.reserve(FORCE_N_COMPONENTS * 11);
-    for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
-    {
-        reduced.push_back(acc[c].Fx);
-        reduced.push_back(acc[c].Fy);
-        reduced.push_back(acc[c].L1);
-        reduced.push_back(acc[c].forward_abs);
-        reduced.push_back(acc[c].lateral_abs);
-        reduced.push_back(acc[c].P);
-        reduced.push_back(acc[c].P_pos);
-        reduced.push_back(acc[c].P_neg);
-        reduced.push_back(acc[c].P_abs);
-        reduced.push_back(acc[c].P_weak);
-        reduced.push_back(acc[c].P_weak_abs);
-    }
-    IBTK_MPI::sumReduction(reduced.data(), static_cast<int>(reduced.size()));
-
-    std::size_t r = 0;
-    for (unsigned int c = 0; c < FORCE_N_COMPONENTS; ++c)
-    {
-        acc[c].Fx          = reduced[r++];
-        acc[c].Fy          = reduced[r++];
-        acc[c].L1          = reduced[r++];
-        acc[c].forward_abs = reduced[r++];
-        acc[c].lateral_abs = reduced[r++];
-        acc[c].P           = reduced[r++];
-        acc[c].P_pos       = reduced[r++];
-        acc[c].P_neg       = reduced[r++];
-        acc[c].P_abs       = reduced[r++];
-        acc[c].P_weak      = reduced[r++];
-        acc[c].P_weak_abs  = reduced[r++];
-    }
-
-    const double dt_eff = std::isfinite(s_force_decomp_prev_time) ?
-        loop_time - s_force_decomp_prev_time : std::numeric_limits<double>::quiet_NaN();
-    if (std::isfinite(dt_eff) && dt_eff > 1.0e-12)
-    {
-        s_force_decomp_work_dev     += acc[FORCE_DEV].P * dt_eff;
-        s_force_decomp_work_dil     += acc[FORCE_DIL].P * dt_eff;
-        s_force_decomp_work_eb_passive += acc[FORCE_EB_PASSIVE].P * dt_eff;
-        s_force_decomp_work_damping += acc[FORCE_DAMPING].P * dt_eff;
-        s_force_decomp_work_active  += acc[FORCE_ACTIVE].P * dt_eff;
-        s_force_decomp_work_sum     += acc[FORCE_SUM].P * dt_eff;
-        s_force_decomp_work_weak_dev += acc[FORCE_DEV].P_weak * dt_eff;
-        s_force_decomp_work_weak_dil += acc[FORCE_DIL].P_weak * dt_eff;
-        s_force_decomp_work_weak_eb_passive += acc[FORCE_EB_PASSIVE].P_weak * dt_eff;
-        s_force_decomp_work_weak_damping += acc[FORCE_DAMPING].P_weak * dt_eff;
-        s_force_decomp_work_weak_active  += acc[FORCE_ACTIVE].P_weak * dt_eff;
-        s_force_decomp_work_weak_sum     += acc[FORCE_SUM].P_weak * dt_eff;
-        if (std::isfinite(F_power_on_fluid))
-        {
-            s_force_decomp_work_ib_on_fluid += F_power_on_fluid * dt_eff;
-        }
-    }
-    s_force_decomp_prev_time = loop_time;
-
-    int dominant_L1 = FORCE_DEV;
-    int dominant_Pabs = FORCE_DEV;
-    for (int c = FORCE_DIL; c <= FORCE_ACTIVE; ++c)
-    {
-        if (acc[c].L1 > acc[dominant_L1].L1) dominant_L1 = c;
-        if (acc[c].P_abs > acc[dominant_Pabs].P_abs) dominant_Pabs = c;
-    }
-
-    if (IBTK_MPI::getRank() != 0) return;
-    static std::ofstream out;
-    if (!out.is_open())
-    {
-        out.open(s_force_decomp_diag_filename.c_str(), std::ios::out);
-        if (!out.is_open())
-        {
-            TBOX_WARNING("write_force_decomposition_diagnostics(): cannot open "
-                         << s_force_decomp_diag_filename << "\n");
-            return;
-        }
-        out << "step,time,dt_eff,forward_sign,x_cm,y_cm,vcm_x,vcm_y,v_forward"
-            << ",F_total_x,F_total_y,F_total_forward_on_fluid,F_total_forward_on_fish"
-            << ",P_IB_on_fluid,P_IB_on_fish";
-        for (int c = FORCE_DEV; c <= FORCE_SUM; ++c)
-        {
-            const char* name = force_decomp_component_name(c);
-            out << ",F_weak_" << name << "_x"
-                << ",F_weak_" << name << "_y"
-                << ",F_weak_" << name << "_forward_on_fluid"
-                << ",F_weak_" << name << "_forward_on_fish"
-                << ",F_weak_L1_" << name
-                << ",F_weak_forward_abs_" << name
-                << ",F_weak_lateral_abs_" << name
-                << ",P_" << name
-                << ",P_pos_" << name
-                << ",P_neg_" << name
-                << ",P_abs_" << name
-                << ",P_weak_on_fluid_" << name
-                << ",P_weak_on_fish_" << name
-                << ",P_weak_abs_" << name;
-        }
-        out << ",F_weak_sum_error_x,F_weak_sum_error_y"
-            << ",W_dev,W_dil,W_eb_passive,W_damping,W_active,W_sum"
-            << ",W_weak_on_fluid_dev"
-            << ",W_weak_on_fluid_dil"
-            << ",W_weak_on_fluid_eb_passive"
-            << ",W_weak_on_fluid_damping,W_weak_on_fluid_active"
-            << ",W_weak_on_fluid_sum,W_IB_on_fluid,W_IB_on_fish"
-            << ",dominant_L1_component,dominant_Pabs_component\n";
-        out.flush();
-    }
-
-    out.setf(std::ios::scientific);
-    out.precision(10);
-    out << iteration_num
-        << "," << loop_time
-        << "," << dt_eff
-        << "," << forward_sign
-        << "," << x_cm
-        << "," << y_cm
-        << "," << vcm_x
-        << "," << vcm_y
-        << "," << forward_sign * vcm_x
-        << "," << F_integral[0]
-        << "," << F_integral[1]
-        << "," << forward_sign * F_integral[0]
-        << "," << -forward_sign * F_integral[0]
-        << "," << F_power_on_fluid
-        << "," << -F_power_on_fluid;
-    for (int c = FORCE_DEV; c <= FORCE_SUM; ++c)
-    {
-        out << "," << acc[c].Fx
-            << "," << acc[c].Fy
-            << "," << forward_sign * acc[c].Fx
-            << "," << -forward_sign * acc[c].Fx
-            << "," << acc[c].L1
-            << "," << acc[c].forward_abs
-            << "," << acc[c].lateral_abs
-            << "," << acc[c].P
-            << "," << acc[c].P_pos
-            << "," << acc[c].P_neg
-            << "," << acc[c].P_abs
-            << "," << acc[c].P_weak
-            << "," << -acc[c].P_weak
-            << "," << acc[c].P_weak_abs;
-    }
-    out << "," << (acc[FORCE_SUM].Fx - F_integral[0])
-        << "," << (acc[FORCE_SUM].Fy - F_integral[1])
-        << "," << s_force_decomp_work_dev
-        << "," << s_force_decomp_work_dil
-        << "," << s_force_decomp_work_eb_passive
-        << "," << s_force_decomp_work_damping
-        << "," << s_force_decomp_work_active
-        << "," << s_force_decomp_work_sum
-        << "," << s_force_decomp_work_weak_dev
-        << "," << s_force_decomp_work_weak_dil
-        << "," << s_force_decomp_work_weak_eb_passive
-        << "," << s_force_decomp_work_weak_damping
-        << "," << s_force_decomp_work_weak_active
-        << "," << s_force_decomp_work_weak_sum
-        << "," << s_force_decomp_work_ib_on_fluid
-        << "," << -s_force_decomp_work_ib_on_fluid
-        << "," << force_decomp_component_name(dominant_L1)
-        << "," << force_decomp_component_name(dominant_Pabs)
-        << "\n";
-    out.flush();
-}
-
-// =========================================================================
-// Fin pitch diagnostic
-//
-// Tracks:
-//   tail tip center (x_tip, y_tip) from ref_tail_upper/lower_node_id
-//   fin root center (x_root, y_root) from ref_fin_root_upper/lower_node_id
-//   theta_fin_lab = atan2(y_tip - y_root, x_tip - x_root)
-//   v_y_tip, v_y_root = finite-difference lateral velocities
-//   act_phase_root = active muscle phase at fin root location
-// =========================================================================
-static void
-write_fin_pitch_diagnostics(const int            iteration_num,
-                             const double         loop_time,
-                             Pointer<IBFEMethod>  ib_method_ops,
-                             MeshBase&            mesh,
-                             EquationSystems*     equation_systems,
-                             const double         x_cm,
-                             const double         y_cm)
-{
-    if (!s_fin_pitch_diag_enable) return;
-    if (s_fin_pitch_diag_interval > 1 &&
-        (iteration_num % s_fin_pitch_diag_interval != 0)) return;
-    if (!equation_systems) return;
-
-    // Load the coordinates system.
-    System& X_sys = equation_systems->get_system(
-        ib_method_ops->getCurrentCoordinatesSystemName());
-    NumericVector<double>* X_vec = X_sys.solution.get();
-    NumericVector<double>* X_ghost_vec = X_sys.current_local_solution.get();
-    X_vec->close();
-    copy_and_synch(*X_vec, *X_ghost_vec);
-    const DofMap& X_dof_map = X_sys.get_dof_map();
-
-    // Get current tip center (average of upper and lower tail nodes).
-    double x_tip_u = 0.0, y_tip_u = 0.0, x_tip_l = 0.0, y_tip_l = 0.0;
-    const bool have_tip_u = get_current_node_position(
-        X_dof_map, *X_ghost_vec, mesh, ref_tail_upper_node_id,  x_tip_u, y_tip_u);
-    const bool have_tip_l = get_current_node_position(
-        X_dof_map, *X_ghost_vec, mesh, ref_tail_lower_node_id,  x_tip_l, y_tip_l);
-
-    // Get current fin root center (average of upper and lower fin root nodes).
-    double x_root_u = 0.0, y_root_u = 0.0, x_root_l = 0.0, y_root_l = 0.0;
-    const bool have_root_u = get_current_node_position(
-        X_dof_map, *X_ghost_vec, mesh, ref_fin_root_upper_node_id, x_root_u, y_root_u);
-    const bool have_root_l = get_current_node_position(
-        X_dof_map, *X_ghost_vec, mesh, ref_fin_root_lower_node_id, x_root_l, y_root_l);
-
-    if (!have_tip_u || !have_tip_l || !have_root_u || !have_root_l) return;
-
-    const double x_tip  = 0.5 * (x_tip_u  + x_tip_l);
-    const double y_tip  = 0.5 * (y_tip_u  + y_tip_l);
-    const double x_root = 0.5 * (x_root_u + x_root_l);
-    const double y_root = 0.5 * (y_root_u + y_root_l);
-    const double dx_root = x_root_u - x_root_l;
-    const double dy_root = y_root_u - y_root_l;
-    const double root_gap = std::sqrt(dx_root * dx_root + dy_root * dy_root);
-    const int root_is_degenerate =
-        root_gap <= 1.0e-8 * std::max(1.0, ref_body_length) ? 1 : 0;
-
-    // Fin chord vector and orientation in the lab frame.
-    const double dx_fin = x_tip  - x_root;
-    const double dy_fin = y_tip  - y_root;
-    const double theta_fin_lab = std::atan2(dy_fin, dx_fin);
-    const double fin_length = std::sqrt(dx_fin * dx_fin + dy_fin * dy_fin);
-
-    // Position relative to COM.
-    const double x_tip_rel  = x_tip  - x_cm;
-    const double y_tip_rel  = y_tip  - y_cm;
-    const double x_root_rel = x_root - x_cm;
-    const double y_root_rel = y_root - y_cm;
-
-    // Finite-difference lateral (y) velocity at tip and root.
-    double v_y_tip  = std::numeric_limits<double>::quiet_NaN();
-    double v_y_root = std::numeric_limits<double>::quiet_NaN();
-    if (std::isfinite(s_fin_pitch_prev_time))
-    {
-        const double dt = loop_time - s_fin_pitch_prev_time;
-        if (dt > 1.0e-12)
-        {
-            v_y_tip  = (y_tip  - s_fin_pitch_prev_y_tip)  / dt;
-            v_y_root = (y_root - s_fin_pitch_prev_y_root) / dt;
-        }
-    }
-    s_fin_pitch_prev_y_tip  = y_tip;
-    s_fin_pitch_prev_y_root = y_root;
-    s_fin_pitch_prev_time   = loop_time;
-
-    // Active muscle phase at the fin root in the same active-body coordinate
-    // used by the PK1 stress, not the full fish x/L coordinate.
-    const double s_root_norm = active_end_s_norm_effective();
-    const double xi_root = active_xi_from_s_norm(s_root_norm);
-    const double act_phase_root = 2.0 * M_PI * xi_root /
-        std::max(active_wavelength_over_L, 1.0e-12) -
-        wave_time_sign * wave_omega * loop_time + active_phase0;
-
-    if (IBTK_MPI::getRank() != 0) return;
-
-    static std::ofstream out;
-    if (!out.is_open())
-    {
-        out.open(s_fin_pitch_diag_filename.c_str(), std::ios::out);
-        if (!out.is_open())
-        {
-            TBOX_WARNING("write_fin_pitch_diagnostics(): cannot open "
-                         << s_fin_pitch_diag_filename << "\n");
-            return;
-        }
-        out << "step,time"
-            << ",x_tip,y_tip,x_root,y_root"
-            << ",x_tip_rel,y_tip_rel,x_root_rel,y_root_rel"
-            << ",theta_fin_lab,fin_length"
-            << ",root_gap,root_is_degenerate"
-            << ",s_root_norm,active_xi_root"
-            << ",v_y_tip,v_y_root,act_phase_root\n";
-        out.flush();
-    }
-
-    out.setf(std::ios::scientific);
-    out.precision(10);
-    out << iteration_num
-        << "," << loop_time
-        << "," << x_tip  << "," << y_tip
-        << "," << x_root << "," << y_root
-        << "," << x_tip_rel  << "," << y_tip_rel
-        << "," << x_root_rel << "," << y_root_rel
-        << "," << theta_fin_lab
-        << "," << fin_length
-        << "," << root_gap
-        << "," << root_is_degenerate
-        << "," << s_root_norm
-        << "," << xi_root
-        << "," << v_y_tip
-        << "," << v_y_root
-        << "," << act_phase_root
-        << "\n";
-    out.flush();
-}
-
-// =========================================================================
-// Beta-act bisection calibration
-//
-// Called once per time step (after diagnostics).  State machine:
-//   phase 0 (SETTLING) : wait settle_cycles post-ramp beats after each change
-//   phase 1 (MEASURING): accumulate meas_cycles beats, then read s_last_completed_tail_A_norm
-//   phase 2 (DONE)     : converged or max_iter reached
-// beta_act is a global so modifying it here takes effect in the next PK1 call.
-// =========================================================================
-static void
-maybe_update_beta_calibration(const double loop_time)
-{
-    if (!s_beta_cal_enable || s_beta_cal_phase == 2) return;
-    if (!(wave_frequency > 0.0)) return;
-
-    const double phase_time = loop_time - wave_ramp_time;
-    if (phase_time < 0.0) return;
-    const int post_ramp_cycle = static_cast<int>(phase_time * wave_frequency);
-
-    // One-time initialisation of bisection bounds
-    if (!std::isfinite(s_beta_cal_hi))
-    {
-        s_beta_cal_lo = 0.0;
-        s_beta_cal_hi = std::isfinite(s_beta_cal_init_hi)
-            ? s_beta_cal_init_hi
-            : 3.0 * std::max(beta_act, 1.0e-12);
-        s_beta_cal_ref_cycle = post_ramp_cycle;
-        pout << "[beta_cal] init  lo=" << s_beta_cal_lo
-             << "  hi=" << s_beta_cal_hi
-             << "  beta_act=" << beta_act
-             << "  target A/L=" << s_beta_cal_target << "\n";
-    }
-
-    // Phase 0: SETTLING — wait settle_cycles beats after last beta change
-    if (s_beta_cal_phase == 0)
-    {
-        if (post_ramp_cycle < s_beta_cal_ref_cycle + s_beta_cal_settle_cycles)
-            return;
-        s_beta_cal_phase    = 1;
-        s_beta_cal_ref_cycle = post_ramp_cycle;
-        pout << "[beta_cal] settling done  t=" << loop_time
-             << "  measuring for " << s_beta_cal_meas_cycles << " cycles\n";
-    }
-
-    // Phase 1: MEASURING — wait meas_cycles beats, then evaluate
-    if (s_beta_cal_phase == 1)
-    {
-        if (post_ramp_cycle < s_beta_cal_ref_cycle + s_beta_cal_meas_cycles)
-            return;
-
-        const double A = s_last_completed_tail_A_norm;
-        if (!std::isfinite(A))
-        {
-            // Tail amplitude not yet available; extend window by one cycle
-            s_beta_cal_ref_cycle = post_ramp_cycle - s_beta_cal_meas_cycles + 1;
-            return;
-        }
-
-        s_beta_cal_iter++;
-        const double err = A - s_beta_cal_target;
-        pout << "[beta_cal] iter=" << s_beta_cal_iter
-             << "  beta=" << beta_act
-             << "  A/L=" << A
-             << "  err=" << err
-             << "  tol=" << s_beta_cal_tol << "\n";
-
-        if (std::abs(err) <= s_beta_cal_tol || s_beta_cal_iter >= s_beta_cal_max_iter)
-        {
-            s_beta_cal_phase = 2;
-            pout << "[beta_cal] CONVERGED  beta_act=" << beta_act
-                 << "  A/L=" << A << "\n";
-            return;
-        }
-
-        // Bisect: A < target → need stronger drive → raise lo
-        if (err < 0.0) s_beta_cal_lo = beta_act;
-        else           s_beta_cal_hi = beta_act;
-        beta_act = 0.5 * (s_beta_cal_lo + s_beta_cal_hi);
-        pout << "[beta_cal] bisect  lo=" << s_beta_cal_lo
-             << "  hi=" << s_beta_cal_hi
-             << "  -> beta_act=" << beta_act << "\n";
-
-        s_beta_cal_ref_cycle = post_ramp_cycle;
-        s_beta_cal_phase     = 0;   // back to settling
-    }
 }
 
 // =========================================================================
@@ -6087,6 +5090,12 @@ write_midline_history(const int            iteration_num,
     compute_current_midline_samples(ib_method_ops, mesh, equation_systems,
                                     n, x_cm, y_cm, samples, theta_body);
     const std::vector<double> kappa_body = compute_body_midline_curvature(samples);
+    std::vector<double> s_values(samples.size(), 0.0);
+    for (std::size_t k = 0; k < samples.size(); ++k)
+        s_values[k] = samples[k].s;
+    std::vector<double> kappa_ref_body =
+        compute_reference_midline_curvature_at_s(s_values);
+    cap_station_scalar_field(kappa_ref_body, passive_bending_curvature_cap);
 
     const double ph = phase01(loop_time);
 
@@ -6097,10 +5106,11 @@ write_midline_history(const int            iteration_num,
     if (!s_midline_hist_header_done)
     {
         f << "time,cycle_phase,station,s_norm"
+          << ",s"
           << ",x_lab,y_lab,x_cm,y_cm,theta_body"
           << ",x_body,y_body"   // deformation frame (remove translation + rotation)
           << ",y_prop"          // propulsion pattern: lab-frame lateral motion
-          << ",curvature\n";
+          << ",curvature,curvature_ref,curvature_rel\n";
         s_midline_hist_header_done = true;
     }
 
@@ -6111,6 +5121,12 @@ write_midline_history(const int            iteration_num,
         const double kv = (k < static_cast<int>(kappa_body.size()))
             ? kappa_body[static_cast<std::size_t>(k)]
             : std::numeric_limits<double>::quiet_NaN();
+        const double kref = (k < static_cast<int>(kappa_ref_body.size()))
+            ? kappa_ref_body[static_cast<std::size_t>(k)]
+            : std::numeric_limits<double>::quiet_NaN();
+        const double krel = (std::isfinite(kv) && std::isfinite(kref))
+            ? kv - kref
+            : std::numeric_limits<double>::quiet_NaN();
         // Keep lateral recoil/heave in the propulsion pattern; only forward
         // translation is irrelevant for the Y(s,t) matrix used downstream.
         const double y_prop = samples[k].y_lab;
@@ -6118,6 +5134,7 @@ write_midline_history(const int            iteration_num,
           << "," << ph
           << "," << k
           << "," << (samples[k].s / Lref)
+          << "," << samples[k].s
           << "," << samples[k].x_lab
           << "," << samples[k].y_lab
           << "," << x_cm
@@ -6127,16 +5144,14 @@ write_midline_history(const int            iteration_num,
           << "," << samples[k].y_body
           << "," << y_prop
           << "," << kv
+          << "," << kref
+          << "," << krel
           << "\n";
     }
 }
 
 // =========================================================================
-// Minimal sign/debug diagnostics
-//
-// This wrapper feeds the retained CSVs:
-//   direction_debug.csv, curvature_phase_diag.csv, and
-//   force_decomposition_diag.csv.
+// Retained diagnostics for COM, J positivity, curvature phase, and midline history.
 // =========================================================================
 static void
 write_test_diagnostics(const int            iteration_num,
@@ -6149,145 +5164,26 @@ write_test_diagnostics(const int            iteration_num,
         s_curvature_phase_diag_enable &&
         (s_curvature_phase_diag_interval <= 1 ||
          (iteration_num % s_curvature_phase_diag_interval == 0));
-    const bool direction_debug_due =
-        s_direction_debug_enable &&
-        (s_direction_debug_interval <= 1 ||
-         (iteration_num % s_direction_debug_interval == 0));
-    const bool force_decomp_due =
-        s_force_decomp_diag_enable &&
-        (s_force_decomp_diag_interval <= 1 ||
-         (iteration_num % s_force_decomp_diag_interval == 0));
-    const bool section_moment_due =
-        s_section_moment_diag_enable &&
-        (s_section_moment_diag_interval <= 1 ||
-         (iteration_num % s_section_moment_diag_interval == 0));
-    const bool fin_pitch_due =
-        s_fin_pitch_diag_enable &&
-        (s_fin_pitch_diag_interval <= 1 ||
-         (iteration_num % s_fin_pitch_diag_interval == 0));
     const bool geometry_conservation_due =
         s_geometry_conservation_diag_enable &&
         (s_geometry_conservation_diag_interval <= 1 ||
          (iteration_num % s_geometry_conservation_diag_interval == 0));
+    const bool force_decomp_due =
+        s_force_decomp_diag_enable &&
+        (s_force_decomp_diag_interval <= 1 ||
+         (iteration_num % s_force_decomp_diag_interval == 0));
     const bool midline_hist_due =
         s_midline_hist_enable &&
         (s_midline_hist_interval <= 1 ||
          (iteration_num % s_midline_hist_interval == 0));
-    if (!curvature_phase_due && !direction_debug_due && !force_decomp_due &&
-        !section_moment_due && !fin_pitch_due && !geometry_conservation_due &&
-        !midline_hist_due) return;
+    if (!curvature_phase_due && !geometry_conservation_due &&
+        !force_decomp_due && !midline_hist_due) return;
     if (!equation_systems) return;
 
-    // ── 1. Integrate the IB force only when a force diagnostic needs it.
-    const unsigned int dim = mesh.mesh_dimension();
-    double F_integral[NDIM] = { 0.0, 0.0 };
-    double F_power_on_fluid = std::numeric_limits<double>::quiet_NaN();
-    if (direction_debug_due || force_decomp_due)
-    {
-        System& F_sys = equation_systems->get_system(ib_method_ops->getForceSystemName());
-        NumericVector<double>* F_vec = F_sys.solution.get();
-        NumericVector<double>* F_ghost_vec = F_sys.current_local_solution.get();
-        F_vec->close();
-        copy_and_synch(*F_vec, *F_ghost_vec);
-
-        const DofMap& F_dof_map = F_sys.get_dof_map();
-        const FEType fe_type = F_dof_map.variable_type(0);
-        std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
-        std::unique_ptr<QBase> qrule = fe_type.default_quadrature_rule(dim);
-        fe->attach_quadrature_rule(qrule.get());
-        const std::vector<double>& JxW = fe->get_JxW();
-        const std::vector<std::vector<double>>& phi = fe->get_phi();
-        std::vector<std::vector<unsigned int>> dof_indices(NDIM);
-        boost::multi_array<double, 2> F_node;
-        boost::multi_array<double, 2> U_node;
-        VectorValue<double> F_qp;
-        VectorValue<double> U_qp;
-
-        const bool compute_ib_power = force_decomp_due;
-        const DofMap* U_dof_map_ptr = nullptr;
-        NumericVector<double>* U_ghost_vec = nullptr;
-        std::vector<std::vector<unsigned int>> U_dof_indices(NDIM);
-        if (compute_ib_power)
-        {
-            System& U_sys = equation_systems->get_system(
-                ib_method_ops->getVelocitySystemName());
-            NumericVector<double>* U_vec = U_sys.solution.get();
-            U_ghost_vec = U_sys.current_local_solution.get();
-            U_vec->close();
-            copy_and_synch(*U_vec, *U_ghost_vec);
-            U_dof_map_ptr = &U_sys.get_dof_map();
-            F_power_on_fluid = 0.0;
-        }
-
-        for (auto el_it = mesh.active_local_elements_begin();
-             el_it != mesh.active_local_elements_end(); ++el_it)
-        {
-            const Elem* elem = *el_it;
-            fe->reinit(elem);
-            for (unsigned int d = 0; d < NDIM; ++d)
-            {
-                F_dof_map.dof_indices(elem, dof_indices[d], d);
-                if (compute_ib_power && U_dof_map_ptr)
-                    U_dof_map_ptr->dof_indices(elem, U_dof_indices[d], d);
-            }
-            get_values_for_interpolation(F_node, *F_ghost_vec, dof_indices);
-            if (compute_ib_power && U_ghost_vec)
-                get_values_for_interpolation(U_node, *U_ghost_vec, U_dof_indices);
-            for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
-            {
-                interpolate(F_qp, qp, F_node, phi);
-                for (unsigned int d = 0; d < NDIM; ++d)
-                    F_integral[d] += F_qp(d) * JxW[qp];
-                if (compute_ib_power && U_ghost_vec)
-                {
-                    interpolate(U_qp, qp, U_node, phi);
-                    F_power_on_fluid += (F_qp * U_qp) * JxW[qp];
-                }
-            }
-        }
-        IBTK_MPI::sumReduction(F_integral, NDIM);
-        if (compute_ib_power) IBTK_MPI::sumReduction(&F_power_on_fluid, 1);
-    }
-
-    // ── 2. Tail amplitude is only needed by direction_debug.csv.
-    double tail_tip_y_lab = std::numeric_limits<double>::quiet_NaN();
-    bool have_tail_tip = false;
-    double tail_A_norm = std::numeric_limits<double>::quiet_NaN();
-    double tail_tip_y_rel = std::numeric_limits<double>::quiet_NaN();
-    if (direction_debug_due)
-    {
-        System& X_sys = equation_systems->get_system(ib_method_ops->getCurrentCoordinatesSystemName());
-        NumericVector<double>* X_vec = X_sys.solution.get();
-        NumericVector<double>* X_ghost_vec = X_sys.current_local_solution.get();
-        X_vec->close();
-        copy_and_synch(*X_vec, *X_ghost_vec);
-
-        const DofMap& X_dof_map = X_sys.get_dof_map();
-        double x_upper = 0.0, y_upper = 0.0;
-        double x_lower = 0.0, y_lower = 0.0;
-        const bool have_upper =
-            get_current_node_position(X_dof_map, *X_ghost_vec, mesh, ref_tail_upper_node_id, x_upper, y_upper);
-        const bool have_lower =
-            get_current_node_position(X_dof_map, *X_ghost_vec, mesh, ref_tail_lower_node_id, x_lower, y_lower);
-        if (have_upper && have_lower)
-        {
-            tail_tip_y_lab = 0.5 * (y_upper + y_lower);
-            have_tail_tip = true;
-        }
-    }
-
-    // ── 3. COM tracking, shared by both retained diagnostics.
     double x_cm_new = xcom_tracked;
     double y_cm_new = ycom_tracked;
-    double fish_area = 0.0;
-    compute_fish_com(ib_method_ops, mesh, equation_systems, x_cm_new, y_cm_new, &fish_area);
-    if (have_tail_tip)
-    {
-        tail_tip_y_rel = tail_tip_y_lab - y_cm_new;
-        tail_A_norm = update_tail_cycle_amplitude(loop_time, tail_tip_y_rel);
-    }
+    compute_fish_com(ib_method_ops, mesh, equation_systems, x_cm_new, y_cm_new, nullptr);
 
-    // Finite-difference COM velocity over the diagnostics sampling interval.
     double vcm_x = xcom_vel;
     double vcm_y = ycom_vel;
     if (std::isfinite(xcom_tracked_time))
@@ -6308,8 +5204,8 @@ write_test_diagnostics(const int            iteration_num,
     if (force_decomp_due)
     {
         write_force_decomposition_diagnostics(iteration_num, loop_time,
-                                              ib_method_ops, mesh, equation_systems,
-                                              F_integral, F_power_on_fluid,
+                                              ib_method_ops, mesh,
+                                              equation_systems,
                                               x_cm_new, y_cm_new,
                                               vcm_x, vcm_y);
     }
@@ -6321,32 +5217,10 @@ write_test_diagnostics(const int            iteration_num,
                                                 equation_systems);
     }
 
-    if (section_moment_due)
-    {
-        write_section_moment_decomposition_diagnostics(iteration_num, loop_time,
-                                                       ib_method_ops, mesh,
-                                                       equation_systems);
-    }
-
-    if (direction_debug_due)
-    {
-        write_direction_debug_diagnostics(iteration_num, loop_time,
-                                          F_integral,
-                                          x_cm_new, y_cm_new,
-                                          vcm_x, vcm_y,
-                                          tail_A_norm,
-                                          fish_area);
-    }
-
     if (curvature_phase_due)
         write_curvature_phase_diagnostics(iteration_num, loop_time,
                                           ib_method_ops, mesh, equation_systems,
                                           x_cm_new, y_cm_new);
-
-    if (fin_pitch_due)
-        write_fin_pitch_diagnostics(iteration_num, loop_time,
-                                    ib_method_ops, mesh, equation_systems,
-                                    x_cm_new, y_cm_new);
 
     if (midline_hist_due)
         write_midline_history(iteration_num, loop_time,
@@ -6381,35 +5255,138 @@ int main(int argc, char* argv[])
         fluid_viscosity = std::max(fluid_viscosity, 1.0e-30);
         fluid_density = std::max(fluid_density, 1.0e-30);
 
-        // ── Read passive material parameters ───────────────────────────────
-        eta_dev =
-            input_db->getDoubleWithDefault("ETA_DEV", eta_dev);
-        kappa_vol =
-            input_db->getDoubleWithDefault("KAPPA_VOL", kappa_vol);
-        eb_kappa_b =
-            input_db->getDoubleWithDefault("EB_KAPPA_B", eb_kappa_b);
-        structural_kv_loss_factor =
-            input_db->getDoubleWithDefault("STRUCTURAL_KV_LOSS_FACTOR",
-                                           structural_kv_loss_factor);
-        structural_kv_stress_cap_over_c1 =
-            input_db->getDoubleWithDefault("STRUCTURAL_KV_STRESS_CAP_OVER_C1",
-                                           structural_kv_stress_cap_over_c1);
-        use_eb_passive_bending =
-            input_db->getBoolWithDefault("USE_EB_PASSIVE_BENDING",
-                                         use_eb_passive_bending);
-        eb_active_s_end =
-            input_db->getDoubleWithDefault("EB_ACTIVE_S_END", eb_active_s_end);
-        s_eb_bending_stations =
-            input_db->getIntegerWithDefault("EB_BENDING_STATIONS",
-                                            s_eb_bending_stations);
-        eta_dev   = std::max(0.0, eta_dev);
-        kappa_vol = std::max(0.0, kappa_vol);
-        eb_kappa_b = std::max(1.0e-12, eb_kappa_b);
-        structural_kv_loss_factor = std::max(0.0, structural_kv_loss_factor);
-        structural_kv_stress_cap_over_c1 =
-            std::max(0.0, structural_kv_stress_cap_over_c1);
-        eb_active_s_end   = std::max(0.0, std::min(1.0, eb_active_s_end));
-        s_eb_bending_stations = std::max(3, s_eb_bending_stations);
+        c1_mesh_reg =
+            input_db->getDoubleWithDefault("C1_MESH_REG", c1_mesh_reg);
+        kappa_mesh_reg =
+            input_db->getDoubleWithDefault("KAPPA_MESH_REG", kappa_mesh_reg);
+
+        use_physical_bending =
+            input_db->getBoolWithDefault("USE_PHYSICAL_BENDING",
+                                         use_physical_bending);
+        strict_eb_force_stations =
+            input_db->getIntegerWithDefault("STRICT_EB_FORCE_STATIONS",
+                                            strict_eb_force_stations);
+        strict_eb_fd_epsilon =
+            input_db->getDoubleWithDefault("STRICT_EB_FD_EPSILON",
+                                           strict_eb_fd_epsilon);
+        strict_eb_min_station_area =
+            input_db->getDoubleWithDefault("STRICT_EB_MIN_STATION_AREA",
+                                           strict_eb_min_station_area);
+        strict_eb_dt_control_enable =
+            input_db->getBoolWithDefault("STRICT_EB_DT_CONTROL_ENABLE",
+                                         strict_eb_dt_control_enable);
+        strict_eb_dt_safety_factor =
+            input_db->getDoubleWithDefault("STRICT_EB_DT_SAFETY_FACTOR",
+                                           strict_eb_dt_safety_factor);
+        strict_eb_dt_max =
+            input_db->getDoubleWithDefault("STRICT_EB_DT_MAX",
+                                           strict_eb_dt_max);
+        passive_bending_B_body =
+            input_db->getDoubleWithDefault("B_BODY", passive_bending_B_body);
+        passive_bending_B_peduncle =
+            input_db->getDoubleWithDefault("B_PEDUNCLE", passive_bending_B_peduncle);
+        passive_bending_B_caudal =
+            input_db->getDoubleWithDefault("B_CAUDAL", passive_bending_B_caudal);
+        passive_bending_D_body =
+            input_db->getDoubleWithDefault("D_BODY", passive_bending_D_body);
+        passive_bending_D_peduncle =
+            input_db->getDoubleWithDefault("D_PEDUNCLE", passive_bending_D_peduncle);
+        passive_bending_D_caudal =
+            input_db->getDoubleWithDefault("D_CAUDAL", passive_bending_D_caudal);
+        passive_bending_body_transition_s =
+            input_db->getDoubleWithDefault("PASSIVE_BENDING_BODY_TRANSITION_S",
+                                           passive_bending_body_transition_s);
+        passive_bending_body_transition_w =
+            input_db->getDoubleWithDefault("PASSIVE_BENDING_BODY_TRANSITION_W",
+                                           passive_bending_body_transition_w);
+        passive_bending_caudal_transition_s =
+            input_db->getDoubleWithDefault("PASSIVE_BENDING_CAUDAL_TRANSITION_S",
+                                           passive_bending_caudal_transition_s);
+        passive_bending_caudal_transition_w =
+            input_db->getDoubleWithDefault("PASSIVE_BENDING_CAUDAL_TRANSITION_W",
+                                           passive_bending_caudal_transition_w);
+        passive_bending_curvature_method =
+            parse_passive_bending_curvature_method(
+                input_db->getStringWithDefault(
+                    "PASSIVE_BENDING_CURVATURE_METHOD",
+                    passive_bending_curvature_method_name()));
+        passive_bending_curvature_smooth_passes =
+            input_db->getIntegerWithDefault("PASSIVE_BENDING_CURVATURE_SMOOTH_PASSES",
+                                            passive_bending_curvature_smooth_passes);
+        passive_bending_curvature_poly_window =
+            input_db->getIntegerWithDefault("PASSIVE_BENDING_CURVATURE_POLY_WINDOW",
+                                            passive_bending_curvature_poly_window);
+        passive_bending_curvature_poly_order =
+            input_db->getIntegerWithDefault("PASSIVE_BENDING_CURVATURE_POLY_ORDER",
+                                            passive_bending_curvature_poly_order);
+        passive_bending_curvature_cap =
+            input_db->getDoubleWithDefault("PASSIVE_BENDING_CURVATURE_CAP",
+                                           passive_bending_curvature_cap);
+        passive_bending_kappa_dot_cap =
+            input_db->getDoubleWithDefault("PASSIVE_BENDING_KAPPA_DOT_CAP",
+                                           passive_bending_kappa_dot_cap);
+        passive_bending_moment_cap =
+            input_db->getDoubleWithDefault("PASSIVE_BENDING_MOMENT_CAP",
+                                           passive_bending_moment_cap);
+        use_continuum_damping =
+            input_db->getBoolWithDefault("USE_CONTINUUM_DAMPING",
+                                         use_continuum_damping);
+        continuum_damping_factor =
+            input_db->getDoubleWithDefault("CONTINUUM_DAMPING_FACTOR",
+                                           continuum_damping_factor);
+        continuum_damping_stress_cap_over_c1 =
+            input_db->getDoubleWithDefault(
+                "CONTINUUM_DAMPING_STRESS_CAP_OVER_C1",
+                continuum_damping_stress_cap_over_c1);
+        c1_mesh_reg = std::max(c1_mesh_reg, 1.0e-12);
+        kappa_mesh_reg = std::max(0.0, kappa_mesh_reg);
+        passive_bending_B_body = std::max(0.0, passive_bending_B_body);
+        passive_bending_B_peduncle = std::max(0.0, passive_bending_B_peduncle);
+        passive_bending_B_caudal = std::max(0.0, passive_bending_B_caudal);
+        passive_bending_D_body = std::max(0.0, passive_bending_D_body);
+        passive_bending_D_peduncle = std::max(0.0, passive_bending_D_peduncle);
+        passive_bending_D_caudal = std::max(0.0, passive_bending_D_caudal);
+        strict_eb_force_stations =
+            std::max(0, strict_eb_force_stations);
+        strict_eb_fd_epsilon =
+            std::max(strict_eb_fd_epsilon, 1.0e-12);
+        strict_eb_min_station_area =
+            std::max(strict_eb_min_station_area, 1.0e-30);
+        strict_eb_dt_safety_factor =
+            std::max(0.0, strict_eb_dt_safety_factor);
+        strict_eb_dt_max = (std::isfinite(strict_eb_dt_max) &&
+                            strict_eb_dt_max > 0.0) ?
+            strict_eb_dt_max : 0.0;
+        passive_bending_curvature_smooth_passes =
+            std::max(0, passive_bending_curvature_smooth_passes);
+        passive_bending_curvature_poly_window =
+            std::max(3, passive_bending_curvature_poly_window);
+        if (passive_bending_curvature_poly_window % 2 == 0)
+        {
+            ++passive_bending_curvature_poly_window;
+        }
+        passive_bending_curvature_poly_order =
+            std::max(2, passive_bending_curvature_poly_order);
+        passive_bending_curvature_poly_order =
+            std::min(passive_bending_curvature_poly_order,
+                     passive_bending_curvature_poly_window - 1);
+        passive_bending_curvature_cap =
+            std::max(0.0, passive_bending_curvature_cap);
+        passive_bending_kappa_dot_cap =
+            std::max(0.0, passive_bending_kappa_dot_cap);
+        passive_bending_moment_cap =
+            std::max(0.0, passive_bending_moment_cap);
+        continuum_damping_factor = std::max(0.0, continuum_damping_factor);
+        continuum_damping_stress_cap_over_c1 =
+            std::max(0.0, continuum_damping_stress_cap_over_c1);
+        passive_bending_body_transition_s =
+            clamp01(passive_bending_body_transition_s);
+        passive_bending_body_transition_w =
+            std::max(passive_bending_body_transition_w, 1.0e-12);
+        passive_bending_caudal_transition_s =
+            clamp01(passive_bending_caudal_transition_s);
+        passive_bending_caudal_transition_w =
+            std::max(passive_bending_caudal_transition_w, 1.0e-12);
 
         // ── Read geometry / actuation parameters ──────────────────────────
         fish_length  = input_db->getDoubleWithDefault("FISH_LENGTH", fish_length);
@@ -6429,25 +5406,25 @@ int main(int argc, char* argv[])
         }
 
         beta_act   = input_db->getDoubleWithDefault("BETA_ACT",   beta_act);
+        active_moment_mode =
+            parse_active_moment_mode(input_db->getStringWithDefault(
+                "ACTIVE_MOMENT_MODE", active_moment_mode_name()));
+        static_moment_m0 =
+            input_db->getDoubleWithDefault("STATIC_MOMENT_M0", static_moment_m0);
+        initial_bend_amplitude =
+            input_db->getDoubleWithDefault("INITIAL_BEND_AMPLITUDE",
+                                           initial_bend_amplitude);
         active_wavelength_over_L =
             input_db->getDoubleWithDefault("LAMBDA_ACT_OVER_LACT",
                                            active_wavelength_over_L);
         active_phase0 =
             input_db->getDoubleWithDefault("ACTIVE_PHASE0", active_phase0);
-        active_moment_to_stress_sign =
-            input_db->getDoubleWithDefault("ACTIVE_MOMENT_TO_STRESS_SIGN",
-                                           active_moment_to_stress_sign);
         active_k_shape_mode =
             parse_active_k_shape_mode(input_db->getStringWithDefault(
                 "K_SHAPE_MODE", active_k_shape_mode_name()));
         active_s_start  = input_db->getDoubleWithDefault("ACTIVE_S_START",  active_s_start);
         active_s_end    = input_db->getDoubleWithDefault("ACTIVE_S_END",    active_s_end);
         active_s_smooth = input_db->getDoubleWithDefault("ACTIVE_S_SMOOTH", active_s_smooth);
-        active_band_fraction =
-            input_db->getDoubleWithDefault("ACTIVE_BAND_FRACTION", active_band_fraction);
-        active_t_act_max_over_c1 =
-            input_db->getDoubleWithDefault("ACTIVE_T_ACT_MAX_OVER_C1",
-                                           active_t_act_max_over_c1);
         reference_profile_bins =
             input_db->getIntegerWithDefault("REFERENCE_PROFILE_BINS", reference_profile_bins);
         reference_backbone_end_x =
@@ -6455,9 +5432,6 @@ int main(int argc, char* argv[])
         use_laplace_reference_parameterization =
             input_db->getBoolWithDefault("USE_LAPLACE_REFERENCE_PARAMETERIZATION",
                                          use_laplace_reference_parameterization);
-        use_fe_active_section_data =
-            input_db->getBoolWithDefault("USE_FE_ACTIVE_SECTION_DATA",
-                                         use_fe_active_section_data);
         laplace_head_bc_width_over_L =
             input_db->getDoubleWithDefault("LAPLACE_HEAD_BC_WIDTH_OVER_L",
                                            laplace_head_bc_width_over_L);
@@ -6467,37 +5441,10 @@ int main(int argc, char* argv[])
         active_s_start = clamp01(active_s_start);
         active_s_end = clamp01(active_s_end);
         active_s_smooth = std::max(0.0, active_s_smooth);
-        active_band_fraction = std::max(0.0, active_band_fraction);
         active_wavelength_over_L = std::max(active_wavelength_over_L, 1.0e-12);
-        active_moment_to_stress_sign =
-            (active_moment_to_stress_sign >= 0.0) ? 1.0 : -1.0;
-        active_t_act_max_over_c1 = std::max(active_t_act_max_over_c1, 1.0e-12);
         reference_profile_bins = std::max(8, reference_profile_bins);
         laplace_head_bc_width_over_L = std::max(0.0, laplace_head_bc_width_over_L);
         laplace_tail_bc_width_over_L = std::max(0.0, laplace_tail_bc_width_over_L);
-
-        // ── Beta-act bisection calibration ─────────────────────────────────
-        s_beta_cal_enable =
-            input_db->getBoolWithDefault("BETA_ACT_CALIBRATION", s_beta_cal_enable);
-        s_beta_cal_target =
-            input_db->getDoubleWithDefault("BETA_ACT_TARGET_A", s_beta_cal_target);
-        s_beta_cal_tol =
-            input_db->getDoubleWithDefault("BETA_ACT_CAL_TOL", s_beta_cal_tol);
-        s_beta_cal_settle_cycles =
-            input_db->getIntegerWithDefault("BETA_ACT_CAL_SETTLE_CYCLES",
-                                            s_beta_cal_settle_cycles);
-        s_beta_cal_meas_cycles =
-            input_db->getIntegerWithDefault("BETA_ACT_CAL_MEAS_CYCLES",
-                                            s_beta_cal_meas_cycles);
-        s_beta_cal_max_iter =
-            input_db->getIntegerWithDefault("BETA_ACT_CAL_MAX_ITER",
-                                            s_beta_cal_max_iter);
-        s_beta_cal_init_hi =
-            input_db->getDoubleWithDefault("BETA_ACT_CAL_INIT_HI",
-                                           s_beta_cal_init_hi);
-        s_beta_cal_settle_cycles = std::max(1, s_beta_cal_settle_cycles);
-        s_beta_cal_meas_cycles   = std::max(1, s_beta_cal_meas_cycles);
-        s_beta_cal_max_iter      = std::max(1, s_beta_cal_max_iter);
 
         // ── Midline history CSV ────────────────────────────────────────────
         s_midline_hist_enable =
@@ -6520,23 +5467,12 @@ int main(int argc, char* argv[])
         }
 
         build_reference_profile_from_mesh(mesh);
-        initialize_tail_tracking_points(mesh);
-        initialize_fin_root_tracking_points(mesh);
-        if (use_laplace_reference_parameterization && use_fe_active_section_data)
-        {
-            pout << "  Building FE-consistent section data "
-                 << "(active eta_bar/I2_c)...\n";
-            build_fe_section_data(mesh);
-        }
         if (active_s_span_norm_effective() <= 1.0e-12)
         {
             TBOX_ERROR("Effective active-body span is zero: check ACTIVE_S_START "
                        "and ACTIVE_S_END.\n");
         }
         initialize_reference_com_from_mesh(mesh);
-        write_reference_centerline_csv();
-        write_active_section_consistency();
-        write_geometry_sign_diagnostics();
 
         // ── Read only the retained test diagnostics ─────────────────────────
         s_curvature_phase_diag_enable = input_db->getBoolWithDefault(
@@ -6558,12 +5494,12 @@ int main(int argc, char* argv[])
                                                  "PROGRESS_PRINT_INTERVAL",
                                                  s_progress_print_interval));
 
-        s_direction_debug_enable = input_db->getBoolWithDefault(
-            "DIRECTION_DEBUG_ENABLE", s_direction_debug_enable);
-        s_direction_debug_interval = std::max(1, input_db->getIntegerWithDefault(
-            "DIRECTION_DEBUG_INTERVAL", s_direction_debug_interval));
-        s_direction_debug_filename = input_db->getStringWithDefault(
-            "DIRECTION_DEBUG_FILENAME", s_direction_debug_filename);
+        s_geometry_conservation_diag_enable = input_db->getBoolWithDefault(
+            "GEOMETRY_CONSERVATION_DIAG_ENABLE", s_geometry_conservation_diag_enable);
+        s_geometry_conservation_diag_interval = std::max(1, input_db->getIntegerWithDefault(
+            "GEOMETRY_CONSERVATION_DIAG_INTERVAL", s_geometry_conservation_diag_interval));
+        s_geometry_conservation_diag_filename = input_db->getStringWithDefault(
+            "GEOMETRY_CONSERVATION_DIAG_FILENAME", s_geometry_conservation_diag_filename);
 
         s_force_decomp_diag_enable = input_db->getBoolWithDefault(
             "FORCE_DECOMP_DIAG_ENABLE", s_force_decomp_diag_enable);
@@ -6573,31 +5509,6 @@ int main(int argc, char* argv[])
             "FORCE_DECOMP_DIAG_FILENAME", s_force_decomp_diag_filename);
         s_force_decomp_quad_order = input_db->getStringWithDefault(
             "FORCE_DECOMP_QUAD_ORDER", s_force_decomp_quad_order);
-
-        s_section_moment_diag_enable = input_db->getBoolWithDefault(
-            "SECTION_MOMENT_DIAG_ENABLE", s_section_moment_diag_enable);
-        s_section_moment_diag_interval = std::max(1, input_db->getIntegerWithDefault(
-            "SECTION_MOMENT_DIAG_INTERVAL", s_section_moment_diag_interval));
-        s_section_moment_diag_filename = input_db->getStringWithDefault(
-            "SECTION_MOMENT_DIAG_FILENAME", s_section_moment_diag_filename);
-        s_section_moment_quad_order = input_db->getStringWithDefault(
-            "SECTION_MOMENT_QUAD_ORDER", s_section_moment_quad_order);
-        s_section_moment_diag_bins = input_db->getIntegerWithDefault(
-            "SECTION_MOMENT_DIAG_BINS", s_section_moment_diag_bins);
-
-        s_geometry_conservation_diag_enable = input_db->getBoolWithDefault(
-            "GEOMETRY_CONSERVATION_DIAG_ENABLE", s_geometry_conservation_diag_enable);
-        s_geometry_conservation_diag_interval = std::max(1, input_db->getIntegerWithDefault(
-            "GEOMETRY_CONSERVATION_DIAG_INTERVAL", s_geometry_conservation_diag_interval));
-        s_geometry_conservation_diag_filename = input_db->getStringWithDefault(
-            "GEOMETRY_CONSERVATION_DIAG_FILENAME", s_geometry_conservation_diag_filename);
-
-        s_fin_pitch_diag_enable = input_db->getBoolWithDefault(
-            "FIN_PITCH_DIAG_ENABLE", s_fin_pitch_diag_enable);
-        s_fin_pitch_diag_interval = std::max(1, input_db->getIntegerWithDefault(
-            "FIN_PITCH_DIAG_INTERVAL", s_fin_pitch_diag_interval));
-        s_fin_pitch_diag_filename = input_db->getStringWithDefault(
-            "FIN_PITCH_DIAG_FILENAME", s_fin_pitch_diag_filename);
 
         // ── Print startup summary ─────────────────────────────────────────
         const double L_act = active_phase_length_dimensional();
@@ -6610,68 +5521,83 @@ int main(int argc, char* argv[])
         const double U_act   = wave_frequency * lambda_phase;
         const double Re_act  = fluid_density * U_act * L_fish /
             std::max(fluid_viscosity, 1.0e-30);
-        pout << "\n=== Phase-2: active-bending self-propelled swimmer ===\n";
-        pout << "  fish_length L_fish = " << fish_length << "\n";
-        pout << "  reference/backbone arc length L_ref = " << ref_arc_length << "\n";
-        pout << "  active-body s_norm range = [" << active_s0 << ", " << active_s1
+        const double eb_dt_estimate = estimate_strict_eb_dt();
+        const double eb_dt_cap = strict_eb_dt_limit();
+        pout << "\n=== IBFE continuum fish: strict EB/Kirchhoff variational bending ===\n";
+        pout << "  fish length = " << fish_length
+             << ", reference arc length = " << ref_arc_length << "\n";
+        pout << "  active s_norm range = [" << active_s0 << ", " << active_s1
              << "], span = " << active_s_span << "\n";
-        pout << "  active-body phase length L_act = "
-             << L_act << " = span*L_ref\n";
-        pout << "  LAMBDA_ACT_OVER_LACT = lambda_act/L_act = "
-             << active_wavelength_over_L << "\n";
-        pout << "  lambda_act = LAMBDA_ACT_OVER_LACT * L_act = " << lambda_phase << "\n";
-        pout << "  lambda_act/L_ref = " << lambda_phase / L_ref << "\n";
-        pout << "  lambda_act/L_fish = " << lambda_phase / L_fish << "\n";
-        pout << "  U_act = f*lambda_act = " << U_act  << "\n";
-        pout << "  fluid rho/mu = " << fluid_density << " / " << fluid_viscosity << "\n";
-        pout << "  Re_act = rho*f*lambda_act*L_fish/mu = "
-             << Re_act << "\n";
-        pout << "  beta_act = " << beta_act << "\n";
-        pout << "  active drive model = MUSCLE_MOMENT/XU2024_SIMPLE\n";
-        pout << "  eb_kappa_b (EB stiffness) = " << eb_kappa_b << "\n";
-        pout << "  passive shape maintenance: dev+dil split\n"
-             << "    ETA_DEV = " << eta_dev << "  (PP_dev = 2*eta_dev*F)\n"
-             << "    KAPPA_VOL = " << kappa_vol << "  (PP_dil = 2*(-eta_dev+kappa_vol*lnJ)*F^{-T})\n";
-        pout << "  EB passive bending = "
-             << (use_eb_passive_bending ? "ON" : "OFF")
-             << ", stations = " << s_eb_bending_stations << "\n";
-        pout << "  structural Kelvin-Voigt loss factor = "
-             << structural_kv_loss_factor
-             << ", stress cap = " << structural_kv_stress_cap_over_c1
-             << " * eta_dev\n";
-        if (use_eb_passive_bending)
-        {
-            pout << "  legacy fiber KV stress is disabled because EB passive bending "
-                 << "already includes the curvature-rate damping term.\n";
-        }
-        pout << "  requested active zone s/L = [" << active_s_start << ", " << active_s_end << "]\n";
-        pout << "  active end taper width s/L = " << active_s_smooth << "\n";
-        pout << "  reference backbone end x = " << ref_backbone_end_x
-             << ", mapped reference-end s_norm = " << active_end_s_norm_effective()
+        pout << "  lambda_act = " << lambda_phase
+             << ", U_act = " << U_act
+             << ", Re_act = " << Re_act << "\n";
+        pout << "  mesh regularization C1_MESH_REG = " << c1_mesh_reg
+             << ", KAPPA_MESH_REG = " << kappa_mesh_reg << "\n";
+        pout << "  mesh regularization split = decoupled isochoric-dev + dilational-logJ\n";
+        pout << "  physical passive bending = "
+             << (use_physical_bending ? "ON" : "OFF")
+             << ", strict EB variational force = ON"
+             << ", B body/peduncle/caudal = "
+             << passive_bending_B_body << " / "
+             << passive_bending_B_peduncle << " / "
+             << passive_bending_B_caudal
+             << ", D body/peduncle/caudal = "
+             << passive_bending_D_body << " / "
+             << passive_bending_D_peduncle << " / "
+             << passive_bending_D_caudal << "\n";
+        pout << "  passive bending samples s/L = 0, 0.45, 0.65, 0.82, 0.86, 0.90, 1:\n";
+        pout << "    B = "
+             << get_passive_bending_B_local(0.00) << ", "
+             << get_passive_bending_B_local(0.45) << ", "
+             << get_passive_bending_B_local(0.65) << ", "
+             << get_passive_bending_B_local(0.82) << ", "
+             << get_passive_bending_B_local(0.86) << ", "
+             << get_passive_bending_B_local(0.90) << ", "
+             << get_passive_bending_B_local(1.00) << "\n";
+        pout << "    D = "
+             << get_passive_bending_D_local(0.00) << ", "
+             << get_passive_bending_D_local(0.45) << ", "
+             << get_passive_bending_D_local(0.65) << ", "
+             << get_passive_bending_D_local(0.82) << ", "
+             << get_passive_bending_D_local(0.86) << ", "
+             << get_passive_bending_D_local(0.90) << ", "
+             << get_passive_bending_D_local(1.00) << "\n";
+        pout << "  strict EB weak form = int [B*(kappa-kappa_ref)"
+             << " + D*kappa_dot - M_active] * delta_kappa ds\n";
+        pout << "  strict EB stations = " << strict_eb_station_count()
+             << ", FD epsilon = " << strict_eb_fd_epsilon
+             << ", min station area = " << strict_eb_min_station_area << "\n";
+        pout << "  EB curvature method = " << passive_bending_curvature_method_name()
+             << ", smooth passes = " << passive_bending_curvature_smooth_passes
+             << ", curvature cap = " << passive_bending_curvature_cap
+             << ", kappa_dot cap = " << passive_bending_kappa_dot_cap
+             << ", moment cap = " << passive_bending_moment_cap << "\n";
+        pout << "  EB-to-IBFE force distribution = transpose of area-weighted "
+             << "  backbone extraction\n";
+        pout << "  strict EB dt control = "
+             << ((strict_eb_dt_control_enable || strict_eb_dt_max > 0.0) ?
+                 "ON" : "OFF")
+             << ", dt_EB_est = " << eb_dt_estimate
+             << ", safety = " << strict_eb_dt_safety_factor
+             << ", absolute cap = "
+             << (strict_eb_dt_max > 0.0 ? strict_eb_dt_max :
+                 std::numeric_limits<double>::quiet_NaN())
+             << ", applied cap = " << eb_dt_cap << "\n";
+        pout << "  continuum structural damping = "
+             << (use_continuum_damping ? "ON" : "OFF")
+             << ", factor = " << continuum_damping_factor
+             << ", stress cap = " << continuum_damping_stress_cap_over_c1
+             << " * C1_MESH_REG\n";
+        pout << "  active moment mode = " << active_moment_mode_name()
+             << ", beta_act = " << beta_act
+             << ", static M0 = " << static_moment_m0
+             << ", initial bend amplitude = " << initial_bend_amplitude << "\n";
+        pout << "  beta_act = " << beta_act
+             << ", K_shape = " << active_k_shape_formula_string()
              << "\n";
-        pout << "  active band mode = LATERAL, fraction = " << active_band_fraction
-             << ", I2_eff_unit = " << active_band_second_moment_unit() << "\n";
-        pout << "  active moment width scale = local w(s)^2 from the reference mesh\n";
-        pout << "  FE active section correction = "
-             << (active_section_correction_enabled() ? "ON" : "OFF") << "\n";
-        if (active_section_correction_enabled())
-        {
-            pout << "  active moment-to-stress mapping = "
-                 << "T_act = " << active_moment_to_stress_sign
-                 << " * w * Mm * (eta-eta_bar_FE) / I2_c_FE"
-                 << "; curvature-conjugate moment = "
-                 << -active_moment_to_stress_sign << " * Mm\n";
-        }
-        else
-        {
-            pout << "  active moment-to-stress mapping = "
-                 << "T_act = " << active_moment_to_stress_sign
-                 << " * w * Mm * eta / I2_eff"
-                 << "; curvature-conjugate moment = "
-                 << -active_moment_to_stress_sign << " * Mm\n";
-        }
-        pout << "  active stress cap = "
-             << active_t_act_max_over_c1 << " * eta_dev\n";
+        pout << "  active moment = beta_act*w(s)^2*K_shape(xi)*cos(active phase)\n";
+        pout << "  active zone s/L = [" << active_s_start << ", "
+             << active_s_end << "], taper = " << active_s_smooth << "\n";
         pout << "  reference profile bins = " << reference_profile_bins << "\n";
         pout << "  reference parameterization = "
              << (use_laplace_reference_parameterization ?
@@ -6698,7 +5624,6 @@ int main(int argc, char* argv[])
              << " omega*t + ACTIVE_PHASE0\n";
         pout << "  K_shape mode = " << active_k_shape_mode_name()
              << ", K_shape(xi) = " << active_k_shape_formula_string() << "\n";
-        pout << "  muscle moment = beta_act*w(s)^2*K_shape(xi)*cos(active phase)\n";
         pout << "  active phase-speed direction in s = "
              << active_phase_propagation_s_string() << "\n";
         pout << "  active phase-speed x sign = "
@@ -6710,38 +5635,31 @@ int main(int argc, char* argv[])
         pout << "  reference mesh area = " << s_reference_area << "\n";
         pout << "  mesh h_max/L = " << ref_h_max / std::max(fish_length, 1.0e-12) << "\n";
         pout << "  progress print interval = " << s_progress_print_interval << "\n";
-        pout << "  retained CSV diagnostics = direction_debug.csv, "
-             << s_curvature_phase_diag_filename
-             << ", " << s_force_decomp_diag_filename
-             << ", " << s_section_moment_diag_filename
-             << ", " << s_geometry_conservation_diag_filename
-             << ", geometry_sign_diag.csv, active_section_consistency.csv\n";
-        pout << "  direction debug diagnostics = "
-             << (s_direction_debug_enable ? "on" : "off")
-             << ", interval = " << s_direction_debug_interval
-             << ", file = " << s_direction_debug_filename << "\n";
+        pout << "  retained CSV diagnostics = "
+             << s_midline_hist_filename << " (whole-body bending), "
+             << s_curvature_phase_diag_filename << " (curvature phase), "
+             << s_geometry_conservation_diag_filename << " (J_min), "
+             << s_force_decomp_diag_filename << " (force decomposition)\n";
+        pout << "  midline history diagnostics = "
+             << (s_midline_hist_enable ? "on" : "off")
+             << ", interval = " << s_midline_hist_interval
+             << ", stations = " << s_midline_hist_stations
+             << ", file = " << s_midline_hist_filename << "\n";
         pout << "  curvature/phase diagnostics = "
              << (s_curvature_phase_diag_enable ? "on" : "off")
              << ", interval = " << s_curvature_phase_diag_interval
              << ", stations = " << s_curvature_phase_diag_stations
              << ", start_time = " << s_curvature_phase_diag_start_time
              << ", file = " << s_curvature_phase_diag_filename << "\n";
+        pout << "  geometry conservation diagnostics = "
+             << (s_geometry_conservation_diag_enable ? "on" : "off")
+             << ", interval = " << s_geometry_conservation_diag_interval
+             << ", file = " << s_geometry_conservation_diag_filename << "\n";
         pout << "  force decomposition diagnostics = "
              << (s_force_decomp_diag_enable ? "on" : "off")
              << ", interval = " << s_force_decomp_diag_interval
              << ", quad_order = " << s_force_decomp_quad_order
              << ", file = " << s_force_decomp_diag_filename << "\n";
-        pout << "  section moment diagnostics = "
-             << (s_section_moment_diag_enable ? "on" : "off")
-             << ", interval = " << s_section_moment_diag_interval
-             << ", bins = " << (s_section_moment_diag_bins > 0 ?
-                                s_section_moment_diag_bins : reference_profile_bins)
-             << ", quad_order = " << s_section_moment_quad_order
-             << ", file = " << s_section_moment_diag_filename << "\n";
-        pout << "  geometry conservation diagnostics = "
-             << (s_geometry_conservation_diag_enable ? "on" : "off")
-             << ", interval = " << s_geometry_conservation_diag_interval
-             << ", file = " << s_geometry_conservation_diag_filename << "\n";
 
         pout << "  effective active-zone length = "
              << active_s_span * ref_arc_length
@@ -6816,72 +5734,50 @@ int main(int argc, char* argv[])
                 app_initializer->getComponentDatabase("GriddingAlgorithm"),
                 error_detector, box_generator, load_balancer);
 
-        // ── Register PK1 stress functions ─────────────────────────────────
-        //
-        // Five contributions are registered in order:
-        //   (1) Dev shape maintenance — 2*eta_dev*F (pure shear)
-        //   (2) Dil volume penalty    — 2*(-eta_dev+kappa_vol*lnJ)*F^{-T}
-        //   (3) EB passive bending    — Xu/Zhou/Yu section-resultant analogue
-        //   (4) Structural damping    — legacy fiber Kelvin-Voigt damping
-        //   (5) Active bending        — Xu, Zhou & Yu 2024 active muscle moment
-        //
-        // The IBFE framework sums all PK1 contributions when spreading
-        // forces to the fluid grid.
-
         std::vector<int> ref_geom_vars(REF_GEOM_N_VARS);
         for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v) ref_geom_vars[v] = v;
         const std::vector<SystemData> ref_geom_sys_data(
             1, SystemData(REF_GEOM_SYSTEM_NAME, ref_geom_vars));
-        const std::vector<SystemData> no_sys_data;
-        IBFEMethod::PK1StressFcnData PK1_dev_data(
-            PK1_dev_stress_function, no_sys_data);
-        IBFEMethod::PK1StressFcnData PK1_dil_data(
-            PK1_dil_stress_function, no_sys_data);
-        IBFEMethod::PK1StressFcnData PK1_act_data(
-            PK1_active_stress_function, ref_geom_sys_data);
-        std::vector<int> eb_bending_vars(EB_BENDING_N_VARS);
-        for (unsigned int v = 0; v < EB_BENDING_N_VARS; ++v) eb_bending_vars[v] = v;
-        std::vector<SystemData> ref_geom_eb_sys_data = ref_geom_sys_data;
-        ref_geom_eb_sys_data.push_back(
-            SystemData(EB_BENDING_SYSTEM_NAME, eb_bending_vars));
-        IBFEMethod::PK1StressFcnData PK1_eb_data(
-            PK1_eb_passive_bending_stress_function, ref_geom_eb_sys_data);
+        IBFEMethod::PK1StressFcnData PK1_reg_dev_data(
+            PK1_reg_dev_stress_function, ref_geom_sys_data);
+        IBFEMethod::PK1StressFcnData PK1_reg_dil_data(
+            PK1_reg_dil_stress_function, ref_geom_sys_data);
+        IBFEMethod::LagBodyForceFcnData strict_eb_force_data(
+            strict_eb_variational_body_force_function, ref_geom_sys_data);
         std::vector<int> velocity_vars(NDIM);
         for (unsigned int d = 0; d < NDIM; ++d) velocity_vars[d] = d;
         std::vector<SystemData> ref_geom_velocity_grad_sys_data = ref_geom_sys_data;
         ref_geom_velocity_grad_sys_data.push_back(
             SystemData(ib_method_ops->getVelocitySystemName(),
                        std::vector<int>(), velocity_vars));
-        IBFEMethod::PK1StressFcnData PK1_kv_data(
-            PK1_structural_damping_stress_function, ref_geom_velocity_grad_sys_data);
+        IBFEMethod::PK1StressFcnData PK1_damp_data(
+            PK1_continuum_damping_stress_function,
+            ref_geom_velocity_grad_sys_data);
 
-        PK1_dev_data.quad_order =
+        PK1_reg_dev_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(
-                input_db->getStringWithDefault("PK1_DEV_QUAD_ORDER", "FIFTH"));
-        PK1_dil_data.quad_order =
+                input_db->getStringWithDefault("PK1_REG_DEV_QUAD_ORDER", "THIRD"));
+        PK1_reg_dil_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(
-                input_db->getStringWithDefault("PK1_DIL_QUAD_ORDER", "FIFTH"));
-        PK1_act_data.quad_order =
-            Utility::string_to_enum<libMesh::Order>(
-                input_db->getStringWithDefault("PK1_ACT_QUAD_ORDER", "FIFTH"));
-        PK1_eb_data.quad_order =
-            Utility::string_to_enum<libMesh::Order>(
-                input_db->getStringWithDefault("PK1_EB_QUAD_ORDER", "FIFTH"));
-        PK1_kv_data.quad_order =
+                input_db->getStringWithDefault("PK1_REG_DIL_QUAD_ORDER", "THIRD"));
+        PK1_damp_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(
                 input_db->getStringWithDefault("PK1_DAMP_QUAD_ORDER", "FIFTH"));
 
-        ib_method_ops->registerPK1StressFunction(PK1_dev_data);
-        ib_method_ops->registerPK1StressFunction(PK1_dil_data);
-        ib_method_ops->registerPK1StressFunction(PK1_eb_data);
-        ib_method_ops->registerPK1StressFunction(PK1_kv_data);
-        ib_method_ops->registerPK1StressFunction(PK1_act_data);
+        ib_method_ops->registerPK1StressFunction(PK1_reg_dev_data);
+        ib_method_ops->registerPK1StressFunction(PK1_reg_dil_data);
+        ib_method_ops->registerLagBodyForceFunction(strict_eb_force_data);
+        if (use_continuum_damping)
+        {
+            ib_method_ops->registerPK1StressFunction(PK1_damp_data);
+        }
+        ib_method_ops->registerInitialCoordinateMappingFunction(
+            coordinate_mapping_function);
 
         ib_method_ops->initializeFEEquationSystems();
         EquationSystems* equation_systems =
             ib_method_ops->getFEDataManager()->getEquationSystems();
         add_reference_geometry_system(equation_systems);
-        add_eb_bending_system(equation_systems);
 
         // ── Post-processor ─────────────────────────────────────────────────
         Pointer<IBFEPostProcessor> ib_post_processor =
@@ -6890,37 +5786,16 @@ int main(int argc, char* argv[])
         ib_post_processor->registerTensorVariable("FF", MONOMIAL, CONSTANT,
                                                    IBFEPostProcessor::FF_fcn);
 
-        // Output retained stress fields for visualization.
-        IBFEMethod::PK1StressFcnData pk1_dev_post_data(
-            PK1_dev_stress_function, no_sys_data);
-        ib_post_processor->registerTensorVariable(
-            "sigma_dev_shape", MONOMIAL, CONSTANT,
-            IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
-            no_sys_data, &pk1_dev_post_data);
-        IBFEMethod::PK1StressFcnData pk1_dil_post_data(
-            PK1_dil_stress_function, no_sys_data);
-        ib_post_processor->registerTensorVariable(
-            "sigma_dil_shape", MONOMIAL, CONSTANT,
-            IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
-            no_sys_data, &pk1_dil_post_data);
-        IBFEMethod::PK1StressFcnData pk1_act_post_data(
-            PK1_active_stress_function, ref_geom_sys_data);
-        ib_post_processor->registerTensorVariable(
-            "sigma_active", MONOMIAL, CONSTANT,
-            IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
-            ref_geom_sys_data, &pk1_act_post_data);
-        IBFEMethod::PK1StressFcnData pk1_kv_post_data(
-            PK1_structural_damping_stress_function, ref_geom_velocity_grad_sys_data);
-        ib_post_processor->registerTensorVariable(
-            "sigma_structural_damping", MONOMIAL, CONSTANT,
-            IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
-            ref_geom_velocity_grad_sys_data, &pk1_kv_post_data);
-        IBFEMethod::PK1StressFcnData pk1_eb_post_data(
-            PK1_eb_passive_bending_stress_function, ref_geom_eb_sys_data);
-        ib_post_processor->registerTensorVariable(
-            "sigma_eb_passive", MONOMIAL, CONSTANT,
-            IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
-            ref_geom_eb_sys_data, &pk1_eb_post_data);
+        IBFEMethod::PK1StressFcnData pk1_damp_post_data(
+            PK1_continuum_damping_stress_function,
+            ref_geom_velocity_grad_sys_data);
+        if (use_continuum_damping)
+        {
+            ib_post_processor->registerTensorVariable(
+                "sigma_continuum_structural_damping", MONOMIAL, CONSTANT,
+                IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
+                ref_geom_velocity_grad_sys_data, &pk1_damp_post_data);
+        }
 
         // ── Initial conditions / BCs ────────────────────────────────────────
         if (input_db->keyExists("VelocityInitialConditions"))
@@ -6979,8 +5854,9 @@ int main(int argc, char* argv[])
         xcom_tracked_time = loop_time;
         xcom_vel = 0.0;
         ycom_vel = 0.0;
-        update_eb_bending_system(ib_method_ops, mesh, equation_systems,
-                                 loop_time, xcom_tracked, ycom_tracked);
+
+        update_strict_eb_force_cache(ib_method_ops, mesh, equation_systems,
+                                     loop_time);
 
         write_test_diagnostics(iteration_num, loop_time,
                                ib_method_ops, mesh, equation_systems);
@@ -7022,13 +5898,16 @@ int main(int argc, char* argv[])
                 pout << "V_cm = (" << xcom_vel   << ", " << ycom_vel    << ")\n";
             }
 
-            dt = time_integrator->getMaximumTimeStepSize();
-            double eb_x_cm = xcom_tracked;
-            double eb_y_cm = ycom_tracked;
-            compute_fish_com(ib_method_ops, mesh, equation_systems,
-                             eb_x_cm, eb_y_cm);
-            update_eb_bending_system(ib_method_ops, mesh, equation_systems,
-                                     loop_time, eb_x_cm, eb_y_cm);
+            const double dt_ibamr = time_integrator->getMaximumTimeStepSize();
+            dt = apply_strict_eb_dt_control(dt_ibamr);
+            if (print_timestep_log && dt < dt_ibamr)
+            {
+                pout << "STRICT_EB dt cap: requested " << dt_ibamr
+                     << ", using " << dt
+                     << " (limit " << strict_eb_dt_limit() << ")\n";
+            }
+            update_strict_eb_force_cache(ib_method_ops, mesh,
+                                         equation_systems, loop_time);
             time_integrator->advanceHierarchy(dt);
             loop_time += dt;
 
@@ -7041,17 +5920,8 @@ int main(int argc, char* argv[])
                 pout << "+++++++++++++++++++++++++++++++++++++++++++++++++++\n\n";
             }
 
-            double eb_x_cm_new = xcom_tracked;
-            double eb_y_cm_new = ycom_tracked;
-            compute_fish_com(ib_method_ops, mesh, equation_systems,
-                             eb_x_cm_new, eb_y_cm_new);
-            update_eb_bending_system(ib_method_ops, mesh, equation_systems,
-                                     loop_time, eb_x_cm_new, eb_y_cm_new);
-
-            // ── Minimal sign/debug diagnostics ───────────────────────────────
             write_test_diagnostics(iteration_num, loop_time,
                                    ib_method_ops, mesh, equation_systems);
-            maybe_update_beta_calibration(loop_time);
 
             if (dump_viz_data && (iteration_num % viz_dump_interval == 0 || last_step))
             {
