@@ -4307,10 +4307,12 @@ update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
     }
     s_strict_eb_kappa_ref = s_strict_eb_reference_kappa;
 
-    smooth_station_scalar_field(s_strict_eb_kappa,
-                                passive_bending_curvature_smooth_passes);
-    cap_station_scalar_field(s_strict_eb_kappa, passive_bending_curvature_cap);
-
+    // Compute kappa_dot from the RAW (pre-smooth) kappa so that the damping
+    // term D*kappa_dot*kappa inside the potential is evaluated consistently:
+    // both kappa and kappa_dot derive from the same raw turning-angle field.
+    // Smoothing and capping of s_strict_eb_kappa are applied afterwards
+    // (for diagnostics and the cached kappa value), but must not affect the
+    // kappa_dot used in the elastic/damping potential.
     s_strict_eb_kappa_dot.assign(s_strict_eb_kappa.size(), 0.0);
     const double dt_eff = std::isfinite(s_strict_eb_prev_time) ?
         loop_time - s_strict_eb_prev_time : std::numeric_limits<double>::quiet_NaN();
@@ -4324,6 +4326,7 @@ update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
                 interpolate_station_scalar(s_strict_eb_prev_s,
                                            s_strict_eb_prev_kappa,
                                            s_strict_eb_s[i]);
+            // kappa_prev is also raw (stored before smooth below).
             s_strict_eb_kappa_dot[i] =
                 (s_strict_eb_kappa[i] - kappa_prev) / dt_eff;
         }
@@ -4333,8 +4336,20 @@ update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
                                  passive_bending_kappa_dot_cap);
     }
 
+    // Store raw kappa for the next-step kappa_dot computation BEFORE
+    // applying smooth/cap.  The stored value must match what the potential
+    // function will use as kappa (raw turning-angle), so that finite
+    // differences in the potential and the time derivative are consistent.
+    s_strict_eb_prev_kappa = s_strict_eb_kappa; // raw, pre-smooth
+
+    // Apply smooth/cap for diagnostics and for the cached display value only.
+    // The potential always recomputes kappa raw from backbone positions.
+    smooth_station_scalar_field(s_strict_eb_kappa,
+                                passive_bending_curvature_smooth_passes);
+    cap_station_scalar_field(s_strict_eb_kappa, passive_bending_curvature_cap);
+
     s_strict_eb_prev_s = s_strict_eb_s;
-    s_strict_eb_prev_kappa = s_strict_eb_kappa;
+    // prev_kappa already set to raw kappa above (before smooth/cap).
     s_strict_eb_prev_time = loop_time;
     s_strict_eb_force_cache_time = loop_time;
     s_strict_eb_force_cache_ready = true;
