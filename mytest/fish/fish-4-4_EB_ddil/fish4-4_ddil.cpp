@@ -267,7 +267,33 @@ static std::vector<double> s_strict_eb_kappa_ref;
 static std::vector<double> s_strict_eb_kappa_dot;
 static std::vector<double> s_strict_eb_prev_kappa;
 static std::vector<double> s_strict_eb_prev_s;
-static bool                s_strict_eb_kappa_ref_from_mesh = false;
+
+// Reference mode: how kappa_ref is seeded on the first backbone update.
+//
+// MATERIAL_REFERENCE: kappa_ref is built from the material (reference-config)
+//   node coordinates using the SAME area-weighted extraction map that is used
+//   for the current backbone.  The mesh-irregularity artifacts at head/tail are
+//   present in both current and reference, so they cancel in k_rel.  This is
+//   the physically correct default for both zero-force (Test0) and passive
+//   relaxation (Test1) tests.
+//
+// INITIAL_CURRENT: kappa_ref is set equal to kappa at t=0 (first call).
+//   Guarantees zero EB force at t=0 regardless of initial shape, but removes
+//   any elastic restoring force when INITIAL_BEND_AMPLITUDE != 0.
+//   Useful for debugging only.
+//
+// STRAIGHT_ZERO: kappa_ref = 0 everywhere (analytic straight reference).
+//   Will re-introduce spurious head-boundary forces for irregular meshes.
+enum class StrictEBReferenceMode { MATERIAL_REFERENCE, INITIAL_CURRENT, STRAIGHT_ZERO };
+static StrictEBReferenceMode strict_eb_reference_mode =
+    StrictEBReferenceMode::MATERIAL_REFERENCE;
+
+static bool                        s_strict_eb_reference_initialized = false;
+static std::vector<libMesh::Point> s_strict_eb_reference_X;
+static std::vector<double>         s_strict_eb_reference_kappa;
+
+// Deprecated alias kept for snapshot save/restore compatibility.
+static bool s_strict_eb_kappa_ref_from_mesh = false;
 static double s_strict_eb_prev_time =
     std::numeric_limits<double>::quiet_NaN();
 
@@ -4089,6 +4115,13 @@ update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
     std::vector<double> station_area(static_cast<std::size_t>(n), 0.0);
     std::vector<double> station_x(static_cast<std::size_t>(n), 0.0);
     std::vector<double> station_y(static_cast<std::size_t>(n), 0.0);
+    // Material-reference backbone: same hat-weights, node coordinates instead
+    // of current deformed coordinates.  Only needed on the first call.
+    const bool need_ref_extraction =
+        !s_strict_eb_reference_initialized &&
+        strict_eb_reference_mode == StrictEBReferenceMode::MATERIAL_REFERENCE;
+    std::vector<double> station_x_ref(static_cast<std::size_t>(n), 0.0);
+    std::vector<double> station_y_ref(static_cast<std::size_t>(n), 0.0);
 
     System& X_sys = equation_systems->get_system(
         ib_method_ops->getCurrentCoordinatesSystemName());
@@ -4142,6 +4175,19 @@ update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
                 x_qp(1) += phi[k][qp] * X_node[k][1];
             }
 
+            // Material-reference QP position: interpolate from mesh node
+            // coordinates (reference configuration, fixed throughout the run).
+            libMesh::Point X_ref_qp(0.0, 0.0, 0.0);
+            if (need_ref_extraction)
+            {
+                for (unsigned int k = 0; k < n_nodes; ++k)
+                {
+                    const Node* nd = elem->node_ptr(k);
+                    X_ref_qp(0) += phi[k][qp] * (*nd)(0);
+                    X_ref_qp(1) += phi[k][qp] * (*nd)(1);
+                }
+            }
+
             double s_qp = 0.0;
             for (unsigned int k = 0; k < n_nodes; ++k)
             {
@@ -4161,38 +4207,64 @@ update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
                 station_area[j] += dA;
                 station_x[j] += dA * x_qp(0);
                 station_y[j] += dA * x_qp(1);
+                if (need_ref_extraction)
+                {
+                    station_x_ref[j] += dA * X_ref_qp(0);
+                    station_y_ref[j] += dA * X_ref_qp(1);
+                }
             }
         }
     }
 
+    // Pack current-position sums (+ reference sums on first call) for MPI reduction.
+    const int fields_per_station = need_ref_extraction ? 5 : 3;
     std::vector<double> reduced;
-    reduced.reserve(static_cast<std::size_t>(3 * n));
+    reduced.reserve(static_cast<std::size_t>(fields_per_station * n));
     for (int i = 0; i < n; ++i)
     {
         const std::size_t j = static_cast<std::size_t>(i);
         reduced.push_back(station_area[j]);
         reduced.push_back(station_x[j]);
         reduced.push_back(station_y[j]);
+        if (need_ref_extraction)
+        {
+            reduced.push_back(station_x_ref[j]);
+            reduced.push_back(station_y_ref[j]);
+        }
     }
     IBTK_MPI::sumReduction(reduced.data(), static_cast<int>(reduced.size()));
 
     s_strict_eb_station_area.assign(static_cast<std::size_t>(n), 0.0);
     s_strict_eb_X.assign(static_cast<std::size_t>(n), libMesh::Point());
+    if (need_ref_extraction)
+        s_strict_eb_reference_X.assign(static_cast<std::size_t>(n),
+                                        libMesh::Point());
     std::size_t r = 0;
     for (int i = 0; i < n; ++i)
     {
         const std::size_t j = static_cast<std::size_t>(i);
-        const double area = reduced[r++];
-        const double x_sum = reduced[r++];
-        const double y_sum = reduced[r++];
+        const double area   = reduced[r++];
+        const double x_sum  = reduced[r++];
+        const double y_sum  = reduced[r++];
+        double x_ref_sum = 0.0, y_ref_sum = 0.0;
+        if (need_ref_extraction)
+        {
+            x_ref_sum = reduced[r++];
+            y_ref_sum = reduced[r++];
+        }
         s_strict_eb_station_area[j] = area;
         if (area > strict_eb_min_station_area)
         {
             s_strict_eb_X[j] = libMesh::Point(x_sum / area, y_sum / area);
+            if (need_ref_extraction)
+                s_strict_eb_reference_X[j] =
+                    libMesh::Point(x_ref_sum / area, y_ref_sum / area);
         }
         else
         {
             s_strict_eb_X[j] = reference_frame_at_s(s_strict_eb_s[j]).X;
+            if (need_ref_extraction)
+                s_strict_eb_reference_X[j] = s_strict_eb_X[j];
         }
     }
 
@@ -4201,19 +4273,39 @@ update_strict_eb_force_cache(Pointer<IBFEMethod>  ib_method_ops,
     for (double& value : s_strict_eb_kappa)
         if (!std::isfinite(value)) value = 0.0;
 
-    // Seed kappa_ref once from the RAW (pre-smoothing) backbone curvature on
-    // the very first call.  The potential function always evaluates kappa via
-    // raw compute_turning_angle_curvature(), so the reference must also be raw
-    // to guarantee k_rel = 0 at t = 0 regardless of mesh irregularity near the
-    // head / tail (non-uniform triangulation creates spurious apparent curvature
-    // in the area-weighted backbone).  The reference is then frozen: all
-    // subsequent updates measure departure from this initial mesh state, which
-    // is the physically correct stress-free configuration.
-    if (!s_strict_eb_kappa_ref_from_mesh)
+    // Seed s_strict_eb_kappa_ref once, on the very first backbone update.
+    // The chosen mode determines the source of the reference curvature.
+    if (!s_strict_eb_reference_initialized)
     {
-        s_strict_eb_kappa_ref = s_strict_eb_kappa;   // raw kappa, before smooth/cap
-        s_strict_eb_kappa_ref_from_mesh = true;
+        switch (strict_eb_reference_mode)
+        {
+        case StrictEBReferenceMode::MATERIAL_REFERENCE:
+            // Compute kappa from the material (reference-config) backbone
+            // extracted with the same area-weighted map as the current
+            // backbone.  Mesh-irregularity artifacts are identical in both
+            // current and reference, so they cancel in k_rel.
+            s_strict_eb_reference_kappa =
+                compute_turning_angle_curvature(s_strict_eb_reference_X,
+                                                s_strict_eb_s);
+            for (double& v : s_strict_eb_reference_kappa)
+                if (!std::isfinite(v)) v = 0.0;
+            break;
+
+        case StrictEBReferenceMode::INITIAL_CURRENT:
+            // Debug-only: freeze at current (possibly bent) configuration.
+            // Guarantees zero EB force at t=0 but removes elastic restoring
+            // force when INITIAL_BEND_AMPLITUDE != 0.
+            s_strict_eb_reference_kappa = s_strict_eb_kappa; // raw, pre-smooth
+            s_strict_eb_kappa_ref_from_mesh = true;           // legacy flag
+            break;
+
+        case StrictEBReferenceMode::STRAIGHT_ZERO:
+            s_strict_eb_reference_kappa.assign(s_strict_eb_s.size(), 0.0);
+            break;
+        }
+        s_strict_eb_reference_initialized = true;
     }
+    s_strict_eb_kappa_ref = s_strict_eb_reference_kappa;
 
     smooth_station_scalar_field(s_strict_eb_kappa,
                                 passive_bending_curvature_smooth_passes);
@@ -4341,6 +4433,9 @@ struct StrictEBForceCacheSnapshot
     std::vector<double> prev_s;
     double prev_time = std::numeric_limits<double>::quiet_NaN();
     bool kappa_ref_from_mesh = false;
+    bool reference_initialized = false;
+    std::vector<libMesh::Point> reference_X;
+    std::vector<double>         reference_kappa;
 };
 
 static StrictEBForceCacheSnapshot
@@ -4362,7 +4457,10 @@ save_strict_eb_force_cache()
     snapshot.prev_kappa = s_strict_eb_prev_kappa;
     snapshot.prev_s = s_strict_eb_prev_s;
     snapshot.prev_time = s_strict_eb_prev_time;
-    snapshot.kappa_ref_from_mesh = s_strict_eb_kappa_ref_from_mesh;
+    snapshot.kappa_ref_from_mesh  = s_strict_eb_kappa_ref_from_mesh;
+    snapshot.reference_initialized = s_strict_eb_reference_initialized;
+    snapshot.reference_X           = s_strict_eb_reference_X;
+    snapshot.reference_kappa       = s_strict_eb_reference_kappa;
     return snapshot;
 }
 
@@ -4384,7 +4482,10 @@ restore_strict_eb_force_cache(const StrictEBForceCacheSnapshot& snapshot)
     s_strict_eb_prev_kappa = snapshot.prev_kappa;
     s_strict_eb_prev_s = snapshot.prev_s;
     s_strict_eb_prev_time = snapshot.prev_time;
-    s_strict_eb_kappa_ref_from_mesh = snapshot.kappa_ref_from_mesh;
+    s_strict_eb_kappa_ref_from_mesh   = snapshot.kappa_ref_from_mesh;
+    s_strict_eb_reference_initialized = snapshot.reference_initialized;
+    s_strict_eb_reference_X           = snapshot.reference_X;
+    s_strict_eb_reference_kappa       = snapshot.reference_kappa;
 }
 
 static void
@@ -5266,6 +5367,25 @@ int main(int argc, char* argv[])
         strict_eb_force_stations =
             input_db->getIntegerWithDefault("STRICT_EB_FORCE_STATIONS",
                                             strict_eb_force_stations);
+        {
+            const std::string ref_mode =
+                input_db->getStringWithDefault("STRICT_EB_REFERENCE_MODE",
+                                               "MATERIAL_REFERENCE");
+            if (ref_mode == "MATERIAL_REFERENCE")
+                strict_eb_reference_mode =
+                    StrictEBReferenceMode::MATERIAL_REFERENCE;
+            else if (ref_mode == "INITIAL_CURRENT")
+                strict_eb_reference_mode =
+                    StrictEBReferenceMode::INITIAL_CURRENT;
+            else if (ref_mode == "STRAIGHT_ZERO")
+                strict_eb_reference_mode =
+                    StrictEBReferenceMode::STRAIGHT_ZERO;
+            else
+                TBOX_ERROR("Unknown STRICT_EB_REFERENCE_MODE = \""
+                           << ref_mode << "\".\n"
+                           << "Expected \"MATERIAL_REFERENCE\", "
+                           << "\"INITIAL_CURRENT\", or \"STRAIGHT_ZERO\".\n");
+        }
         strict_eb_fd_epsilon =
             input_db->getDoubleWithDefault("STRICT_EB_FD_EPSILON",
                                            strict_eb_fd_epsilon);
@@ -5572,8 +5692,18 @@ int main(int argc, char* argv[])
              << ", curvature cap = " << passive_bending_curvature_cap
              << ", kappa_dot cap = " << passive_bending_kappa_dot_cap
              << ", moment cap = " << passive_bending_moment_cap << "\n";
+        {
+            const char* rmode =
+                (strict_eb_reference_mode ==
+                 StrictEBReferenceMode::MATERIAL_REFERENCE) ?
+                "MATERIAL_REFERENCE" :
+                (strict_eb_reference_mode ==
+                 StrictEBReferenceMode::INITIAL_CURRENT) ?
+                "INITIAL_CURRENT" : "STRAIGHT_ZERO";
+            pout << "  EB reference mode = " << rmode << "\n";
+        }
         pout << "  EB-to-IBFE force distribution = transpose of area-weighted "
-             << "  backbone extraction\n";
+             << "backbone extraction\n";
         pout << "  strict EB dt control = "
              << ((strict_eb_dt_control_enable || strict_eb_dt_max > 0.0) ?
                  "ON" : "OFF")
