@@ -8,53 +8,23 @@ N          = 128
 NX         = 2*N
 NY         = N
 NFINEST    = (REF_RATIO^(MAX_LEVELS - 1))*N
-PK1_REG_DEV_QUAD_ORDER      = "FIFTH"
-PK1_REG_DIL_QUAD_ORDER      = "FIFTH"
-PK1_DAMP_QUAD_ORDER         = "FIFTH"
+PK1_MATRIX_QUAD_ORDER = "FIFTH"
+PK1_FIBER_QUAD_ORDER  = "FIFTH"
+PK1_ACTIVE_QUAD_ORDER = "FIFTH"
 
-// Mesh regularization and strict EB body force
-C1_MESH_REG     = 1.0e-3
-KAPPA_MESH_REG  = 1.0e-2
-
-USE_PHYSICAL_BENDING = TRUE
-STRICT_EB_FORCE_STATIONS = 128
-STRICT_EB_FD_EPSILON = 1.0e-7
-STRICT_EB_MIN_STATION_AREA = 1.0e-14
-// Reference curvature mode for strict EB.
-// MATERIAL_REFERENCE: kappa_ref extracted from material (reference-config)
-//   node coordinates using the same area-weighted map as the current backbone.
-//   Mesh-irregularity artifacts cancel in k_rel.  Correct for Test0, Test1,
-//   and active swimming.
-// INITIAL_CURRENT: kappa_ref frozen at the initial current backbone (debug).
-// STRAIGHT_ZERO:   kappa_ref = 0 everywhere (simplified validation only).
-STRICT_EB_REFERENCE_MODE = "MATERIAL_REFERENCE"
-// EB beam explicit timestep stability control.
-STRICT_EB_DT_CONTROL_ENABLE = TRUE
-STRICT_EB_DT_SAFETY_FACTOR  = 0.5
-// Physical passive bending stiffness
+// Full physical material. B(s) calibrates E(s) through E*I=B with
+// I=2*h^3/3 for the 2D unit-depth section.
 B_BODY     = 1.5e-4
 B_PEDUNCLE = 7.5e-5
 B_CAUDAL   = 1.0e-4
-// Physical passive bending damping
-D_BODY     = 1.0e-6
-D_PEDUNCLE = 5.0e-7
-D_CAUDAL   = 1.0e-6
-PASSIVE_BENDING_BODY_TRANSITION_S    = 0.60
-PASSIVE_BENDING_BODY_TRANSITION_W    = 0.30
-PASSIVE_BENDING_CAUDAL_TRANSITION_S  = 0.90
-PASSIVE_BENDING_CAUDAL_TRANSITION_W  = 0.05
-PASSIVE_BENDING_CURVATURE_METHOD     = "TANGENT_ANGLE" // TANGENT_ANGLE, LOCAL_POLY
-PASSIVE_BENDING_CURVATURE_POLY_WINDOW = 7
-PASSIVE_BENDING_CURVATURE_POLY_ORDER  = 3
-PASSIVE_BENDING_CURVATURE_SMOOTH_PASSES = 10
-// Debugging safeguards against isolated bad midline samples.
-PASSIVE_BENDING_CURVATURE_CAP        = 30.0
-PASSIVE_BENDING_KAPPA_DOT_CAP        = 10.0
-PASSIVE_BENDING_MOMENT_CAP           = 0.0
-
-USE_CONTINUUM_DAMPING             = FALSE
-CONTINUUM_DAMPING_FACTOR          = 0.005
-CONTINUUM_DAMPING_STRESS_CAP_OVER_C1 = 50.0
+MATERIAL_BODY_TRANSITION_S   = 0.60
+MATERIAL_BODY_TRANSITION_W   = 0.30
+MATERIAL_CAUDAL_TRANSITION_S = 0.90
+MATERIAL_CAUDAL_TRANSITION_W = 0.05
+MATERIAL_NU_EFF              = 0.45
+SECTION_I2_FLOOR_RATIO       = 1.0e-3
+FIBER_STIFFNESS_RATIO        = 0.10
+ACTIVE_T_MAX_ABS             = 50.0
 
 FISH_LENGTH = 1.00
 X_LEADING   = 1.00
@@ -63,7 +33,7 @@ WAVE_RAMP_TIME = 1.0
 WAVE_TIME_SIGN = 1.0
 
 REFERENCE_PROFILE_BINS = 128
-REFERENCE_BACKBONE_END_X = 0.0
+REFERENCE_CENTERLINE_END_X = 0.0
 USE_LAPLACE_REFERENCE_PARAMETERIZATION = TRUE
 LAPLACE_HEAD_BC_WIDTH_OVER_L = 0.05
 LAPLACE_TAIL_BC_WIDTH_OVER_L = 0.05

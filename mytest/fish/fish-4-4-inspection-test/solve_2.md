@@ -1,498 +1,664 @@
-你的判断很可能是对的，但要更精确地说：
+## 总体判断
 
-**问题不一定是 EB 理论错了，而是当前版本的 EB 实现方式还没有形成一个能量一致、变分一致的 bending operator。**
+**这个框架是合适的，而且方向正确。**
+它的核心思想可以成立：
 
-当前代码虽然已经把模型拆成了：
+```text
+JFM 水母式 full physical material:
+    P = passive continuum material + active material stress
+
+active bending 文献驱动:
+    prescribed travelling active bending moment M_a(s,t)
+
+你的新模型:
+    用 continuum active stress 实现 M_a(s,t) 的截面合弯矩
+```
+
+这比当前 `strict EB backbone + weak 2D regularization` 更像一个真实柔性体。当前代码本身也明确说明：active/passive bending 仍是 beam-level load，再通过 area-averaged backbone 转置分配回 2D mesh，而 continuum PK1 stresses 只是 weak mesh regularization。
+你现在提出的新框架，就是要把这个逻辑换成 **continuum material 自己承载主动/被动应力**。方向对。
+
+但是，你给出的方案里有几处需要修正。
+
+---
+
+# 1. `P_matrix` 公式需要修正一个系数
+
+你写的是：
+
+```text
+W_matrix = (μ/2)(J^{-2/d} I₁ − d) + (K/2)(lnJ)²
+P_matrix = 2μ J^{-2/d} (F − (I₁/d) F^{−T}) + K lnJ · F^{−T}
+```
+
+这里 **系数不一致**。
+
+如果能量写成：
 
 [
-P_{\mathrm{total}}
+W_{\mathrm{iso}}
+================
+
+\frac{\mu}{2}
+\left(
+J^{-2/d}I_1-d
+\right)
+]
+
+那么导数应是：
+
+[
+P_{\mathrm{iso}}
+================
+
+\mu J^{-2/d}
+\left[
+F-\frac{I_1}{d}F^{-T}
+\right]
+]
+
+不是 (2\mu)。
+
+也就是说，应改为：
+
+```text
+W_matrix = (μ/2)(J^{-2/d} I₁ − d) + (K/2)(lnJ)²
+
+P_matrix =
+    μ J^{-2/d} (F − (I₁/d) F^{-T})
+    + K lnJ F^{-T}
+```
+
+如果你想保留代码里类似 `2*c1` 的形式，那么应写成：
+
+[
+W_{\mathrm{iso}}
+================
+
+c_1
+\left(
+J^{-2/d}I_1-d
+\right)
+]
+
+[
+P_{\mathrm{iso}}
+================
+
+2c_1J^{-2/d}
+\left[
+F-\frac{I_1}{d}F^{-T}
+\right]
+]
+
+也就是：
+
+```text
+μ = 2c1
+```
+
+这点要统一，否则材料刚度会差一倍。
+
+---
+
+# 2. `I(s) = h³/6` 这里不对，取决于 h 的定义
+
+你后面 active 里写：
+
+```text
+I₂ = ∫η² dA ≈ 2h³/3
+```
+
+这说明你的 (h) 是 **half-thickness**，即截面范围：
+
+[
+\eta\in[-h,h]
+]
+
+对于 2D per-unit-depth 截面：
+
+[
+I(s)
+====
+
+# \int_{-h}^{h}\eta^2,d\eta
+
+\frac{2h^3}{3}
+]
+
+所以如果 `h(s)` 是 half-thickness，应使用：
+
+```text
+I(s) = 2 h(s)^3 / 3
+```
+
+不是：
+
+```text
+I(s) = h(s)^3 / 6
+```
+
+如果 (H) 是 full thickness，(H=2h)，则：
+
+[
+I = \frac{H^3}{12}
 ==================
 
-P_{\mathrm{active}}
-+
-P_{\mathrm{phys,bending}}
-+
-P_{\mathrm{reg}}
+# \frac{(2h)^3}{12}
+
+\frac{2h^3}{3}
 ]
 
-并且注释里也明确写了：physical passive stiffness 来自 beam-level bending moment law，再转换为 zero-resultant axial PK1 stress，weak neo-Hookean stress 只作为 numerical mesh regularization。这个总体架构是对的。
-
-但是你现在 Step 5/6 的现象说明：**这个 section-projected EB bending stress 还没有产生“正确的整体弯曲动力学”。**
-
----
-
-## 1. 为什么说可能是 EB 实现问题？
-
-你现在做的是：
-
-[
-M_p(s,t)
-========
-
-B(s)\left[\kappa(s,t)-\kappa_0(s)\right]
-+
-D(s)\dot{\kappa}(s,t)
-]
-
-然后转换成截面轴向应力：
-
-[
-T_{\mathrm{phys}}
-=================
-
-\frac{M_p}{I_2}\eta_c
-]
-
-再写成：
-
-[
-P_{\mathrm{phys,bending}}
-=========================
-
-T_{\mathrm{phys}}F(f_0\otimes f_0)
-]
-
-这个转换能保证局部截面意义上：
-
-[
-N_{\mathrm{phys}}\approx0
-]
-
-[
-M_{\mathrm{phys}}\approx M_p
-]
-
-所以 Step 4 能通过。
-
-但 EB beam 的真实力学不是只要求“截面弯矩对”，还要求沿中线的空间微分关系正确：
-
-[
-Q(s)=\frac{\partial M}{\partial s}
-]
-
-[
-f_\perp(s)=\frac{\partial^2 M}{\partial s^2}
-]
-
-也就是说，**弯矩必须通过空间导数产生横向剪力和横向力密度。**
-
-当前方法是把 (M_p) 转成 continuum axial stress，再依赖 IBFE 的 stress divergence 自动产生力。理论上可以近似这一点，但前提是：
-
-1. (s,\eta) 场足够光滑；
-2. (\kappa(s)) 计算足够平滑；
-3. (M(s)) 沿中线连续；
-4. 截面 (I_2(s)) 不出现局部突变；
-5. stress divergence 与 beam-level (\partial_s^2 M) 等价。
-
-你现在 Step 6 出现 `J_min=-52`，说明这些条件至少有一个没有满足。
-
----
-
-## 2. 当前更像是“截面弯矩正确，但弯曲力不正确”
-
-这句话很关键。
-
-Step 4 通过说明：
-
-[
-M_{\mathrm{section}}
-\approx M_{\mathrm{model}}
-]
-
-也就是局部截面 moment 对了。
-
-但 Step 5/6 失败说明：
-
-[
-\nabla\cdot P_{\mathrm{phys,bending}}
-]
-
-产生的整体结构力不对，或者不稳定。
-
-所以当前问题不是：
-
-[
-M_p=B\kappa+D\dot{\kappa}
-]
-
-这个文献公式不能用。
-
-而是：
-
-[
-M_p
-\rightarrow
-T_{\mathrm{phys}}
-\rightarrow
-P_{\mathrm{phys,bending}}
-\rightarrow
-\nabla\cdot P
-]
-
-这条链条还没有证明等价于 EB beam bending force。
-
----
-
-## 3. 为什么会“没有形成正确弯曲”？
-
-我认为有四个主要原因。
-
-### 原因 1：当前 EB 不是 variational EB
-
-真正的 EB bending force 应该来自 bending energy：
-
-[
-E_b
-===
-
-\frac{1}{2}
-\int B(s)\left[\kappa(s)-\kappa_0(s)\right]^2ds
-]
-
-被动力应该满足：
-
-[
-F_b
-===
-
--\frac{\delta E_b}{\delta X}
-]
-
-这样能量上天然是回复的。
-
-但你当前不是从能量泛函变分得到 force，而是：
-
-1. 先用 finite difference 计算 (\kappa)；
-2. 构造 (M_p)；
-3. 再投影成 continuum stress；
-4. 再由 stress divergence 产生 force。
-
-这不是严格的能量一致离散化。
-
-因此可能出现：
-
-[
-M_p \text{ 截面意义正确}
-]
-
-但：
-
-[
-F_b \text{ 不是 } -\delta E_b/\delta X
-]
-
-这会导致能量正反馈。
-
----
-
-### 原因 2：曲率 finite difference 噪声进入 force，而不是只进入诊断
-
-以前 (\kappa) 只是后处理，噪声只影响图。
-
-现在：
-
-[
-\kappa
-\rightarrow M_p
-\rightarrow P_{\mathrm{phys,bending}}
-]
-
-所以曲率噪声直接变成结构力。
-
-三点差分的放大率大约是：
-
-[
-1/\Delta s^2
-]
-
-你估计约 (3900\ \mathrm{m}^{-2})，这个量级足以把很小的 midline 噪声变成很大的 bending moment。
-
-这说明：**当前 EB bending 不是在处理平滑 beam centerline，而是在处理 noisy midline samples。**
-
----
-
-### 原因 3：(\dot{\kappa}) 项更危险
-
-damping 项是：
-
-[
-D\dot{\kappa}
-]
-
-如果：
-
-[
-\dot{\kappa}
-============
-
-\frac{\kappa^n-\kappa^{n-1}}{\Delta t}
-]
-
-那么噪声又被：
-
-[
-1/\Delta t
-]
-
-放大。
-
-所以 Step 6 中 damping 造成 `J_min=-52`，非常符合这个机制。
-
-这不是简单的 damping 参数问题，而是说明当前 damping discretization 可能不是能量耗散型。
-
----
-
-### 原因 4：截面 stress 投影不一定等价于 EB shear-force distribution
-
-即使 (M_p) 对，转成：
-
-[
-T_{\mathrm{phys}}=\frac{M_p}{I_2}\eta_c
-]
-
-也只保证截面 moment 对。
-
-但 EB bending 的横向力来自：
-
-[
-\partial_s^2 M
-]
-
-如果 (M(s))、(I_2(s))、(\eta_c(s))、(f_0(s)) 不光滑，stress divergence 会出现局部尖峰。特别是 fork-root、尾柄过渡区、低 (I_2) 区域，非常容易产生非物理局部力。
-
----
-
-## 4. 怎么证明是不是 EB bending 没有形成正确弯曲？
-
-现在不要直接看 swimming。应该做一个 **EB operator verification**。
-
-### Test EB-1：modal sign test
-
-给一个简单初始形状：
-
-[
-y(s,0)=A\sin(\pi s/L)
-]
-
-关闭 active，关闭 damping，只开 elastic bending：
-
-[
-M_p=B\kappa
-]
-
-然后计算：
-
-[
-K_{\mathrm{rms}}(t)
-]
-
-正确 EB elastic force 应该让该模态产生回复运动，而不是高频局部折叠。
-
-如果出现局部尖峰增长，说明 EB operator 不对。
-
----
-
-### Test EB-2：energy test
-
-计算 bending energy：
-
-[
-E_b(t)
-======
-
-\frac{1}{2}
-\int B(s)\left[\kappa-\kappa_0\right]^2ds
-]
-
-对于 elastic-only + fluid viscosity 情况，能量不应该持续增长。
-
-对于 elastic + damping：
-
-[
-\frac{dE_b}{dt}
-]
-
-更应该下降。
-
-如果 (E_b) 在 Step 6 中快速增长，说明当前 (P_{\mathrm{phys,bending}}) 不是能量稳定的 bending force。
-
----
-
-### Test EB-3：beam force consistency test
-
-离线比较两个量：
-
-从 beam theory 得到：
-
-[
-f_\perp^{EB}(s)
-\approx
-\frac{\partial^2 M}{\partial s^2}
-]
-
-从 IBFE force decomposition 得到实际横向力：
-
-[
-f_\perp^{IBFE}(s)
-]
-
-如果两者空间分布完全不同，说明：
-
-[
-M_p \rightarrow P_{\mathrm{phys,bending}}
-]
-
-的 stress projection 没有形成正确 EB bending force。
-
----
-
-### Test EB-4：mesh / station refinement sensitivity
-
-改变：
+所以更安全的写法是：
 
 ```text
-PASSIVE_BENDING_CACHE_STATIONS = 64, 128, 256
+如果 h = half-thickness:
+    I = 2 h^3 / 3
+
+如果 H = full thickness:
+    I = H^3 / 12
 ```
 
-以及：
+你当前代码里的 `ref_halfthickness` / `h_s` 明显更像 half-thickness，因此应使用：
 
 ```text
-smooth = 5, 10, 15
+I = 2.0/3.0 * h_s^3
 ```
 
-如果结果高度依赖 station 数和 smoothing 次数，说明当前 bending operator 主要受数值差分控制，而不是物理参数 (B(s)) 控制。
-
 ---
 
-## 5. 如果确认是 EB operator 问题，应该怎么改？
+# 3. 由 `B(s)` 反推 `μ(s)` 的思路对，但要小心 plane strain / plane stress
 
-有三条路线。按严谨程度排序。
+你写：
 
----
+```text
+E_target(s) = B_target(s) / I(s)
+μ(s) = E_target(s) / (2(1+ν)) → 平面应变取 μ = E/4
+```
 
-### 路线 A：真正做 variational beam bending force
+这里 “平面应变取 μ=E/4” 不严谨。
 
-这是最严格的。
-
-在 centerline 上定义 bending energy：
+一般三维 isotropic elasticity 中：
 
 [
-E_b
-===
-
-\frac{1}{2}
-\int B(s)(\kappa-\kappa_0)^2ds
+\mu = \frac{E}{2(1+\nu)}
 ]
 
-然后对 centerline nodes 做变分，得到 nodal bending force。
-
-这类似 IBM 里传统 fiber/beam force 的做法。
-
-优点：
-
-* 能量一致；
-* 回复方向自然正确；
-* damping 可以单独用 velocity-proportional generalized force；
-* 不依赖 noisy continuum stress divergence。
-
-缺点：
-
-* 需要额外实现 backbone force spreading；
-* 和当前 continuum IBFE stress 框架耦合更复杂；
-* 需要定义 centerline node 与体网格之间的力分配。
-
----
-
-### 路线 B：保留 section stress，但用平滑的 spline/Savitzky–Golay 曲率
-
-这是最实用的短期方案。
-
-不要再用：
+如果近似不可压缩：
 
 [
-3\text{-point finite difference}
+\nu \approx 0.5
 ]
 
-直接算 (\kappa)。
+则：
 
-改成：
+[
+\mu = \frac{E}{3}
+]
 
-1. 对 midline (X(s)) 做局部多项式拟合；
-2. 从拟合曲线计算：
-   [
-   \kappa=
-   \frac{x_s y_{ss}-y_s x_{ss}}
-   {(x_s^2+y_s^2)^{3/2}}
-   ]
-3. 对 (\dot{\kappa}) 使用低通滤波。
+不是 (E/4)。
+
+在 2D IBFE 中你到底是 plane stress、plane strain，还是 purely 2D artificial solid，需要明确。对你的当前目标，建议先采用清晰的工程定义：
+
+```text
+E_target(s) = B_target(s) / I_2D(s)
+μ(s) = E_target(s) / [2(1+ν_eff)]
+ν_eff = 0.45 或 0.49
+K(s) 由 ν_eff 或 K/μ 比值给定
+```
 
 例如：
 
+[
+K =
+\frac{E}{3(1-2\nu)}
+]
+
+这是 3D 关系。如果你采用 2D area penalty，就不要强行说它是严格 3D bulk modulus，而应称为：
+
 ```text
-window = 7 or 9
-poly_order = 3
+effective area modulus
 ```
 
-这比“3点差分 + 10次 smoothing”更像连续 EB 曲率。
-
 ---
 
-### 路线 C：先去掉 (D\dot{\kappa})，只保留 elastic bending
+# 4. `P_active` 框架正确，但 `q(η)=-η/I₂` 只能作为第一版
 
-如果当前目标是让 fish 能稳定形成 travelling wave，可以先设：
+你写的核心条件是对的：
 
 [
-D(s)=0
+\int_A q,dA=0
 ]
-
-只保留：
 
 [
-M_p=B(s)(\kappa-\kappa_0)
+-\int_A q\eta,dA=1
 ]
 
-然后用流体黏性和 weak reg 提供耗散。
+然后：
 
-这是最稳妥的短期选择。文献中的 viscoelastic damping 可以后续再加，但不要让 (D\dot{\kappa}) 先把模型打崩。
+[
+T_a(s,\eta,t)=M_a(s,t)q(\eta)
+]
 
----
+[
+P_{\mathrm{active}}
+===================
 
-## 6. 我建议你现在的判断应写成这样
+T_a F(f_0\otimes f_0)
+]
 
-你可以在记录里写：
+这个逻辑非常好。它保留了 active bending 文献的 (M_a(s,t))，但把它实现为 continuum 内部的 active stress。
 
-> Step 5 confirms that the sign of the projected passive bending stress is correct. However, Step 6 reveals that the current EB implementation does not yet behave as an energy-stable bending operator. The issue is likely not the beam-level constitutive law (M_p=B\kappa+D\dot{\kappa}), but the discrete pathway from noisy finite-difference curvature to section-projected PK1 stress. The damping term amplifies curvature noise and causes mesh collapse.
+但是，最简：
 
-中文就是：
+[
+q(\eta)=-\frac{\eta}{I_2}
+]
 
-**当前不是文献 EB 公式不适用，而是 EB 公式进入 IBFE 的离散实现还没有形成正确的弯曲算子。**
-
----
-
-## 7. 下一步我建议这样做
-
-优先级如下：
-
-1. **先跑 elastic-only：**
-   [
-   D=0
-   ]
-   确认 (B\kappa) 是否能稳定产生回复弯曲。
-
-2. **暂时不要使用 full (D\dot{\kappa})**，因为 Step 6 已经证明它会导致 catastrophic collapse。
-
-3. **改曲率计算方法**：从 3 点差分改成 tangent-angle 或 local polynomial curvature。
-
-4. **加 bending energy diagnostic**：
-   [
-   E_b=\frac12\int B(\kappa-\kappa_0)^2ds
-   ]
-   如果 (E_b) 在 passive-only 情况下增长，说明 EB operator 仍然不正确。
-
-5. **只在 elastic-only EB 稳定后，再逐步恢复 damping。**
+有两个问题。
 
 ---
 
-一句话总结：
+## 4.1 尾部 (I_2) 小，仍会放大
 
-**你的怀疑成立：现在最大的问题很可能不是 active，也不是 reg，而是当前 projected EB bending 没有形成能量一致的正确弯曲力。下一步不要急着调 damping；先验证并修正 EB bending operator 本身。**
+你自己已经指出了：
+
+```text
+I₂ 在尾部很小，q = -η/I₂ 会放大。
+```
+
+这和旧的 `M η/I2` 问题是同源的。区别是现在 passive continuum 更强，可以部分承载，但尾端仍可能爆。
+
+所以第一版可以用 analytic (I_2)，但正式版最好改成：
+
+```text
+按每个 s-station 的实际 FE section 数值积分得到 q(η) 的归一化
+```
+
+也就是不要只用：
+
+[
+I_2 = \frac{2h^3}{3}
+]
+
+而是用 FE section 上的积分：
+
+[
+A_0(s)=\int_A w_s,dA
+]
+
+[
+A_1(s)=\int_A w_s\eta,dA
+]
+
+[
+A_2(s)=\int_A w_s\eta^2,dA
+]
+
+然后构造零轴力、单位弯矩的 (q)。
+
+---
+
+## 4.2 更推荐的 (q)：去均值后的 muscle-band shape
+
+可以定义一个原始 muscle-band shape (g(\eta))，例如只在上下侧激活：
+
+```text
+g(η) = +1  for η > αh
+g(η) = -1  for η < -αh
+g(η) = smooth transition otherwise
+```
+
+然后做截面归一化：
+
+[
+q(\eta)=a[g(\eta)-\bar g]
+]
+
+其中：
+
+[
+\bar g=\frac{\int_A g,dA}{\int_A dA}
+]
+
+保证：
+
+[
+\int_A q,dA=0
+]
+
+再令：
+
+[
+a =
+-\frac{1}{\int_A [g(\eta)-\bar g]\eta,dA}
+]
+
+保证：
+
+[
+-\int_A q\eta,dA=1
+]
+
+这个比 (-\eta/I_2) 更像真实肌肉带，也更稳定，因为主动应力集中在肌肉区域，而不是整个截面线性分布。
+
+---
+
+# 5. `P_fiber` 方向正确，但要避免和 `P_active` 双重计算
+
+你写：
+
+[
+W_{\mathrm{fiber}}
+==================
+
+\frac{k_f}{2}\langle I_4-1\rangle^2
+]
+
+[
+P_{\mathrm{fiber}}
+==================
+
+2k_f\langle I_4-1\rangle F(f_0\otimes f_0)
+]
+
+这个是可以的，表示 passive axial fiber 只在拉伸时提供阻力。
+
+但要注意：
+
+```text
+P_fiber 是被动结构支撑；
+P_active 是主动肌肉应力；
+二者都沿 f0 方向。
+```
+
+如果 (k_f) 太大，鱼会像轴向拉杆一样变硬，抑制 travelling curvature wave。建议第一版：
+
+```text
+k_f 不要太大
+先让 matrix 承担主要实体支撑
+fiber 只作为弱抗拉增强
+```
+
+经验上先让：
+
+```text
+F_fiber < 10%~30% F_active
+```
+
+不要让 fiber 主导动力学。
+
+---
+
+# 6. `P_matrix + P_fiber + P_active` 三个 PK1 函数注册是可行的
+
+你写的 IBFE 实现方式基本可行：
+
+```cpp
+registerPK1StressFunction(PK1_matrix_data);
+registerPK1StressFunction(PK1_fiber_data);
+registerPK1StressFunction(PK1_active_data);
+```
+
+IBFE 会把多个 stress contribution 叠加进入结构力。这个结构清楚，也方便 force decomposition。
+
+不过实现细节建议调整：
+
+## 6.1 不要写 `interpolate_ref_geom_at_point(X_ref)`
+
+你当前代码里已有 `REF_GEOM_SYSTEM_NAME` 和：
+
+```cpp
+reference_geometry_from_system_data(...)
+```
+
+PK1 callback 已经可以通过 `var_data` 读取：
+
+```text
+REF_GEOM_T_X
+REF_GEOM_T_Y
+REF_GEOM_ETA
+REF_GEOM_S
+```
+
+所以在 PK1 stress function 里更应该直接用：
+
+```cpp
+const ReferenceGeometrySample ref_geom =
+    reference_geometry_from_system_data(var_data);
+```
+
+而不是另外写一个 `interpolate_ref_geom_at_point(X_ref)`。
+
+因为 `X_ref` 插值可能和 FE quadrature point 的系统数据不完全一致；而 `var_data` 是 IBFE 回调官方路径中传进来的 quadrature data。
+
+---
+
+## 6.2 `f0` 要归一化
+
+你写：
+
+```cpp
+const VectorValue<double>& f0 = ref_geom.t_hat;
+```
+
+建议仍然保险归一化：
+
+```cpp
+VectorValue<double> f0 = ref_geom.t_hat;
+const double nf = std::sqrt(f0*f0);
+if (nf <= 1.0e-14) { PP.zero(); return; }
+f0 /= nf;
+```
+
+避免 Laplace / interpolation 产生极小误差。
+
+---
+
+## 6.3 active stress 最好加 cap，但 cap 应作用在 (T_a)，不是 (M_a)
+
+建议加入：
+
+```text
+ACTIVE_T_MAX
+```
+
+然后：
+
+```cpp
+T_a = clamp(T_a, -ACTIVE_T_MAX, ACTIVE_T_MAX);
+```
+
+或者 smoother：
+
+```cpp
+T_a = ACTIVE_T_MAX * tanh(T_a / ACTIVE_T_MAX);
+```
+
+但论文里要说明这是数值保护。正式结果最好验证 cap 不激活。
+
+---
+
+# 7. 与文献对应关系基本成立，但表述要更准确
+
+你写的对应关系是对的，但建议这样表述：
+
+## 水母文献对应
+
+不是简单说：
+
+```text
+P_matrix + P_fiber = mesoglea-like body
+```
+
+更严谨是：
+
+```text
+The medusan model motivates the use of a continuum active-material formulation,
+in which passive elasticity and active contraction are represented by
+stress contributions within the material body.
+```
+
+因为水母没有 fish axial fiber / active bending moment，所以不能说一一对应。
+
+## fish stiffness 文献对应
+
+你说：
+
+```text
+B(s) 用来反推 μ(s)
+```
+
+这个逻辑成立，但要说成：
+
+```text
+B(s) is used to calibrate an effective continuum modulus distribution through
+B_eff(s)=E(s)I(s).
+```
+
+也就是说，它不是直接等价，而是 **effective calibration**。
+
+## active bending 文献对应
+
+这个是最强的连接点：
+
+```text
+The same travelling active bending moment M_a(s,t) is retained, but it is
+realized as a self-equilibrated active stress distribution over each body section.
+```
+
+这是你的创新核心。
+
+---
+
+# 8. 这个框架的最大风险
+
+## 风险 A：2D continuum 自然弯曲刚度可能和目标 (B(s)) 不匹配
+
+即使你设：
+
+[
+E(s)=B(s)/I(s)
+]
+
+真实数值中 (B_{\mathrm{eff}}) 还会受以下因素影响：
+
+```text
+1. mesh shape
+2. 2D/plane strain assumption
+3. incompressibility K
+4. fiber stiffness
+5. boundary/tail geometry
+6. IB coupling and fluid loading
+```
+
+所以必须做一个 calibration test：
+
+```text
+static bending test:
+    施加小端矩或小主动 moment
+    测量 curvature
+    反算 B_eff = M/kappa
+```
+
+只有这样才能确认 continuum material 的等效刚度真的接近文献 (B(s))。
+
+---
+
+## 风险 B：active stress 不一定自动产生 travelling curvature wave
+
+在 EB 模型里，(M_a(s,t)) 直接进入 bending equation。
+
+在 continuum 模型里，(M_a) 先变成 active stress，然后材料和流体共同决定曲率。因此实际 curvature wave 可能：
+
+```text
+相位滞后
+幅值不足
+局部变形
+不沿尾部放大
+```
+
+所以需要诊断：
+
+```text
+M_a(s,t)
+T_a(s,η,t)
+actual curvature κ(s,t)
+phase lag between M_a and κ
+```
+
+---
+
+## 风险 C：active stress 正负号要重新验证
+
+你定义：
+
+[
+-\int_A q\eta,dA=1
+]
+
+[
+T_a=M_aq
+]
+
+这样得到：
+
+[
+-\int_A T_a\eta,dA=M_a
+]
+
+符号上是自洽的。
+但实际鱼体正曲率方向还要和 `eta`、`t_hat`、`s` 方向一致。需要保留 `geometry_sign_diag` 或类似诊断。
+
+---
+
+# 9. 我建议的最终修正版框架
+
+你的方案可以整理为下面这个更严谨版本：
+
+```text
+P = P_matrix + P_fiber + P_active
+
+P_matrix:
+    W_iso = μ(s)/2 * (J^{-2/d} I1 - d)
+    W_vol = K(s)/2 * (lnJ)^2
+    P_iso = μ(s) J^{-2/d} [F - I1/d F^{-T}]
+    P_vol = K(s) lnJ F^{-T}
+
+P_fiber:
+    I4 = f0 · C f0
+    W_fiber = kf(s)/2 * <I4 - 1>^2
+    P_fiber = 2 kf(s)<I4 - 1> F(f0⊗f0)
+
+P_active:
+    M_a(s,t) = β h(s)^2 K_shape(s) cos(phase)
+    construct q(s,η) numerically so that:
+        ∫ q dA = 0
+        -∫ q η dA = 1
+    T_a = M_a q
+    P_active = T_a F(f0⊗f0)
+```
+
+并且：
+
+```text
+USE_STRICT_EB_VARIATIONAL_FORCE = FALSE
+USE_PHYSICAL_BENDING = FALSE
+```
+
+让 EB backbone 作为对照模型，不参与 full material 模型。
+
+---
+
+# 10. 最终评价
+
+你的框架 **合适，而且有研究价值**。但要改 4 个关键点：
+
+```text
+1. 修正 P_matrix 的 μ 系数；
+2. 修正 I(s)：若 h 是 half-thickness，用 I=2h^3/3；
+3. active q(η) 第一版可用 -η/I2，但正式版建议改成 FE-section-normalized muscle-band q；
+4. B(s) → μ(s) 只是 effective calibration，必须通过静态弯曲测试验证 B_eff。
+```
+
+一句话：
+**这个框架可以作为你的“full physical material fish”主方案，但第一版不要追求太复杂；先实现 matrix + moment-equivalent active stress，关闭 EB backbone，做静态 bending calibration 和小幅 travelling active test。**
