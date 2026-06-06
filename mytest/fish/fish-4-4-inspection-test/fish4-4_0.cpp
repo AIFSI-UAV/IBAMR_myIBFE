@@ -14,6 +14,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -79,7 +80,13 @@ static double material_caudal_transition_w = 0.10;
 static double material_nu_eff = 0.45;
 static double section_i2_floor_ratio = 1.0e-3;
 static double fiber_stiffness_ratio = 0.10;
-static double active_t_max_abs = 50.0;
+static double active_t_max_abs = 10.0;
+enum class ActiveCrossSectionMode { LINEAR_ETA, MUSCLE_BAND };
+static ActiveCrossSectionMode active_cross_section_mode =
+    ActiveCrossSectionMode::MUSCLE_BAND;
+static double active_band_fraction = 0.40;
+static int active_section_bins = 128;
+static std::string active_section_quad_order = "FIFTH";
 
 // --- Geometry / actuation frequency ---
 static double fish_length = 1.00;
@@ -163,9 +170,25 @@ struct ReferenceGeometrySample
     VectorValue<double> t_hat = VectorValue<double>(1.0, 0.0);
 };
 
+struct ActiveSectionNormalization
+{
+    bool valid = false;
+    double s_mid = 0.0;
+    double ds = 0.0;
+    double area = 0.0;
+    double eta_mean = 0.0;
+    double I2 = 0.0;
+    double g_mean = 0.0;
+    double q_scale = 0.0;
+    double q_abs_max = 0.0;
+    double unit_force = 0.0;
+    double unit_moment = 0.0;
+};
+
 static std::vector<CenterlineSegment> ref_centerline_segments;
 static std::map<dof_id_type, ReferenceGeometrySample> ref_laplace_node_geom;
 static bool ref_laplace_parameterization_built = false;
+static std::vector<ActiveSectionNormalization> active_section_normalization;
 
 struct PhiIsoSectionSample
 {
@@ -240,6 +263,11 @@ static std::string s_force_decomp_diag_filename = "force_decomposition_diag.csv"
 static std::string s_force_decomp_quad_order    = "FIFTH";
 static double      s_force_decomp_prev_time =
     std::numeric_limits<double>::quiet_NaN();
+
+// -- Active section equilibrium diagnostics -----------------------------
+static bool        s_active_section_diag_enable   = true;
+static int         s_active_section_diag_interval = 100;
+static std::string s_active_section_diag_filename = "active_section_diag.csv";
 
 // ── Midline history CSV ───────────────────────────────────────────────────────
 // Full per-station midline snapshot at regular step intervals. Columns include
@@ -2290,6 +2318,30 @@ inline ActiveMomentMode parse_active_moment_mode(const std::string& mode_raw)
     return ActiveMomentMode::TRAVELING;
 }
 
+inline ActiveCrossSectionMode
+parse_active_cross_section_mode(const std::string& mode_raw)
+{
+    const std::string mode = normalize_mode_string(mode_raw);
+    if (mode == "LINEAR-ETA") return ActiveCrossSectionMode::LINEAR_ETA;
+    if (mode == "MUSCLE-BAND") return ActiveCrossSectionMode::MUSCLE_BAND;
+
+    TBOX_ERROR("Unknown ACTIVE_CROSS_SECTION_MODE = \"" << mode_raw
+               << "\". Expected \"LINEAR_ETA\" or \"MUSCLE_BAND\".\n");
+    return ActiveCrossSectionMode::MUSCLE_BAND;
+}
+
+inline const char* active_cross_section_mode_name()
+{
+    switch (active_cross_section_mode)
+    {
+    case ActiveCrossSectionMode::LINEAR_ETA:
+        return "LINEAR_ETA";
+    case ActiveCrossSectionMode::MUSCLE_BAND:
+        return "MUSCLE_BAND";
+    }
+    return "MUSCLE_BAND";
+}
+
 inline const char* active_moment_mode_name()
 {
     switch (active_moment_mode)
@@ -2479,6 +2531,94 @@ inline double section_second_moment_floor()
                     1.0e-18);
 }
 
+inline int active_section_bin_from_s(const double s)
+{
+    const int n_bins = std::max(active_section_bins, 1);
+    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
+    return std::min(static_cast<int>(s_norm * n_bins), n_bins - 1);
+}
+
+inline double active_cross_section_shape(const double eta, const double h)
+{
+    if (h <= 1.0e-14) return 0.0;
+    const double z = std::max(-1.0, std::min(eta / h, 1.0));
+    if (active_cross_section_mode == ActiveCrossSectionMode::LINEAR_ETA)
+    {
+        return z;
+    }
+
+    const double band_fraction =
+        std::max(1.0e-6, std::min(active_band_fraction, 1.0));
+    const double band_coordinate =
+        (std::abs(z) - (1.0 - band_fraction)) / band_fraction;
+    const double magnitude = smoothstep(band_coordinate);
+    return z >= 0.0 ? magnitude : -magnitude;
+}
+
+inline const ActiveSectionNormalization*
+active_section_normalization_from_s(const double s)
+{
+    if (active_section_normalization.empty()) return nullptr;
+    const int bin = active_section_bin_from_s(s);
+    const ActiveSectionNormalization& normalization =
+        active_section_normalization[static_cast<std::size_t>(bin)];
+    return normalization.valid ? &normalization : nullptr;
+}
+
+inline double active_section_q(const ReferenceGeometrySample& ref_geom)
+{
+    const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
+    const double h = body_halfthick_from_s(s);
+    const ActiveSectionNormalization* normalization =
+        active_section_normalization_from_s(s);
+    if (normalization)
+    {
+        const double g = active_cross_section_shape(ref_geom.eta, h);
+        return normalization->q_scale * (g - normalization->g_mean);
+    }
+
+    const double I2_use =
+        std::max(section_second_moment(h), section_second_moment_floor());
+    return -ref_geom.eta / I2_use;
+}
+
+inline double active_section_q_abs_max(const ReferenceGeometrySample& ref_geom)
+{
+    const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
+    const ActiveSectionNormalization* normalization =
+        active_section_normalization_from_s(s);
+    if (normalization) return normalization->q_abs_max;
+
+    const double h = body_halfthick_from_s(s);
+    const double I2_use =
+        std::max(section_second_moment(h), section_second_moment_floor());
+    return h / I2_use;
+}
+
+inline double active_uniform_cap_scale(const double moment,
+                                       const double q_abs_max)
+{
+    if (active_t_max_abs <= 0.0 || q_abs_max <= 0.0) return 1.0;
+    const double ratio = std::abs(moment) * q_abs_max / active_t_max_abs;
+    if (ratio <= 1.0e-12) return 1.0;
+    return std::tanh(ratio) / ratio;
+}
+
+inline double
+active_section_moment_command(const ReferenceGeometrySample& ref_geom,
+                              const double time)
+{
+    const double s_local =
+        std::max(0.0, std::min(ref_geom.s, ref_arc_length));
+    const ActiveSectionNormalization* normalization =
+        active_section_normalization_from_s(s_local);
+    const double s_eval = normalization ? normalization->s_mid : s_local;
+    const double s_norm =
+        clamp01(s_eval / std::max(ref_arc_length, 1.0e-12));
+    const double h = body_halfthick_from_s(s_eval);
+    return active_moment_value_from_sample(s_eval, s_norm, h, time);
+}
+
 inline MaterialProperties material_properties_from_s(const double s)
 {
     const double Lref = std::max(ref_arc_length, 1.0e-12);
@@ -2492,6 +2632,153 @@ inline MaterialProperties material_properties_from_s(const double s)
     props.K = props.E / (3.0 * (1.0 - 2.0 * material_nu_eff));
     props.kf = fiber_stiffness_ratio * props.E;
     return props;
+}
+
+static void
+initialize_active_section_normalization(MeshBase& mesh,
+                                        EquationSystems* equation_systems)
+{
+    if (!equation_systems)
+    {
+        TBOX_ERROR("initialize_active_section_normalization(): null equation systems.\n");
+    }
+
+    const int n_bins = std::max(active_section_bins, 1);
+    active_section_bins = n_bins;
+    const double ds = std::max(ref_arc_length, 1.0e-12) / n_bins;
+    const int n_fields = 5;
+    std::vector<double> moments(static_cast<std::size_t>(n_bins * n_fields), 0.0);
+
+    System& ref_geom_sys = equation_systems->get_system(REF_GEOM_SYSTEM_NAME);
+    NumericVector<double>* ref_geom_vec = ref_geom_sys.solution.get();
+    NumericVector<double>* ref_geom_ghost_vec =
+        ref_geom_sys.current_local_solution.get();
+    ref_geom_vec->close();
+    copy_and_synch(*ref_geom_vec, *ref_geom_ghost_vec);
+
+    const unsigned int dim = mesh.mesh_dimension();
+    const DofMap& dof_map = ref_geom_sys.get_dof_map();
+    const FEType fe_type = dof_map.variable_type(0);
+    const libMesh::Order quad_order =
+        Utility::string_to_enum<libMesh::Order>(active_section_quad_order);
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
+    std::unique_ptr<QBase> qrule(new QGauss(dim, quad_order));
+    fe->attach_quadrature_rule(qrule.get());
+
+    const std::vector<double>& JxW = fe->get_JxW();
+    const std::vector<std::vector<double> >& phi = fe->get_phi();
+    std::vector<std::vector<unsigned int> > dof_indices(REF_GEOM_N_VARS);
+
+    for (auto el_it = mesh.active_local_elements_begin();
+         el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        if (!elem) continue;
+        fe->reinit(elem);
+        for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
+            dof_map.dof_indices(elem, dof_indices[v], v);
+
+        const unsigned int n_nodes = elem->n_nodes();
+        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
+        {
+            double s = 0.0;
+            double eta = 0.0;
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                s += phi[k][qp] *
+                     (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_S][k]);
+                eta += phi[k][qp] *
+                       (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_ETA][k]);
+            }
+            s = std::max(0.0, std::min(s, ref_arc_length));
+            const int bin = active_section_bin_from_s(s);
+            const double h = body_halfthick_from_s(s);
+            const double g = active_cross_section_shape(eta, h);
+            const double weight = JxW[qp];
+            const std::size_t offset =
+                static_cast<std::size_t>(bin * n_fields);
+            moments[offset + 0] += weight;
+            moments[offset + 1] += g * weight;
+            moments[offset + 2] += eta * weight;
+            moments[offset + 3] += g * eta * weight;
+            moments[offset + 4] += eta * eta * weight;
+        }
+    }
+
+    IBTK_MPI::sumReduction(moments.data(), static_cast<int>(moments.size()));
+    active_section_normalization.assign(
+        static_cast<std::size_t>(n_bins), ActiveSectionNormalization());
+
+    int invalid_bins = 0;
+    double max_unit_force = 0.0;
+    double max_unit_moment_error = 0.0;
+    for (int bin = 0; bin < n_bins; ++bin)
+    {
+        const std::size_t offset = static_cast<std::size_t>(bin * n_fields);
+        const double area = moments[offset + 0];
+        const double g_integral = moments[offset + 1];
+        const double eta_integral = moments[offset + 2];
+        const double g_eta_integral = moments[offset + 3];
+        const double eta2_integral = moments[offset + 4];
+
+        ActiveSectionNormalization& normalization =
+            active_section_normalization[static_cast<std::size_t>(bin)];
+        normalization.s_mid = (bin + 0.5) * ds;
+        normalization.ds = ds;
+        normalization.area = area / ds;
+        if (area <= 1.0e-18)
+        {
+            ++invalid_bins;
+            continue;
+        }
+
+        normalization.g_mean = g_integral / area;
+        normalization.eta_mean = eta_integral / area;
+        normalization.I2 =
+            (eta2_integral - eta_integral * eta_integral / area) / ds;
+        const double centered_g_eta =
+            g_eta_integral - normalization.g_mean * eta_integral;
+        if (std::abs(centered_g_eta) <= 1.0e-18)
+        {
+            ++invalid_bins;
+            continue;
+        }
+
+        normalization.q_scale = -ds / centered_g_eta;
+        normalization.q_abs_max =
+            std::abs(normalization.q_scale) *
+            std::max(std::abs(-1.0 - normalization.g_mean),
+                     std::abs(1.0 - normalization.g_mean));
+        normalization.unit_force =
+            normalization.q_scale *
+            (g_integral - normalization.g_mean * area) / ds;
+        normalization.unit_moment =
+            -normalization.q_scale * centered_g_eta / ds;
+        normalization.valid =
+            std::isfinite(normalization.q_scale) &&
+            std::isfinite(normalization.q_abs_max);
+        if (!normalization.valid)
+        {
+            ++invalid_bins;
+            continue;
+        }
+        max_unit_force =
+            std::max(max_unit_force, std::abs(normalization.unit_force));
+        max_unit_moment_error =
+            std::max(max_unit_moment_error,
+                     std::abs(normalization.unit_moment - 1.0));
+    }
+
+    if (invalid_bins > 0)
+    {
+        TBOX_WARNING("Active section FE normalization has " << invalid_bins
+                     << " invalid/empty bins; those bins use the analytic "
+                        "-eta/I2 fallback.\n");
+    }
+    pout << "  active section FE normalization: bins=" << n_bins
+         << ", invalid=" << invalid_bins
+         << ", max |unit force|=" << max_unit_force
+         << ", max |unit moment-1|=" << max_unit_moment_error << "\n";
 }
 
 inline void check_deformation_jacobian(const TensorValue<double>& FF,
@@ -2563,18 +2850,16 @@ compute_active_PK1_stress_impl(TensorValue<double>& PP,
     check_deformation_jacobian(FF, X_ref, "compute_active_PK1_stress_impl()");
 
     const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
-    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
     const double h = body_halfthick_from_s(s);
     if (h <= 1.0e-12) return;
 
-    const double Ma = active_moment_value_from_sample(s, s_norm, h, time);
+    const double Ma = active_section_moment_command(ref_geom, time);
     if (std::abs(Ma) <= 1.0e-30) return;
 
-    const double I2_use = std::max(section_second_moment(h),
-                                   section_second_moment_floor());
-    const double T_raw = -Ma * ref_geom.eta / I2_use;
-    const double T_active = active_t_max_abs > 0.0 ?
-        active_t_max_abs * std::tanh(T_raw / active_t_max_abs) : T_raw;
+    const double q = active_section_q(ref_geom);
+    const double cap_scale =
+        active_uniform_cap_scale(Ma, active_section_q_abs_max(ref_geom));
+    const double T_active = cap_scale * Ma * q;
 
     const VectorValue<double> f0 = ref_geom.t_hat;
     TensorValue<double> f0_f0;
@@ -3905,6 +4190,153 @@ write_force_decomposition_diagnostics(const int            iteration_num,
     out.flush();
 }
 
+static void
+write_active_section_diagnostics(const int        iteration_num,
+                                 const double     loop_time,
+                                 MeshBase&        mesh,
+                                 EquationSystems* equation_systems)
+{
+    if (!s_active_section_diag_enable) return;
+    if (s_active_section_diag_interval > 1 &&
+        (iteration_num % s_active_section_diag_interval != 0)) return;
+    if (!equation_systems || active_section_normalization.empty()) return;
+
+    const int n_bins = static_cast<int>(active_section_normalization.size());
+    const int n_fields = 5;
+    std::vector<double> values(static_cast<std::size_t>(n_bins * n_fields), 0.0);
+
+    System& ref_geom_sys = equation_systems->get_system(REF_GEOM_SYSTEM_NAME);
+    NumericVector<double>* ref_geom_vec = ref_geom_sys.solution.get();
+    NumericVector<double>* ref_geom_ghost_vec =
+        ref_geom_sys.current_local_solution.get();
+    ref_geom_vec->close();
+    copy_and_synch(*ref_geom_vec, *ref_geom_ghost_vec);
+
+    const unsigned int dim = mesh.mesh_dimension();
+    const DofMap& dof_map = ref_geom_sys.get_dof_map();
+    const FEType fe_type = dof_map.variable_type(0);
+    const libMesh::Order quad_order =
+        Utility::string_to_enum<libMesh::Order>(active_section_quad_order);
+    std::unique_ptr<FEBase> fe(FEBase::build(dim, fe_type));
+    std::unique_ptr<QBase> qrule(new QGauss(dim, quad_order));
+    fe->attach_quadrature_rule(qrule.get());
+
+    const std::vector<double>& JxW = fe->get_JxW();
+    const std::vector<std::vector<double> >& phi = fe->get_phi();
+    std::vector<std::vector<unsigned int> > dof_indices(REF_GEOM_N_VARS);
+
+    for (auto el_it = mesh.active_local_elements_begin();
+         el_it != mesh.active_local_elements_end(); ++el_it)
+    {
+        const Elem* elem = *el_it;
+        if (!elem) continue;
+        fe->reinit(elem);
+        for (unsigned int v = 0; v < REF_GEOM_N_VARS; ++v)
+            dof_map.dof_indices(elem, dof_indices[v], v);
+
+        const unsigned int n_nodes = elem->n_nodes();
+        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
+        {
+            ReferenceGeometrySample ref_geom;
+            for (unsigned int k = 0; k < n_nodes; ++k)
+            {
+                ref_geom.s +=
+                    phi[k][qp] *
+                    (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_S][k]);
+                ref_geom.eta +=
+                    phi[k][qp] *
+                    (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_ETA][k]);
+            }
+            ref_geom.s =
+                std::max(0.0, std::min(ref_geom.s, ref_arc_length));
+            const int bin = active_section_bin_from_s(ref_geom.s);
+            const double moment =
+                active_section_moment_command(ref_geom, loop_time);
+            const double cap_scale =
+                active_uniform_cap_scale(moment,
+                                         active_section_q_abs_max(ref_geom));
+            const double applied_moment = cap_scale * moment;
+            const double stress = applied_moment * active_section_q(ref_geom);
+            const double weight = JxW[qp];
+            const std::size_t offset =
+                static_cast<std::size_t>(bin * n_fields);
+            values[offset + 0] += weight;
+            values[offset + 1] += stress * weight;
+            values[offset + 2] += -stress * ref_geom.eta * weight;
+            values[offset + 3] += moment * weight;
+            values[offset + 4] += applied_moment * weight;
+        }
+    }
+
+    IBTK_MPI::sumReduction(values.data(), static_cast<int>(values.size()));
+    if (IBTK_MPI::getRank() != 0) return;
+
+    static std::ofstream out;
+    if (!out.is_open())
+    {
+        out.open(s_active_section_diag_filename.c_str(), std::ios::out);
+        if (!out.is_open())
+        {
+            TBOX_WARNING("write_active_section_diagnostics(): cannot open "
+                         << s_active_section_diag_filename << "\n");
+            return;
+        }
+        out << "step,time,bin,s_norm,valid,A_section,eta_bar,I2_section"
+            << ",g_bar,q_scale,q_abs_max,unit_force,unit_moment"
+            << ",N_active,M_active,M_command,M_applied_target"
+            << ",M_ratio,N_relative\n";
+    }
+
+    out.setf(std::ios::scientific);
+    out.precision(10);
+    for (int bin = 0; bin < n_bins; ++bin)
+    {
+        const ActiveSectionNormalization& normalization =
+            active_section_normalization[static_cast<std::size_t>(bin)];
+        const std::size_t offset = static_cast<std::size_t>(bin * n_fields);
+        const double area_volume = values[offset + 0];
+        const double ds = std::max(normalization.ds, 1.0e-30);
+        const double N_active = values[offset + 1] / ds;
+        const double M_active = values[offset + 2] / ds;
+        const double M_command = area_volume > 1.0e-30 ?
+            values[offset + 3] / area_volume : 0.0;
+        const double M_applied = area_volume > 1.0e-30 ?
+            values[offset + 4] / area_volume : 0.0;
+        const double M_ratio = std::abs(M_applied) > 1.0e-30 ?
+            M_active / M_applied :
+            std::numeric_limits<double>::quiet_NaN();
+        const double h = body_halfthick_from_s(normalization.s_mid);
+        const double force_scale =
+            std::abs(M_applied) / std::max(h, 1.0e-30);
+        const double N_relative = force_scale > 1.0e-30 ?
+            std::abs(N_active) / force_scale :
+            std::numeric_limits<double>::quiet_NaN();
+
+        out << iteration_num
+            << "," << loop_time
+            << "," << bin
+            << "," << normalization.s_mid /
+                         std::max(ref_arc_length, 1.0e-12)
+            << "," << (normalization.valid ? 1 : 0)
+            << "," << normalization.area
+            << "," << normalization.eta_mean
+            << "," << normalization.I2
+            << "," << normalization.g_mean
+            << "," << normalization.q_scale
+            << "," << normalization.q_abs_max
+            << "," << normalization.unit_force
+            << "," << normalization.unit_moment
+            << "," << N_active
+            << "," << M_active
+            << "," << M_command
+            << "," << M_applied
+            << "," << M_ratio
+            << "," << N_relative
+            << "\n";
+    }
+    out.flush();
+}
+
 inline double phase_from_fourier_coeffs(const double c, const double s)
 {
     if (c * c + s * s <= 1.0e-30)
@@ -4348,12 +4780,16 @@ write_test_diagnostics(const int            iteration_num,
         s_force_decomp_diag_enable &&
         (s_force_decomp_diag_interval <= 1 ||
          (iteration_num % s_force_decomp_diag_interval == 0));
+    const bool active_section_due =
+        s_active_section_diag_enable &&
+        (s_active_section_diag_interval <= 1 ||
+         (iteration_num % s_active_section_diag_interval == 0));
     const bool midline_hist_due =
         s_midline_hist_enable &&
         (s_midline_hist_interval <= 1 ||
          (iteration_num % s_midline_hist_interval == 0));
     if (!curvature_phase_due && !geometry_conservation_due &&
-        !force_decomp_due && !midline_hist_due) return;
+        !force_decomp_due && !active_section_due && !midline_hist_due) return;
     if (!equation_systems) return;
 
     double x_cm_new = xcom_tracked;
@@ -4384,6 +4820,12 @@ write_test_diagnostics(const int            iteration_num,
                                               equation_systems,
                                               x_cm_new, y_cm_new,
                                               vcm_x, vcm_y);
+    }
+
+    if (active_section_due)
+    {
+        write_active_section_diagnostics(iteration_num, loop_time,
+                                         mesh, equation_systems);
     }
 
     if (geometry_conservation_due)
@@ -4461,6 +4903,19 @@ int main(int argc, char* argv[])
         active_t_max_abs =
             input_db->getDoubleWithDefault("ACTIVE_T_MAX_ABS",
                                            active_t_max_abs);
+        active_cross_section_mode =
+            parse_active_cross_section_mode(input_db->getStringWithDefault(
+                "ACTIVE_CROSS_SECTION_MODE",
+                active_cross_section_mode_name()));
+        active_band_fraction =
+            input_db->getDoubleWithDefault("ACTIVE_BAND_FRACTION",
+                                           active_band_fraction);
+        active_section_bins =
+            input_db->getIntegerWithDefault("ACTIVE_SECTION_BINS",
+                                            active_section_bins);
+        active_section_quad_order =
+            input_db->getStringWithDefault("ACTIVE_SECTION_QUAD_ORDER",
+                                           active_section_quad_order);
 
         target_bending_B_body = std::max(0.0, target_bending_B_body);
         target_bending_B_peduncle = std::max(0.0, target_bending_B_peduncle);
@@ -4476,6 +4931,9 @@ int main(int argc, char* argv[])
         section_i2_floor_ratio = std::max(0.0, section_i2_floor_ratio);
         fiber_stiffness_ratio = std::max(0.0, fiber_stiffness_ratio);
         active_t_max_abs = std::max(0.0, active_t_max_abs);
+        active_band_fraction =
+            std::max(1.0e-6, std::min(active_band_fraction, 1.0));
+        active_section_bins = std::max(1, active_section_bins);
 
         // ── Read geometry / actuation parameters ──────────────────────────
         fish_length  = input_db->getDoubleWithDefault("FISH_LENGTH", fish_length);
@@ -4599,6 +5057,16 @@ int main(int argc, char* argv[])
         s_force_decomp_quad_order = input_db->getStringWithDefault(
             "FORCE_DECOMP_QUAD_ORDER", s_force_decomp_quad_order);
 
+        s_active_section_diag_enable = input_db->getBoolWithDefault(
+            "ACTIVE_SECTION_DIAG_ENABLE", s_active_section_diag_enable);
+        s_active_section_diag_interval = std::max(
+            1, input_db->getIntegerWithDefault(
+                   "ACTIVE_SECTION_DIAG_INTERVAL",
+                   s_active_section_diag_interval));
+        s_active_section_diag_filename = input_db->getStringWithDefault(
+            "ACTIVE_SECTION_DIAG_FILENAME",
+            s_active_section_diag_filename);
+
         // ── Print startup summary ─────────────────────────────────────────
         const double L_fish = std::max(fish_length, 1.0e-12);
         const double lambda_phase = active_phase_wavelength_dimensional();
@@ -4626,7 +5094,12 @@ int main(int argc, char* argv[])
              << ", section I2 floor ratio=" << section_i2_floor_ratio << "\n";
         pout << "  fiber stiffness ratio kf/E = " << fiber_stiffness_ratio
              << ", active stress cap = " << active_t_max_abs << "\n";
-        pout << "  active mapping: T_active=-M_active*eta/I2, PK1 stress only\n";
+        pout << "  active cross-section mode = "
+             << active_cross_section_mode_name()
+             << ", muscle band fraction = " << active_band_fraction
+             << ", FE section bins = " << active_section_bins << "\n";
+        pout << "  active mapping: FE-normalized zero-force/unit-moment q(eta), "
+                "PK1 stress only\n";
         pout << "  active moment mode = " << active_moment_mode_name()
              << ", beta_act = " << beta_act
              << ", static M0 = " << static_moment_m0
@@ -4678,7 +5151,8 @@ int main(int argc, char* argv[])
              << s_midline_hist_filename << " (whole-body bending), "
              << s_curvature_phase_diag_filename << " (curvature phase), "
              << s_geometry_conservation_diag_filename << " (J_min), "
-             << s_force_decomp_diag_filename << " (force decomposition)\n";
+             << s_force_decomp_diag_filename << " (force decomposition), "
+             << s_active_section_diag_filename << " (active section balance)\n";
         pout << "  midline history diagnostics = "
              << (s_midline_hist_enable ? "on" : "off")
              << ", interval = " << s_midline_hist_interval
@@ -4699,6 +5173,11 @@ int main(int argc, char* argv[])
              << ", interval = " << s_force_decomp_diag_interval
              << ", quad_order = " << s_force_decomp_quad_order
              << ", file = " << s_force_decomp_diag_filename << "\n";
+        pout << "  active section diagnostics = "
+             << (s_active_section_diag_enable ? "on" : "off")
+             << ", interval = " << s_active_section_diag_interval
+             << ", quad_order = " << active_section_quad_order
+             << ", file = " << s_active_section_diag_filename << "\n";
 
         pout << "  effective active-zone length = "
              << active_s_span * ref_arc_length
@@ -4873,6 +5352,7 @@ int main(int argc, char* argv[])
         // ── Initialize hierarchy ────────────────────────────────────────────
         ib_method_ops->initializeFEData();
         fill_reference_geometry_system(mesh, equation_systems);
+        initialize_active_section_normalization(mesh, equation_systems);
 
         if (ib_post_processor) ib_post_processor->initializeFEData();
         time_integrator->initializePatchHierarchy(patch_hierarchy, gridding_algorithm);
