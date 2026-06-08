@@ -1,7 +1,8 @@
 // IBFE continuum fish with full physical material stresses.
 //
-// The passive body is a spatially varying continuum material calibrated from
-// the target bending stiffness B(s). Active bending is represented by a
+// The passive body is a spatially varying two-dimensional continuum material
+// calibrated from the target bending stiffness B(s), with objective
+// Kelvin-Voigt axial damping. Active bending is represented by a
 // self-equilibrated axial PK1 stress over each material section. No extracted
 // centerline force or beam-specific time-step controller is used.
 
@@ -16,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -79,8 +81,11 @@ static double material_caudal_transition_s = 0.85;
 static double material_caudal_transition_w = 0.10;
 static double material_nu_eff = 0.45;
 static double section_i2_floor_ratio = 1.0e-3;
-static double fiber_stiffness_ratio = 0.10;
+static double fiber_stiffness_ratio = 0.0;
+static double structural_kv_loss_factor = 0.02;
+static double structural_kv_stress_cap_over_E = 10.0;
 static double active_t_max_abs = 10.0;
+static double active_t_max_over_E = 0.25;
 enum class ActiveCrossSectionMode { LINEAR_ETA, MUSCLE_BAND };
 static ActiveCrossSectionMode active_cross_section_mode =
     ActiveCrossSectionMode::MUSCLE_BAND;
@@ -268,6 +273,11 @@ static double      s_force_decomp_prev_time =
 static bool        s_active_section_diag_enable   = true;
 static int         s_active_section_diag_interval = 100;
 static std::string s_active_section_diag_filename = "active_section_diag.csv";
+
+// -- Material profile diagnostics ----------------------------------------
+static bool        s_material_profile_diag_enable = true;
+static std::string s_material_profile_diag_filename = "material_profile_diag.csv";
+static int         s_material_profile_diag_samples = 201;
 
 // ── Midline history CSV ───────────────────────────────────────────────────────
 // Full per-station midline snapshot at regular step intervals. Columns include
@@ -618,9 +628,27 @@ inline double approximate_s_norm_from_x(const double x_query)
 {
     if (ref_profile_x.size() >= 2 && ref_profile_s.size() == ref_profile_x.size())
     {
-        if (x_query <= ref_profile_x.front()) return 0.0;
-        if (x_query >= ref_profile_x.back()) return clamp01(ref_profile_s.back() / std::max(ref_arc_length, 1.0e-12));
-        const auto it = std::lower_bound(ref_profile_x.begin(), ref_profile_x.end(), x_query);
+        const bool increasing_x = ref_profile_x.back() >= ref_profile_x.front();
+        if (increasing_x)
+        {
+            if (x_query <= ref_profile_x.front()) return 0.0;
+            if (x_query >= ref_profile_x.back())
+                return clamp01(ref_profile_s.back() / std::max(ref_arc_length, 1.0e-12));
+        }
+        else
+        {
+            if (x_query >= ref_profile_x.front()) return 0.0;
+            if (x_query <= ref_profile_x.back())
+                return clamp01(ref_profile_s.back() / std::max(ref_arc_length, 1.0e-12));
+        }
+
+        const auto it = increasing_x ?
+            std::lower_bound(ref_profile_x.begin(), ref_profile_x.end(), x_query) :
+            std::lower_bound(ref_profile_x.begin(), ref_profile_x.end(), x_query,
+                             [](const double a, const double b)
+                             {
+                                 return a > b;
+                             });
         const std::size_t i1 = static_cast<std::size_t>(std::distance(ref_profile_x.begin(), it));
         const std::size_t i0 = (i1 > 0) ? i1 - 1 : 0;
         const double x0 = ref_profile_x[i0];
@@ -653,6 +681,7 @@ inline double active_s_start_norm_effective()
 
 inline double active_s_end_norm_effective()
 {
+    if (active_s_end < 0.0) return active_end_s_norm_effective();
     return clamp01(active_s_end);
 }
 
@@ -1076,6 +1105,7 @@ ReferenceGeometrySample reference_geometry_from_system_data(
 void add_reference_geometry_system(EquationSystems* equation_systems)
 {
     if (!equation_systems) return;
+    if (equation_systems->has_system(REF_GEOM_SYSTEM_NAME)) return;
 
     ExplicitSystem& ref_geom_sys =
         equation_systems->add_system<ExplicitSystem>(REF_GEOM_SYSTEM_NAME);
@@ -2506,8 +2536,8 @@ inline double longitudinal_active_envelope(double s_norm)
 //   W_vol = K(s)/2 [ln J]^2
 //
 // The local effective Young modulus is calibrated by E(s) I(s) = B(s), with
-// I(s) = 2 h(s)^3 / 3 for a 2D unit-depth section. K is an effective area
-// modulus obtained from the configured nu_eff.
+// I(s) = 2 h(s)^3 / 3 for a 2D unit-depth section. The 2D shear/area moduli
+// are chosen so a traction-free uniaxial test recovers E and nu.
 // =========================================================================
 struct MaterialProperties
 {
@@ -2555,26 +2585,73 @@ inline double active_cross_section_shape(const double eta, const double h)
     return z >= 0.0 ? magnitude : -magnitude;
 }
 
-inline const ActiveSectionNormalization*
-active_section_normalization_from_s(const double s)
+inline bool
+interpolate_active_section_normalization(
+    const double s,
+    ActiveSectionNormalization& normalization)
 {
-    if (active_section_normalization.empty()) return nullptr;
-    const int bin = active_section_bin_from_s(s);
-    const ActiveSectionNormalization& normalization =
-        active_section_normalization[static_cast<std::size_t>(bin)];
-    return normalization.valid ? &normalization : nullptr;
+    if (active_section_normalization.empty()) return false;
+    const int n_bins = static_cast<int>(active_section_normalization.size());
+    const double ds = std::max(ref_arc_length, 1.0e-12) / n_bins;
+    const double bin_coordinate =
+        std::max(0.0, std::min(s, ref_arc_length)) / ds - 0.5;
+    int bin0 = static_cast<int>(std::floor(bin_coordinate));
+    double alpha = bin_coordinate - bin0;
+    if (bin0 < 0)
+    {
+        bin0 = 0;
+        alpha = 0.0;
+    }
+    if (bin0 >= n_bins - 1)
+    {
+        bin0 = n_bins - 1;
+        alpha = 0.0;
+    }
+    const int bin1 = std::min(bin0 + 1, n_bins - 1);
+    const ActiveSectionNormalization& n0 =
+        active_section_normalization[static_cast<std::size_t>(bin0)];
+    const ActiveSectionNormalization& n1 =
+        active_section_normalization[static_cast<std::size_t>(bin1)];
+    if (!n0.valid && !n1.valid) return false;
+    if (!n0.valid)
+    {
+        normalization = n1;
+        return true;
+    }
+    if (!n1.valid)
+    {
+        normalization = n0;
+        return true;
+    }
+
+    const auto lerp = [alpha](const double a, const double b)
+    {
+        return (1.0 - alpha) * a + alpha * b;
+    };
+    normalization = n0;
+    normalization.s_mid = std::max(0.0, std::min(s, ref_arc_length));
+    normalization.area = lerp(n0.area, n1.area);
+    normalization.eta_mean = lerp(n0.eta_mean, n1.eta_mean);
+    normalization.I2 = lerp(n0.I2, n1.I2);
+    normalization.g_mean = lerp(n0.g_mean, n1.g_mean);
+    normalization.q_scale = lerp(n0.q_scale, n1.q_scale);
+    normalization.q_abs_max =
+        std::abs(normalization.q_scale) *
+        std::max(std::abs(-1.0 - normalization.g_mean),
+                 std::abs(1.0 - normalization.g_mean));
+    normalization.valid = true;
+    return true;
 }
 
 inline double active_section_q(const ReferenceGeometrySample& ref_geom)
 {
     const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
     const double h = body_halfthick_from_s(s);
-    const ActiveSectionNormalization* normalization =
-        active_section_normalization_from_s(s);
-    if (normalization)
+    ActiveSectionNormalization normalization;
+    if (interpolate_active_section_normalization(s, normalization))
     {
         const double g = active_cross_section_shape(ref_geom.eta, h);
-        return normalization->q_scale * (g - normalization->g_mean);
+        return normalization.q_scale * (g - normalization.g_mean);
     }
 
     const double I2_use =
@@ -2585,9 +2662,9 @@ inline double active_section_q(const ReferenceGeometrySample& ref_geom)
 inline double active_section_q_abs_max(const ReferenceGeometrySample& ref_geom)
 {
     const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
-    const ActiveSectionNormalization* normalization =
-        active_section_normalization_from_s(s);
-    if (normalization) return normalization->q_abs_max;
+    ActiveSectionNormalization normalization;
+    if (interpolate_active_section_normalization(s, normalization))
+        return normalization.q_abs_max;
 
     const double h = body_halfthick_from_s(s);
     const double I2_use =
@@ -2595,11 +2672,32 @@ inline double active_section_q_abs_max(const ReferenceGeometrySample& ref_geom)
     return h / I2_use;
 }
 
-inline double active_uniform_cap_scale(const double moment,
-                                       const double q_abs_max)
+inline double active_stress_cap_from_s(const double s)
 {
-    if (active_t_max_abs <= 0.0 || q_abs_max <= 0.0) return 1.0;
-    const double ratio = std::abs(moment) * q_abs_max / active_t_max_abs;
+    double cap = active_t_max_abs > 0.0 ?
+        active_t_max_abs : std::numeric_limits<double>::infinity();
+    if (active_t_max_over_E > 0.0)
+    {
+        const double s_norm =
+            clamp01(s / std::max(ref_arc_length, 1.0e-12));
+        const double I2 =
+            std::max(section_second_moment(body_halfthick_from_s(s)),
+                     section_second_moment_floor());
+        const double E = get_target_bending_B_local(s_norm) / I2;
+        cap = std::min(cap, active_t_max_over_E * E);
+    }
+    return cap;
+}
+
+inline double active_uniform_cap_scale(const double moment,
+                                       const double q_abs_max,
+                                       const double s)
+{
+    if (q_abs_max <= 0.0) return 1.0;
+    const double stress_cap = active_stress_cap_from_s(s);
+    if (!std::isfinite(stress_cap)) return 1.0;
+    if (stress_cap <= 0.0) return 0.0;
+    const double ratio = std::abs(moment) * q_abs_max / stress_cap;
     if (ratio <= 1.0e-12) return 1.0;
     return std::tanh(ratio) / ratio;
 }
@@ -2610,13 +2708,10 @@ active_section_moment_command(const ReferenceGeometrySample& ref_geom,
 {
     const double s_local =
         std::max(0.0, std::min(ref_geom.s, ref_arc_length));
-    const ActiveSectionNormalization* normalization =
-        active_section_normalization_from_s(s_local);
-    const double s_eval = normalization ? normalization->s_mid : s_local;
     const double s_norm =
-        clamp01(s_eval / std::max(ref_arc_length, 1.0e-12));
-    const double h = body_halfthick_from_s(s_eval);
-    return active_moment_value_from_sample(s_eval, s_norm, h, time);
+        clamp01(s_local / std::max(ref_arc_length, 1.0e-12));
+    const double h = body_halfthick_from_s(s_local);
+    return active_moment_value_from_sample(s_local, s_norm, h, time);
 }
 
 inline MaterialProperties material_properties_from_s(const double s)
@@ -2628,10 +2723,68 @@ inline MaterialProperties material_properties_from_s(const double s)
     props.I2 = std::max(section_second_moment(body_halfthick_from_s(s)),
                         section_second_moment_floor());
     props.E = props.B / props.I2;
+    // This is a two-dimensional constitutive law:
+    //   sigma = 2*mu*dev_2(epsilon) + K*tr(epsilon)*I.
+    // These moduli make a traction-free uniaxial test recover the configured
+    // E and nu, so the small-strain section bending rigidity is E*I = B.
     props.mu = props.E / (2.0 * (1.0 + material_nu_eff));
-    props.K = props.E / (3.0 * (1.0 - 2.0 * material_nu_eff));
+    props.K = props.E / (2.0 * (1.0 - material_nu_eff));
     props.kf = fiber_stiffness_ratio * props.E;
     return props;
+}
+
+static void
+write_material_profile_diagnostics()
+{
+    if (!s_material_profile_diag_enable) return;
+    if (IBTK_MPI::getRank() != 0) return;
+
+    const int n_samples = std::max(s_material_profile_diag_samples, 2);
+    std::ofstream out(s_material_profile_diag_filename.c_str(), std::ios::out);
+    if (!out.is_open())
+    {
+        TBOX_WARNING("write_material_profile_diagnostics(): cannot open "
+                     << s_material_profile_diag_filename << "\n");
+        return;
+    }
+
+    out << "sample,s_norm,s,h,I2_real,I2_floor,I2_used"
+        << ",B_target,E_used,B_eff,B_eff_over_B_target\n";
+    out.setf(std::ios::scientific);
+    out.precision(10);
+
+    const double Lref = std::max(ref_arc_length, 1.0e-12);
+    const double I2_floor = section_second_moment_floor();
+    for (int k = 0; k < n_samples; ++k)
+    {
+        const double s_norm =
+            (n_samples > 1) ?
+            static_cast<double>(k) / static_cast<double>(n_samples - 1) : 0.0;
+        const double s = s_norm * Lref;
+        const double h = body_halfthick_from_s(s);
+        const double I2_real = section_second_moment(h);
+        const double I2_used = std::max(I2_real, I2_floor);
+        const double B_target = get_target_bending_B_local(s_norm);
+        const double E_used = B_target / std::max(I2_used, 1.0e-30);
+        const double B_eff = E_used * I2_real;
+        const double B_eff_over_B_target =
+            B_target > 1.0e-30 ?
+            B_eff / B_target :
+            std::numeric_limits<double>::quiet_NaN();
+
+        out << k
+            << "," << s_norm
+            << "," << s
+            << "," << h
+            << "," << I2_real
+            << "," << I2_floor
+            << "," << I2_used
+            << "," << B_target
+            << "," << E_used
+            << "," << B_eff
+            << "," << B_eff_over_B_target
+            << "\n";
+    }
 }
 
 static void
@@ -2667,6 +2820,7 @@ initialize_active_section_normalization(MeshBase& mesh,
 
     const std::vector<double>& JxW = fe->get_JxW();
     const std::vector<std::vector<double> >& phi = fe->get_phi();
+    const std::vector<std::vector<RealGradient> >& dphi = fe->get_dphi();
     std::vector<std::vector<unsigned int> > dof_indices(REF_GEOM_N_VARS);
 
     for (auto el_it = mesh.active_local_elements_begin();
@@ -2683,18 +2837,26 @@ initialize_active_section_normalization(MeshBase& mesh,
         {
             double s = 0.0;
             double eta = 0.0;
+            RealGradient grad_s;
+            grad_s.zero();
             for (unsigned int k = 0; k < n_nodes; ++k)
             {
-                s += phi[k][qp] *
-                     (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_S][k]);
+                const double s_node =
+                    (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_S][k]);
+                s += phi[k][qp] * s_node;
                 eta += phi[k][qp] *
                        (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_ETA][k]);
+                grad_s.add_scaled(dphi[k][qp], s_node);
             }
             s = std::max(0.0, std::min(s, ref_arc_length));
             const int bin = active_section_bin_from_s(s);
             const double h = body_halfthick_from_s(s);
             const double g = active_cross_section_shape(eta, h);
-            const double weight = JxW[qp];
+            // Coarea weighting converts a thin s-bin volume integral into
+            // the corresponding physical iso-s section integral.
+            const double grad_s_norm =
+                std::sqrt(std::max(grad_s * grad_s, 0.0));
+            const double weight = grad_s_norm * JxW[qp];
             const std::size_t offset =
                 static_cast<std::size_t>(bin * n_fields);
             moments[offset + 0] += weight;
@@ -2712,6 +2874,17 @@ initialize_active_section_normalization(MeshBase& mesh,
     int invalid_bins = 0;
     double max_unit_force = 0.0;
     double max_unit_moment_error = 0.0;
+
+    struct InvalidBinRecord
+    {
+        int    bin;
+        double s_norm;
+        double area;
+        double centered_g_eta;
+        const char* reason;
+    };
+    std::vector<InvalidBinRecord> invalid_bin_records;
+
     for (int bin = 0; bin < n_bins; ++bin)
     {
         const std::size_t offset = static_cast<std::size_t>(bin * n_fields);
@@ -2729,6 +2902,10 @@ initialize_active_section_normalization(MeshBase& mesh,
         if (area <= 1.0e-18)
         {
             ++invalid_bins;
+            invalid_bin_records.push_back(
+                { bin,
+                  normalization.s_mid / std::max(ref_arc_length, 1.0e-12),
+                  area, 0.0, "empty (area=0)" });
             continue;
         }
 
@@ -2741,6 +2918,10 @@ initialize_active_section_normalization(MeshBase& mesh,
         if (std::abs(centered_g_eta) <= 1.0e-18)
         {
             ++invalid_bins;
+            invalid_bin_records.push_back(
+                { bin,
+                  normalization.s_mid / std::max(ref_arc_length, 1.0e-12),
+                  area, centered_g_eta, "degenerate (centered_g_eta=0)" });
             continue;
         }
 
@@ -2760,6 +2941,10 @@ initialize_active_section_normalization(MeshBase& mesh,
         if (!normalization.valid)
         {
             ++invalid_bins;
+            invalid_bin_records.push_back(
+                { bin,
+                  normalization.s_mid / std::max(ref_arc_length, 1.0e-12),
+                  area, centered_g_eta, "non-finite q_scale" });
             continue;
         }
         max_unit_force =
@@ -2771,9 +2956,19 @@ initialize_active_section_normalization(MeshBase& mesh,
 
     if (invalid_bins > 0)
     {
-        TBOX_WARNING("Active section FE normalization has " << invalid_bins
-                     << " invalid/empty bins; those bins use the analytic "
-                        "-eta/I2 fallback.\n");
+        std::ostringstream oss;
+        oss << "Active section FE normalization has " << invalid_bins
+            << " invalid/empty bins; those bins use the analytic -eta/I2 fallback.\n"
+            << "  Invalid bin details (bin, s_norm, area, centered_g_eta, reason):\n";
+        for (const InvalidBinRecord& rec : invalid_bin_records)
+        {
+            oss << "    bin=" << rec.bin
+                << "  s_norm=" << rec.s_norm
+                << "  area=" << rec.area
+                << "  centered_g_eta=" << rec.centered_g_eta
+                << "  [" << rec.reason << "]\n";
+        }
+        TBOX_WARNING(oss.str());
     }
     pout << "  active section FE normalization: bins=" << n_bins
          << ", invalid=" << invalid_bins
@@ -2837,6 +3032,50 @@ compute_fiber_PK1_stress_impl(TensorValue<double>& PP,
 }
 
 static void
+compute_structural_damping_PK1_stress_impl(
+    TensorValue<double>& PP,
+    const TensorValue<double>& FF,
+    const libMesh::Point& X_ref,
+    const ReferenceGeometrySample& ref_geom,
+    const TensorValue<double>& F_dot)
+{
+    PP = 0.0;
+    if (structural_kv_loss_factor <= 0.0) return;
+    check_deformation_jacobian(
+        FF, X_ref, "compute_structural_damping_PK1_stress_impl()");
+
+    const double J = FF.det();
+    const TensorValue<double> F_inv_trans =
+        tensor_inverse_transpose(FF, NDIM);
+    const TensorValue<double> F_inv = F_inv_trans.transpose();
+    const TensorValue<double> L = F_dot * F_inv;
+    const TensorValue<double> D = 0.5 * (L + L.transpose());
+
+    const VectorValue<double> a = FF * ref_geom.t_hat;
+    const double a_norm = std::sqrt(std::max(a * a, 0.0));
+    if (a_norm <= 1.0e-14) return;
+    const VectorValue<double> a_hat = a / a_norm;
+
+    const double axial_strain_rate = a_hat * (D * a_hat);
+    const MaterialProperties props = material_properties_from_s(ref_geom.s);
+    const double omega_ref = std::max(std::abs(wave_omega), 1.0e-12);
+    // eta_s = loss_factor*E/omega gives D_bend =
+    // loss_factor*B/omega in the small-strain beam limit.
+    const double eta_s =
+        structural_kv_loss_factor * props.E / omega_ref;
+    const double T_raw = eta_s * axial_strain_rate;
+    const double T_cap = structural_kv_stress_cap_over_E > 0.0 ?
+        structural_kv_stress_cap_over_E * props.E :
+        std::numeric_limits<double>::infinity();
+    const double T_damping = std::isfinite(T_cap) ?
+        std::max(-T_cap, std::min(T_cap, T_raw)) : T_raw;
+
+    TensorValue<double> aa;
+    outer_product(aa, a_hat, a_hat);
+    PP = J * (T_damping * aa) * F_inv_trans;
+}
+
+static void
 compute_active_PK1_stress_impl(TensorValue<double>& PP,
                                const TensorValue<double>& FF,
                                const libMesh::Point& X_ref,
@@ -2858,7 +3097,7 @@ compute_active_PK1_stress_impl(TensorValue<double>& PP,
 
     const double q = active_section_q(ref_geom);
     const double cap_scale =
-        active_uniform_cap_scale(Ma, active_section_q_abs_max(ref_geom));
+        active_uniform_cap_scale(Ma, active_section_q_abs_max(ref_geom), s);
     const double T_active = cap_scale * Ma * q;
 
     const VectorValue<double> f0 = ref_geom.t_hat;
@@ -2897,6 +3136,41 @@ void PK1_fiber_stress_function(
     const ReferenceGeometrySample ref_geom =
         reference_geometry_from_system_data(system_var_data);
     compute_fiber_PK1_stress_impl(PP, FF, X_ref, ref_geom);
+}
+
+void PK1_structural_damping_stress_function(
+    TensorValue<double>& PP,
+    const TensorValue<double>& FF,
+    const libMesh::Point&,
+    const libMesh::Point& X_ref,
+    Elem* const,
+    const std::vector<const std::vector<double>*>& system_var_data,
+    const std::vector<const std::vector<VectorValue<double> >*>&
+        system_grad_var_data,
+    double,
+    void*)
+{
+    PP = 0.0;
+    if (structural_kv_loss_factor <= 0.0) return;
+    if (system_grad_var_data.size() < 2 ||
+        system_grad_var_data[1] == nullptr ||
+        system_grad_var_data[1]->size() < NDIM)
+    {
+        TBOX_ERROR("PK1_structural_damping_stress_function(): "
+                   "velocity-gradient data are unavailable.\n");
+    }
+
+    const ReferenceGeometrySample ref_geom =
+        reference_geometry_from_system_data(system_var_data);
+    const std::vector<VectorValue<double> >& grad_U =
+        *system_grad_var_data[1];
+    TensorValue<double> F_dot;
+    F_dot.zero();
+    for (unsigned int i = 0; i < NDIM; ++i)
+        for (unsigned int j = 0; j < NDIM; ++j)
+            F_dot(i, j) = grad_U[i](j);
+    compute_structural_damping_PK1_stress_impl(
+        PP, FF, X_ref, ref_geom, F_dot);
 }
 
 void PK1_active_stress_function(
@@ -3872,9 +4146,10 @@ enum ForceDecompComponent
 {
     FORCE_MATRIX = 0,
     FORCE_FIBER = 1,
-    FORCE_ACTIVE = 2,
-    FORCE_SUM = 3,
-    FORCE_N_COMPONENTS = 4
+    FORCE_DAMPING = 2,
+    FORCE_ACTIVE = 3,
+    FORCE_SUM = 4,
+    FORCE_N_COMPONENTS = 5
 };
 
 inline const char*
@@ -3884,6 +4159,7 @@ force_decomp_component_name(const int c)
     {
     case FORCE_MATRIX: return "matrix";
     case FORCE_FIBER:  return "fiber";
+    case FORCE_DAMPING: return "damping";
     case FORCE_ACTIVE: return "active";
     case FORCE_SUM:    return "sum";
     default:           return "unknown";
@@ -4059,15 +4335,20 @@ write_force_decomposition_diagnostics(const int            iteration_num,
             if (t_norm <= 1.0e-14) continue;
             ref_geom.t_hat = t_raw / t_norm;
 
-            TensorValue<double> PP_matrix(0.0), PP_fiber(0.0), PP_active(0.0);
+            TensorValue<double> PP_matrix(0.0), PP_fiber(0.0);
+            TensorValue<double> PP_damping(0.0), PP_active(0.0);
             compute_matrix_PK1_stress_impl(PP_matrix, FF, X_ref_qp, ref_geom);
             compute_fiber_PK1_stress_impl(PP_fiber, FF, X_ref_qp, ref_geom);
+            compute_structural_damping_PK1_stress_impl(
+                PP_damping, FF, X_ref_qp, ref_geom, F_dot);
             compute_active_PK1_stress_impl(PP_active, FF, X_ref_qp,
                                            ref_geom, loop_time);
 
             accumulate_stress_qp(FORCE_MATRIX, PP_matrix, F_dot, JxW[qp],
                                  n_nodes, qp, elem_loads);
             accumulate_stress_qp(FORCE_FIBER, PP_fiber, F_dot, JxW[qp],
+                                 n_nodes, qp, elem_loads);
+            accumulate_stress_qp(FORCE_DAMPING, PP_damping, F_dot, JxW[qp],
                                  n_nodes, qp, elem_loads);
             accumulate_stress_qp(FORCE_ACTIVE, PP_active, F_dot, JxW[qp],
                                  n_nodes, qp, elem_loads);
@@ -4223,6 +4504,7 @@ write_active_section_diagnostics(const int        iteration_num,
 
     const std::vector<double>& JxW = fe->get_JxW();
     const std::vector<std::vector<double> >& phi = fe->get_phi();
+    const std::vector<std::vector<RealGradient> >& dphi = fe->get_dphi();
     std::vector<std::vector<unsigned int> > dof_indices(REF_GEOM_N_VARS);
 
     for (auto el_it = mesh.active_local_elements_begin();
@@ -4238,14 +4520,17 @@ write_active_section_diagnostics(const int        iteration_num,
         for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
         {
             ReferenceGeometrySample ref_geom;
+            RealGradient grad_s;
+            grad_s.zero();
             for (unsigned int k = 0; k < n_nodes; ++k)
             {
-                ref_geom.s +=
-                    phi[k][qp] *
+                const double s_node =
                     (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_S][k]);
+                ref_geom.s += phi[k][qp] * s_node;
                 ref_geom.eta +=
                     phi[k][qp] *
                     (*ref_geom_ghost_vec)(dof_indices[REF_GEOM_ETA][k]);
+                grad_s.add_scaled(dphi[k][qp], s_node);
             }
             ref_geom.s =
                 std::max(0.0, std::min(ref_geom.s, ref_arc_length));
@@ -4254,10 +4539,13 @@ write_active_section_diagnostics(const int        iteration_num,
                 active_section_moment_command(ref_geom, loop_time);
             const double cap_scale =
                 active_uniform_cap_scale(moment,
-                                         active_section_q_abs_max(ref_geom));
+                                         active_section_q_abs_max(ref_geom),
+                                         ref_geom.s);
             const double applied_moment = cap_scale * moment;
             const double stress = applied_moment * active_section_q(ref_geom);
-            const double weight = JxW[qp];
+            const double grad_s_norm =
+                std::sqrt(std::max(grad_s * grad_s, 0.0));
+            const double weight = grad_s_norm * JxW[qp];
             const std::size_t offset =
                 static_cast<std::size_t>(bin * n_fields);
             values[offset + 0] += weight;
@@ -4705,6 +4993,8 @@ write_midline_history(const int            iteration_num,
     std::vector<double> kappa_ref_body =
         compute_reference_midline_curvature_at_s(s_values);
 
+    if (IBTK_MPI::getRank() != 0) return;
+
     const double ph = phase01(loop_time);
 
     std::ofstream f(s_midline_hist_filename,
@@ -4900,9 +5190,18 @@ int main(int argc, char* argv[])
         fiber_stiffness_ratio =
             input_db->getDoubleWithDefault("FIBER_STIFFNESS_RATIO",
                                            fiber_stiffness_ratio);
+        structural_kv_loss_factor =
+            input_db->getDoubleWithDefault("STRUCTURAL_KV_LOSS_FACTOR",
+                                           structural_kv_loss_factor);
+        structural_kv_stress_cap_over_E =
+            input_db->getDoubleWithDefault("STRUCTURAL_KV_STRESS_CAP_OVER_E",
+                                           structural_kv_stress_cap_over_E);
         active_t_max_abs =
             input_db->getDoubleWithDefault("ACTIVE_T_MAX_ABS",
                                            active_t_max_abs);
+        active_t_max_over_E =
+            input_db->getDoubleWithDefault("ACTIVE_T_MAX_OVER_E",
+                                           active_t_max_over_E);
         active_cross_section_mode =
             parse_active_cross_section_mode(input_db->getStringWithDefault(
                 "ACTIVE_CROSS_SECTION_MODE",
@@ -4916,6 +5215,15 @@ int main(int argc, char* argv[])
         active_section_quad_order =
             input_db->getStringWithDefault("ACTIVE_SECTION_QUAD_ORDER",
                                            active_section_quad_order);
+        s_material_profile_diag_enable =
+            input_db->getBoolWithDefault("MATERIAL_PROFILE_DIAG_ENABLE",
+                                         s_material_profile_diag_enable);
+        s_material_profile_diag_filename =
+            input_db->getStringWithDefault("MATERIAL_PROFILE_DIAG_FILENAME",
+                                           s_material_profile_diag_filename);
+        s_material_profile_diag_samples =
+            input_db->getIntegerWithDefault("MATERIAL_PROFILE_DIAG_SAMPLES",
+                                            s_material_profile_diag_samples);
 
         target_bending_B_body = std::max(0.0, target_bending_B_body);
         target_bending_B_peduncle = std::max(0.0, target_bending_B_peduncle);
@@ -4930,10 +5238,18 @@ int main(int argc, char* argv[])
             std::max(0.0, std::min(material_nu_eff, 0.499));
         section_i2_floor_ratio = std::max(0.0, section_i2_floor_ratio);
         fiber_stiffness_ratio = std::max(0.0, fiber_stiffness_ratio);
+        structural_kv_loss_factor =
+            std::max(0.0, structural_kv_loss_factor);
+        structural_kv_stress_cap_over_E =
+            std::max(0.0, structural_kv_stress_cap_over_E);
         active_t_max_abs = std::max(0.0, active_t_max_abs);
+        // Negative active_t_max_over_E disables the E-relative cap; do not clamp
+        // to zero so the user's sentinel value (-1 = disabled) appears in the log.
         active_band_fraction =
             std::max(1.0e-6, std::min(active_band_fraction, 1.0));
         active_section_bins = std::max(1, active_section_bins);
+        s_material_profile_diag_samples =
+            std::max(2, s_material_profile_diag_samples);
 
         // ── Read geometry / actuation parameters ──────────────────────────
         fish_length  = input_db->getDoubleWithDefault("FISH_LENGTH", fish_length);
@@ -4986,7 +5302,7 @@ int main(int argc, char* argv[])
             input_db->getDoubleWithDefault("LAPLACE_TAIL_BC_WIDTH_OVER_L",
                                            laplace_tail_bc_width_over_L);
         active_s_start = clamp01(active_s_start);
-        active_s_end = clamp01(active_s_end);
+        if (active_s_end >= 0.0) active_s_end = clamp01(active_s_end);
         active_s_smooth = std::max(0.0, active_s_smooth);
         active_wavelength_over_L = std::max(active_wavelength_over_L, 1.0e-12);
         reference_profile_bins = std::max(8, reference_profile_bins);
@@ -5008,16 +5324,17 @@ int main(int argc, char* argv[])
         s_midline_hist_interval = std::max(1, s_midline_hist_interval);
         s_midline_hist_stations = std::max(3, s_midline_hist_stations);
 
-        if (active_s_end <= active_s_start)
+        if (active_s_end >= 0.0 && active_s_end <= active_s_start)
         {
             TBOX_ERROR("ACTIVE_S_END must be greater than ACTIVE_S_START.\n");
         }
 
         build_reference_profile_from_mesh(mesh);
+        write_material_profile_diagnostics();
         if (active_s_span_norm_effective() <= 1.0e-12)
         {
             TBOX_ERROR("Effective active-body span is zero: check ACTIVE_S_START "
-                       "and ACTIVE_S_END.\n");
+                       "and ACTIVE_S_END/REFERENCE_CENTERLINE_END_X.\n");
         }
         initialize_reference_com_from_mesh(mesh);
 
@@ -5084,16 +5401,31 @@ int main(int argc, char* argv[])
         pout << "  lambda_act = " << lambda_phase
              << ", U_act = " << U_act
              << ", Re_act = " << Re_act << "\n";
-        pout << "  PK1 material = matrix + tension-only fiber + active\n";
+        pout << "  PK1 material = 2D matrix + optional tension-only fiber"
+                " + Kelvin-Voigt damping + active\n";
         pout << "  target B body/peduncle/caudal = "
              << target_bending_B_body << " / "
              << target_bending_B_peduncle << " / "
              << target_bending_B_caudal << "\n";
-        pout << "  matrix calibration: E=B/I, I=2*h^3/3, nu_eff="
+        pout << "  matrix calibration: E=B/I, I=2*h^3/3, 2D K=E/[2(1-nu)], nu_eff="
              << material_nu_eff
              << ", section I2 floor ratio=" << section_i2_floor_ratio << "\n";
         pout << "  fiber stiffness ratio kf/E = " << fiber_stiffness_ratio
-             << ", active stress cap = " << active_t_max_abs << "\n";
+             << ", structural KV loss factor = "
+             << structural_kv_loss_factor
+             << ", damping stress cap/E = "
+             << structural_kv_stress_cap_over_E
+             << ", active stress absolute cap = " << active_t_max_abs
+             << ", active stress cap/E = "
+             << (active_t_max_over_E > 0.0 ?
+                 std::to_string(active_t_max_over_E) : "disabled")
+             << "\n";
+        if (fiber_stiffness_ratio > 0.0)
+        {
+            pout << "  WARNING: passive tension-only fiber is enabled; "
+                    "effective bending rigidity exceeds target B(s) and must "
+                    "be calibrated independently.\n";
+        }
         pout << "  active cross-section mode = "
              << active_cross_section_mode_name()
              << ", muscle band fraction = " << active_band_fraction
@@ -5108,8 +5440,12 @@ int main(int argc, char* argv[])
              << ", K_shape = " << active_k_shape_formula_string()
              << "\n";
         pout << "  active moment = beta_act*w(s)^2*K_shape(xi)*cos(active phase)\n";
-        pout << "  active zone s/L = [" << active_s_start << ", "
-             << active_s_end << "], taper = " << active_s_smooth << "\n";
+        pout << "  active zone request s/L = [" << active_s_start << ", ";
+        if (active_s_end < 0.0)
+            pout << "AUTO_REFERENCE_CENTERLINE_END";
+        else
+            pout << active_s_end;
+        pout << "], taper = " << active_s_smooth << "\n";
         pout << "  reference profile bins = " << reference_profile_bins << "\n";
         pout << "  reference parameterization = "
              << (use_laplace_reference_parameterization ?
@@ -5178,11 +5514,22 @@ int main(int argc, char* argv[])
              << ", interval = " << s_active_section_diag_interval
              << ", quad_order = " << active_section_quad_order
              << ", file = " << s_active_section_diag_filename << "\n";
+        pout << "  material profile diagnostics = "
+             << (s_material_profile_diag_enable ? "on" : "off")
+             << ", samples = " << s_material_profile_diag_samples
+             << ", file = " << s_material_profile_diag_filename << "\n";
 
         pout << "  effective active-zone length = "
-             << active_s_span * ref_arc_length
-             << " (requested unclipped length = "
-             << (active_s_end - active_s_start) * ref_arc_length << ")\n";
+             << active_s_span * ref_arc_length;
+        if (active_s_end < 0.0)
+        {
+            pout << " (auto endpoint from REFERENCE_CENTERLINE_END_X)\n";
+        }
+        else
+        {
+            pout << " (requested unclipped length = "
+                 << (active_s_end - active_s_start) * ref_arc_length << ")\n";
+        }
 
         if (std::abs(ref_body_length - fish_length) > 1.0e-6)
         {
@@ -5260,6 +5607,16 @@ int main(int argc, char* argv[])
             PK1_matrix_stress_function, ref_geom_sys_data);
         IBFEMethod::PK1StressFcnData PK1_fiber_data(
             PK1_fiber_stress_function, ref_geom_sys_data);
+        std::vector<int> velocity_vars(NDIM);
+        for (unsigned int d = 0; d < NDIM; ++d) velocity_vars[d] = d;
+        std::vector<SystemData> ref_geom_velocity_grad_sys_data =
+            ref_geom_sys_data;
+        ref_geom_velocity_grad_sys_data.push_back(
+            SystemData(ib_method_ops->getVelocitySystemName(),
+                       std::vector<int>(), velocity_vars));
+        IBFEMethod::PK1StressFcnData PK1_damping_data(
+            PK1_structural_damping_stress_function,
+            ref_geom_velocity_grad_sys_data);
         IBFEMethod::PK1StressFcnData PK1_active_data(
             PK1_active_stress_function, ref_geom_sys_data);
 
@@ -5269,12 +5626,16 @@ int main(int argc, char* argv[])
         PK1_fiber_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(
                 input_db->getStringWithDefault("PK1_FIBER_QUAD_ORDER", "FIFTH"));
+        PK1_damping_data.quad_order =
+            Utility::string_to_enum<libMesh::Order>(
+                input_db->getStringWithDefault("PK1_DAMP_QUAD_ORDER", "FIFTH"));
         PK1_active_data.quad_order =
             Utility::string_to_enum<libMesh::Order>(
                 input_db->getStringWithDefault("PK1_ACTIVE_QUAD_ORDER", "FIFTH"));
 
         ib_method_ops->registerPK1StressFunction(PK1_matrix_data);
         ib_method_ops->registerPK1StressFunction(PK1_fiber_data);
+        ib_method_ops->registerPK1StressFunction(PK1_damping_data);
         ib_method_ops->registerPK1StressFunction(PK1_active_data);
         ib_method_ops->registerInitialCoordinateMappingFunction(
             coordinate_mapping_function);
@@ -5282,6 +5643,8 @@ int main(int argc, char* argv[])
         ib_method_ops->initializeFEEquationSystems();
         EquationSystems* equation_systems =
             ib_method_ops->getFEDataManager()->getEquationSystems();
+        // IBAMR creates EquationSystems above; external systems must be added
+        // before initializeFEData(), which initializes all systems together.
         add_reference_geometry_system(equation_systems);
 
         // ── Post-processor ─────────────────────────────────────────────────
@@ -5295,6 +5658,9 @@ int main(int argc, char* argv[])
             PK1_matrix_stress_function, ref_geom_sys_data);
         IBFEMethod::PK1StressFcnData pk1_fiber_post_data(
             PK1_fiber_stress_function, ref_geom_sys_data);
+        IBFEMethod::PK1StressFcnData pk1_damping_post_data(
+            PK1_structural_damping_stress_function,
+            ref_geom_velocity_grad_sys_data);
         IBFEMethod::PK1StressFcnData pk1_active_post_data(
             PK1_active_stress_function, ref_geom_sys_data);
         ib_post_processor->registerTensorVariable(
@@ -5305,6 +5671,10 @@ int main(int argc, char* argv[])
             "sigma_fiber", MONOMIAL, CONSTANT,
             IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
             ref_geom_sys_data, &pk1_fiber_post_data);
+        ib_post_processor->registerTensorVariable(
+            "sigma_damping", MONOMIAL, CONSTANT,
+            IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
+            ref_geom_velocity_grad_sys_data, &pk1_damping_post_data);
         ib_post_processor->registerTensorVariable(
             "sigma_active", MONOMIAL, CONSTANT,
             IBFEPostProcessor::cauchy_stress_from_PK1_stress_fcn,
