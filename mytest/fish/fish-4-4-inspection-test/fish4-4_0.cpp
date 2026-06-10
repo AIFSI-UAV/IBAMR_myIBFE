@@ -101,15 +101,32 @@ static double wave_ramp_time = 3.0;
 static double wave_omega     = 2.0 * M_PI * 1.00;
 static double wave_time_sign = 1.0;
 
-static double beta_act  = 0.0;
+static double beta_act  = 0.0;          // legacy active amplitude / sweep alias
+static double active_kappa_amp = 0.0;   // target active curvature amplitude
 enum class ActiveMomentMode { TRAVELING, STATIC };
 static ActiveMomentMode active_moment_mode = ActiveMomentMode::STATIC;
+enum class ActiveMomentScalingMode { H2_LEGACY, B_KAPPA_TARGET };
+static ActiveMomentScalingMode active_moment_scaling_mode =
+    ActiveMomentScalingMode::B_KAPPA_TARGET;
 static double static_moment_m0 = 0.0;
 static double initial_bend_amplitude = 0.01;
 static double active_wavelength_over_L = 1.00;
 static double active_phase0 = 0.0;
 enum class ActiveKShapeMode { HALF_BELL, BELL };
 static ActiveKShapeMode active_k_shape_mode = ActiveKShapeMode::BELL;
+enum class ActiveEnvelopeMode
+{
+    K_SHAPE,
+    POSTERIOR_RAMP,
+    POSTERIOR_B_COMPENSATED
+};
+static ActiveEnvelopeMode active_envelope_mode =
+    ActiveEnvelopeMode::K_SHAPE;
+static double posterior_g0 = 0.25;
+static double posterior_power = 1.5;
+static double b_compensation_alpha = 0.5;
+static double tail_taper_width = 0.04;
+static double active_envelope_cap_safe_over_E = 0.0;
 static double active_s_start  = 0.00;
 static double active_s_end    = 1.00;
 static double active_s_smooth = 0.0;
@@ -2348,6 +2365,43 @@ inline ActiveMomentMode parse_active_moment_mode(const std::string& mode_raw)
     return ActiveMomentMode::TRAVELING;
 }
 
+inline ActiveMomentScalingMode
+parse_active_moment_scaling_mode(const std::string& mode_raw)
+{
+    const std::string mode = normalize_mode_string(mode_raw);
+    if (mode == "B-KAPPA-TARGET" || mode == "B-KAPPA" ||
+        mode == "BKAPPATARGET" || mode == "BKAPPA")
+        return ActiveMomentScalingMode::B_KAPPA_TARGET;
+    if (mode == "H2-LEGACY" || mode == "H-2-LEGACY" ||
+        mode == "LEGACY" || mode == "W2-LEGACY" || mode == "WIDTH2-LEGACY")
+        return ActiveMomentScalingMode::H2_LEGACY;
+
+    TBOX_ERROR("Unknown ACTIVE_MOMENT_SCALING = \"" << mode_raw
+               << "\". Expected \"B_KAPPA_TARGET\" or \"H2_LEGACY\".\n");
+    return ActiveMomentScalingMode::B_KAPPA_TARGET;
+}
+
+inline ActiveEnvelopeMode
+parse_active_envelope_mode(const std::string& mode_raw)
+{
+    const std::string mode = normalize_mode_string(mode_raw);
+    if (mode == "K-SHAPE" || mode == "KSHAPE" || mode == "LEGACY")
+        return ActiveEnvelopeMode::K_SHAPE;
+    if (mode == "POSTERIOR-RAMP" || mode == "POSTERIORRAMP" ||
+        mode == "POSTERIOR")
+        return ActiveEnvelopeMode::POSTERIOR_RAMP;
+    if (mode == "POSTERIOR-B-COMPENSATED" ||
+        mode == "POSTERIORBCOMPENSATED" ||
+        mode == "B-COMPENSATED" ||
+        mode == "BCOMPENSATED")
+        return ActiveEnvelopeMode::POSTERIOR_B_COMPENSATED;
+
+    TBOX_ERROR("Unknown ACTIVE_ENVELOPE_MODE = \"" << mode_raw
+               << "\". Expected \"K_SHAPE\", \"POSTERIOR_RAMP\", or "
+                  "\"POSTERIOR_B_COMPENSATED\".\n");
+    return ActiveEnvelopeMode::K_SHAPE;
+}
+
 inline ActiveCrossSectionMode
 parse_active_cross_section_mode(const std::string& mode_raw)
 {
@@ -2382,6 +2436,32 @@ inline const char* active_moment_mode_name()
         return "STATIC";
     }
     return "TRAVELING";
+}
+
+inline const char* active_moment_scaling_mode_name()
+{
+    switch (active_moment_scaling_mode)
+    {
+    case ActiveMomentScalingMode::H2_LEGACY:
+        return "H2_LEGACY";
+    case ActiveMomentScalingMode::B_KAPPA_TARGET:
+        return "B_KAPPA_TARGET";
+    }
+    return "B_KAPPA_TARGET";
+}
+
+inline const char* active_envelope_mode_name()
+{
+    switch (active_envelope_mode)
+    {
+    case ActiveEnvelopeMode::K_SHAPE:
+        return "K_SHAPE";
+    case ActiveEnvelopeMode::POSTERIOR_RAMP:
+        return "POSTERIOR_RAMP";
+    case ActiveEnvelopeMode::POSTERIOR_B_COMPENSATED:
+        return "POSTERIOR_B_COMPENSATED";
+    }
+    return "K_SHAPE";
 }
 
 inline const char* active_k_shape_mode_name()
@@ -2423,36 +2503,151 @@ inline double muscle_moment_shape_from_xi(const double xi_in)
     return 0.5 * (1.0 - std::cos(M_PI * xi));
 }
 
-inline double muscle_moment_drive_from_s(const double s, const double time)
-{
-    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
-    const double xi = active_xi_from_s_norm(s_norm);
-    return muscle_moment_shape_from_xi(xi) *
-           std::cos(active_phase_angle_from_s(s, time));
-}
-
-inline double muscle_moment_drive_amplitude_from_s(const double s)
-{
-    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
-    const double xi = active_xi_from_s_norm(s_norm);
-    return muscle_moment_shape_from_xi(xi);
-}
-
 inline double longitudinal_active_envelope(double s_norm);
+inline double section_second_moment(const double halfthickness);
+inline double section_second_moment_floor();
+inline double active_section_q_abs_max_from_s(const double s);
+
+inline double posterior_ramp_shape_from_xi(const double xi_in)
+{
+    const double xi = clamp01(xi_in);
+    const double g0 = clamp01(posterior_g0);
+    const double p = std::max(posterior_power, 1.0e-12);
+    return g0 + (1.0 - g0) * std::pow(xi, p);
+}
+
+inline double active_traveling_scale_amplitude()
+{
+    return active_moment_scaling_mode ==
+           ActiveMomentScalingMode::H2_LEGACY ?
+           beta_act : active_kappa_amp;
+}
+
+inline double active_on_taper_from_s_norm(const double s_norm)
+{
+    const double s0 = active_s_start_norm_effective();
+    const double s1 = active_s_end_norm_effective();
+    if (s_norm <= s0 || s_norm >= s1) return 0.0;
+    const double w = std::min(std::max(active_s_smooth, 0.0),
+                              std::max(s1 - s0, 0.0));
+    if (w <= 1.0e-12) return 1.0;
+    if (s_norm >= s0 + w) return 1.0;
+    return smoothstep((s_norm - s0) / w);
+}
+
+inline double active_tail_taper_from_s_norm(const double s_norm)
+{
+    const double s0 = active_s_start_norm_effective();
+    const double s1 = active_s_end_norm_effective();
+    if (s_norm <= s0 || s_norm >= s1) return 0.0;
+    const double w = std::min(std::max(tail_taper_width, 0.0),
+                              std::max(s1 - s0, 0.0));
+    if (w <= 1.0e-12) return 1.0;
+    if (s_norm <= s1 - w) return 1.0;
+    return smoothstep((s1 - s_norm) / w);
+}
+
+inline double active_curvature_envelope_raw_from_s_norm(const double s_norm_in)
+{
+    const double s_norm = clamp01(s_norm_in);
+    const double s0 = active_s_start_norm_effective();
+    const double s1 = active_s_end_norm_effective();
+    if (s1 <= s0 + 1.0e-12) return 0.0;
+    if (s_norm <= s0 || s_norm >= s1) return 0.0;
+
+    const double xi = active_xi_from_s_norm(s_norm);
+    if (active_envelope_mode == ActiveEnvelopeMode::POSTERIOR_RAMP ||
+        active_envelope_mode ==
+            ActiveEnvelopeMode::POSTERIOR_B_COMPENSATED)
+    {
+        const double G_posterior =
+            active_on_taper_from_s_norm(s_norm) *
+            posterior_ramp_shape_from_xi(xi) *
+            active_tail_taper_from_s_norm(s_norm);
+        if (active_envelope_mode ==
+            ActiveEnvelopeMode::POSTERIOR_B_COMPENSATED)
+        {
+            const double B_local =
+                std::max(get_target_bending_B_local(s_norm), 1.0e-16);
+            const double B_ref =
+                std::max(target_bending_B_caudal, 1.0e-16);
+            return G_posterior *
+                   std::pow(B_ref / B_local, b_compensation_alpha);
+        }
+        return G_posterior;
+    }
+
+    return longitudinal_active_envelope(s_norm) *
+           muscle_moment_shape_from_xi(xi);
+}
+
+inline double active_curvature_envelope_cap_from_s_norm(const double s_norm)
+{
+    if (active_moment_scaling_mode !=
+        ActiveMomentScalingMode::B_KAPPA_TARGET)
+        return std::numeric_limits<double>::infinity();
+    if (active_envelope_cap_safe_over_E <= 0.0 ||
+        active_kappa_amp <= 0.0)
+        return std::numeric_limits<double>::infinity();
+
+    const double s = clamp01(s_norm) * std::max(ref_arc_length, 1.0e-12);
+    const double h = body_halfthick_from_s(s);
+    const double I2_used =
+        std::max(section_second_moment(h), section_second_moment_floor());
+    const double chi = I2_used * active_section_q_abs_max_from_s(s);
+    if (chi <= 1.0e-30 || !std::isfinite(chi))
+        return std::numeric_limits<double>::infinity();
+
+    const double G_cap =
+        active_envelope_cap_safe_over_E / (chi * active_kappa_amp);
+    if (!std::isfinite(G_cap))
+        return std::numeric_limits<double>::infinity();
+    return std::max(0.0, G_cap);
+}
+
+inline double active_curvature_envelope_eff_from_s_norm(const double s_norm)
+{
+    const double raw = active_curvature_envelope_raw_from_s_norm(s_norm);
+    if (raw <= 0.0) return 0.0;
+    const double G_cap = active_curvature_envelope_cap_from_s_norm(s_norm);
+    if (!std::isfinite(G_cap)) return raw;
+    return std::min(raw, std::max(0.0, G_cap));
+}
 
 inline double active_moment_envelope_from_s_norm(const double s_norm)
 {
-    return longitudinal_active_envelope(s_norm);
+    return active_curvature_envelope_eff_from_s_norm(s_norm);
 }
 
 inline double active_moment_prefactor_from_sample(const double s_norm,
                                                   const double h,
                                                   const double time)
 {
-    const double env_s = active_moment_envelope_from_s_norm(s_norm);
-    if (env_s <= 0.0) return 0.0;
-    const double w_local = std::max(h, 0.0);
-    return wave_ramp(time) * env_s * beta_act * w_local * w_local;
+    const double ramp = wave_ramp(time);
+    if (ramp <= 0.0) return 0.0;
+
+    if (active_moment_scaling_mode ==
+        ActiveMomentScalingMode::H2_LEGACY)
+    {
+        const double h_local = std::max(h, 0.0);
+        return ramp * beta_act * h_local * h_local;
+    }
+
+    const double B_local = get_target_bending_B_local(s_norm);
+    return ramp * B_local * active_kappa_amp;
+}
+
+inline double muscle_moment_drive_from_s(const double s, const double time)
+{
+    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
+    return active_moment_envelope_from_s_norm(s_norm) *
+           std::cos(active_phase_angle_from_s(s, time));
+}
+
+inline double muscle_moment_drive_amplitude_from_s(const double s)
+{
+    const double s_norm = clamp01(s / std::max(ref_arc_length, 1.0e-12));
+    return active_moment_envelope_from_s_norm(s_norm);
 }
 
 inline double active_moment_value_from_sample(const double s,
@@ -2659,9 +2854,9 @@ inline double active_section_q(const ReferenceGeometrySample& ref_geom)
     return -ref_geom.eta / I2_use;
 }
 
-inline double active_section_q_abs_max(const ReferenceGeometrySample& ref_geom)
+inline double active_section_q_abs_max_from_s(const double s_in)
 {
-    const double s = std::max(0.0, std::min(ref_geom.s, ref_arc_length));
+    const double s = std::max(0.0, std::min(s_in, ref_arc_length));
     ActiveSectionNormalization normalization;
     if (interpolate_active_section_normalization(s, normalization))
         return normalization.q_abs_max;
@@ -2670,6 +2865,11 @@ inline double active_section_q_abs_max(const ReferenceGeometrySample& ref_geom)
     const double I2_use =
         std::max(section_second_moment(h), section_second_moment_floor());
     return h / I2_use;
+}
+
+inline double active_section_q_abs_max(const ReferenceGeometrySample& ref_geom)
+{
+    return active_section_q_abs_max_from_s(ref_geom.s);
 }
 
 inline double active_stress_cap_from_s(const double s)
@@ -3083,7 +3283,8 @@ compute_active_PK1_stress_impl(TensorValue<double>& PP,
                                const double time)
 {
     PP = 0.0;
-    if (active_moment_mode == ActiveMomentMode::TRAVELING && beta_act <= 0.0) return;
+    if (active_moment_mode == ActiveMomentMode::TRAVELING &&
+        active_traveling_scale_amplitude() <= 0.0) return;
     if (active_moment_mode == ActiveMomentMode::STATIC &&
         std::abs(static_moment_m0) <= 1.0e-30) return;
     check_deformation_jacobian(FF, X_ref, "compute_active_PK1_stress_impl()");
@@ -4483,7 +4684,25 @@ write_active_section_diagnostics(const int        iteration_num,
     if (!equation_systems || active_section_normalization.empty()) return;
 
     const int n_bins = static_cast<int>(active_section_normalization.size());
-    const int n_fields = 5;
+    enum ActiveSectionDiagField
+    {
+        ASD_AREA = 0,
+        ASD_N_ACTIVE,
+        ASD_M_ACTIVE,
+        ASD_G_RAW,
+        ASD_G_EFF,
+        ASD_G_CAP,
+        ASD_G_CAP_WEIGHT,
+        ASD_KAPPA_CMD,
+        ASD_M_COMMAND_RAW,
+        ASD_M_COMMAND,
+        ASD_M_APPLIED,
+        ASD_CAP_SCALE,
+        ASD_T_OVER_E_REQUESTED,
+        ASD_T_OVER_E_APPLIED,
+        ASD_N_FIELDS
+    };
+    const int n_fields = ASD_N_FIELDS;
     std::vector<double> values(static_cast<std::size_t>(n_bins * n_fields), 0.0);
 
     System& ref_geom_sys = equation_systems->get_system(REF_GEOM_SYSTEM_NAME);
@@ -4535,24 +4754,88 @@ write_active_section_diagnostics(const int        iteration_num,
             ref_geom.s =
                 std::max(0.0, std::min(ref_geom.s, ref_arc_length));
             const int bin = active_section_bin_from_s(ref_geom.s);
+            const double s_norm =
+                clamp01(ref_geom.s / std::max(ref_arc_length, 1.0e-12));
+            const double h = body_halfthick_from_s(ref_geom.s);
+            const double B_local = get_target_bending_B_local(s_norm);
+            const double I2_used =
+                std::max(section_second_moment(h),
+                         section_second_moment_floor());
+            const double E_local =
+                B_local > 0.0 ? B_local / I2_used :
+                std::numeric_limits<double>::quiet_NaN();
+            const double G_raw =
+                active_curvature_envelope_raw_from_s_norm(s_norm);
+            const double G_eff =
+                active_curvature_envelope_eff_from_s_norm(s_norm);
+            const double G_cap =
+                active_curvature_envelope_cap_from_s_norm(s_norm);
+            const double phase_cos =
+                std::cos(active_phase_angle_from_s(ref_geom.s, loop_time));
+            const double ramp = wave_ramp(loop_time);
             const double moment =
                 active_section_moment_command(ref_geom, loop_time);
+            const double q_abs_max = active_section_q_abs_max(ref_geom);
             const double cap_scale =
-                active_uniform_cap_scale(moment,
-                                         active_section_q_abs_max(ref_geom),
-                                         ref_geom.s);
+                active_uniform_cap_scale(moment, q_abs_max, ref_geom.s);
             const double applied_moment = cap_scale * moment;
             const double stress = applied_moment * active_section_q(ref_geom);
+            double raw_moment = moment;
+            double kappa_cmd = std::numeric_limits<double>::quiet_NaN();
+            if (active_moment_mode == ActiveMomentMode::TRAVELING)
+            {
+                if (active_moment_scaling_mode ==
+                    ActiveMomentScalingMode::H2_LEGACY)
+                {
+                    raw_moment =
+                        ramp * beta_act * h * h * G_raw * phase_cos;
+                    kappa_cmd = B_local > 1.0e-30 ?
+                        moment / B_local :
+                        std::numeric_limits<double>::quiet_NaN();
+                }
+                else
+                {
+                    raw_moment =
+                        ramp * B_local * active_kappa_amp * G_raw * phase_cos;
+                    kappa_cmd = active_kappa_amp * G_eff * phase_cos;
+                }
+            }
+            else if (B_local > 1.0e-30)
+            {
+                kappa_cmd = moment / B_local;
+            }
+            const double T_over_E_requested =
+                (E_local > 1.0e-30 && std::isfinite(E_local)) ?
+                std::abs(moment) * q_abs_max / E_local :
+                std::numeric_limits<double>::quiet_NaN();
+            const double T_over_E_applied =
+                (E_local > 1.0e-30 && std::isfinite(E_local)) ?
+                std::abs(applied_moment) * q_abs_max / E_local :
+                std::numeric_limits<double>::quiet_NaN();
             const double grad_s_norm =
                 std::sqrt(std::max(grad_s * grad_s, 0.0));
             const double weight = grad_s_norm * JxW[qp];
             const std::size_t offset =
                 static_cast<std::size_t>(bin * n_fields);
-            values[offset + 0] += weight;
-            values[offset + 1] += stress * weight;
-            values[offset + 2] += -stress * ref_geom.eta * weight;
-            values[offset + 3] += moment * weight;
-            values[offset + 4] += applied_moment * weight;
+            values[offset + ASD_AREA] += weight;
+            values[offset + ASD_N_ACTIVE] += stress * weight;
+            values[offset + ASD_M_ACTIVE] += -stress * ref_geom.eta * weight;
+            values[offset + ASD_G_RAW] += G_raw * weight;
+            values[offset + ASD_G_EFF] += G_eff * weight;
+            if (std::isfinite(G_cap))
+            {
+                values[offset + ASD_G_CAP] += G_cap * weight;
+                values[offset + ASD_G_CAP_WEIGHT] += weight;
+            }
+            values[offset + ASD_KAPPA_CMD] += kappa_cmd * weight;
+            values[offset + ASD_M_COMMAND_RAW] += raw_moment * weight;
+            values[offset + ASD_M_COMMAND] += moment * weight;
+            values[offset + ASD_M_APPLIED] += applied_moment * weight;
+            values[offset + ASD_CAP_SCALE] += cap_scale * weight;
+            values[offset + ASD_T_OVER_E_REQUESTED] +=
+                T_over_E_requested * weight;
+            values[offset + ASD_T_OVER_E_APPLIED] +=
+                T_over_E_applied * weight;
         }
     }
 
@@ -4571,8 +4854,10 @@ write_active_section_diagnostics(const int        iteration_num,
         }
         out << "step,time,bin,s_norm,valid,A_section,eta_bar,I2_section"
             << ",g_bar,q_scale,q_abs_max,unit_force,unit_moment"
-            << ",N_active,M_active,M_command,M_applied_target"
-            << ",M_ratio,N_relative\n";
+            << ",G_raw,G_eff,G_cap,kappa_cmd"
+            << ",M_command_raw,M_command,M_applied_target,cap_scale"
+            << ",N_active,M_active,M_ratio_cmd,M_ratio_applied,N_relative"
+            << ",T_over_E_requested,T_over_E_applied\n";
     }
 
     out.setf(std::ios::scientific);
@@ -4582,15 +4867,36 @@ write_active_section_diagnostics(const int        iteration_num,
         const ActiveSectionNormalization& normalization =
             active_section_normalization[static_cast<std::size_t>(bin)];
         const std::size_t offset = static_cast<std::size_t>(bin * n_fields);
-        const double area_volume = values[offset + 0];
+        const double area_volume = values[offset + ASD_AREA];
         const double ds = std::max(normalization.ds, 1.0e-30);
-        const double N_active = values[offset + 1] / ds;
-        const double M_active = values[offset + 2] / ds;
+        const double N_active = values[offset + ASD_N_ACTIVE] / ds;
+        const double M_active = values[offset + ASD_M_ACTIVE] / ds;
+        const double G_raw = area_volume > 1.0e-30 ?
+            values[offset + ASD_G_RAW] / area_volume :
+            std::numeric_limits<double>::quiet_NaN();
+        const double G_eff = area_volume > 1.0e-30 ?
+            values[offset + ASD_G_EFF] / area_volume :
+            std::numeric_limits<double>::quiet_NaN();
+        const double G_cap =
+            values[offset + ASD_G_CAP_WEIGHT] > 1.0e-30 ?
+            values[offset + ASD_G_CAP] / values[offset + ASD_G_CAP_WEIGHT] :
+            std::numeric_limits<double>::quiet_NaN();
+        const double kappa_cmd = area_volume > 1.0e-30 ?
+            values[offset + ASD_KAPPA_CMD] / area_volume :
+            std::numeric_limits<double>::quiet_NaN();
+        const double M_command_raw = area_volume > 1.0e-30 ?
+            values[offset + ASD_M_COMMAND_RAW] / area_volume : 0.0;
         const double M_command = area_volume > 1.0e-30 ?
-            values[offset + 3] / area_volume : 0.0;
+            values[offset + ASD_M_COMMAND] / area_volume : 0.0;
         const double M_applied = area_volume > 1.0e-30 ?
-            values[offset + 4] / area_volume : 0.0;
-        const double M_ratio = std::abs(M_applied) > 1.0e-30 ?
+            values[offset + ASD_M_APPLIED] / area_volume : 0.0;
+        const double cap_scale = area_volume > 1.0e-30 ?
+            values[offset + ASD_CAP_SCALE] / area_volume :
+            std::numeric_limits<double>::quiet_NaN();
+        const double M_ratio_cmd = std::abs(M_command) > 1.0e-30 ?
+            M_active / M_command :
+            std::numeric_limits<double>::quiet_NaN();
+        const double M_ratio_applied = std::abs(M_applied) > 1.0e-30 ?
             M_active / M_applied :
             std::numeric_limits<double>::quiet_NaN();
         const double h = body_halfthick_from_s(normalization.s_mid);
@@ -4598,6 +4904,12 @@ write_active_section_diagnostics(const int        iteration_num,
             std::abs(M_applied) / std::max(h, 1.0e-30);
         const double N_relative = force_scale > 1.0e-30 ?
             std::abs(N_active) / force_scale :
+            std::numeric_limits<double>::quiet_NaN();
+        const double T_over_E_requested = area_volume > 1.0e-30 ?
+            values[offset + ASD_T_OVER_E_REQUESTED] / area_volume :
+            std::numeric_limits<double>::quiet_NaN();
+        const double T_over_E_applied = area_volume > 1.0e-30 ?
+            values[offset + ASD_T_OVER_E_APPLIED] / area_volume :
             std::numeric_limits<double>::quiet_NaN();
 
         out << iteration_num
@@ -4614,12 +4926,21 @@ write_active_section_diagnostics(const int        iteration_num,
             << "," << normalization.q_abs_max
             << "," << normalization.unit_force
             << "," << normalization.unit_moment
-            << "," << N_active
-            << "," << M_active
+            << "," << G_raw
+            << "," << G_eff
+            << "," << G_cap
+            << "," << kappa_cmd
+            << "," << M_command_raw
             << "," << M_command
             << "," << M_applied
-            << "," << M_ratio
+            << "," << cap_scale
+            << "," << N_active
+            << "," << M_active
+            << "," << M_ratio_cmd
+            << "," << M_ratio_applied
             << "," << N_relative
+            << "," << T_over_E_requested
+            << "," << T_over_E_applied
             << "\n";
     }
     out.flush();
@@ -5269,9 +5590,15 @@ int main(int argc, char* argv[])
         }
 
         beta_act   = input_db->getDoubleWithDefault("BETA_ACT",   beta_act);
+        active_kappa_amp =
+            input_db->getDoubleWithDefault("ACTIVE_KAPPA_AMP", beta_act);
         active_moment_mode =
             parse_active_moment_mode(input_db->getStringWithDefault(
                 "ACTIVE_MOMENT_MODE", active_moment_mode_name()));
+        active_moment_scaling_mode =
+            parse_active_moment_scaling_mode(input_db->getStringWithDefault(
+                "ACTIVE_MOMENT_SCALING",
+                active_moment_scaling_mode_name()));
         static_moment_m0 =
             input_db->getDoubleWithDefault("STATIC_MOMENT_M0", static_moment_m0);
         initial_bend_amplitude =
@@ -5285,6 +5612,22 @@ int main(int argc, char* argv[])
         active_k_shape_mode =
             parse_active_k_shape_mode(input_db->getStringWithDefault(
                 "K_SHAPE_MODE", active_k_shape_mode_name()));
+        active_envelope_mode =
+            parse_active_envelope_mode(input_db->getStringWithDefault(
+                "ACTIVE_ENVELOPE_MODE", active_envelope_mode_name()));
+        posterior_g0 =
+            input_db->getDoubleWithDefault("POSTERIOR_G0", posterior_g0);
+        posterior_power =
+            input_db->getDoubleWithDefault("POSTERIOR_POWER", posterior_power);
+        b_compensation_alpha =
+            input_db->getDoubleWithDefault("B_COMPENSATION_ALPHA",
+                                           b_compensation_alpha);
+        tail_taper_width =
+            input_db->getDoubleWithDefault("TAIL_TAPER_WIDTH",
+                                           tail_taper_width);
+        active_envelope_cap_safe_over_E =
+            input_db->getDoubleWithDefault("ACTIVE_ENVELOPE_CAP_SAFE_OVER_E",
+                                           active_envelope_cap_safe_over_E);
         active_s_start  = input_db->getDoubleWithDefault("ACTIVE_S_START",  active_s_start);
         active_s_end    = input_db->getDoubleWithDefault("ACTIVE_S_END",    active_s_end);
         active_s_smooth = input_db->getDoubleWithDefault("ACTIVE_S_SMOOTH", active_s_smooth);
@@ -5305,6 +5648,41 @@ int main(int argc, char* argv[])
         if (active_s_end >= 0.0) active_s_end = clamp01(active_s_end);
         active_s_smooth = std::max(0.0, active_s_smooth);
         active_wavelength_over_L = std::max(active_wavelength_over_L, 1.0e-12);
+        if (beta_act < 0.0)
+        {
+            TBOX_ERROR("BETA_ACT must be non-negative. Use ACTIVE_PHASE0 or "
+                       "WAVE_TIME_SIGN to change active phase/sign.\n");
+        }
+        if (active_kappa_amp < 0.0)
+        {
+            TBOX_ERROR("ACTIVE_KAPPA_AMP must be non-negative. Use "
+                       "ACTIVE_PHASE0 or WAVE_TIME_SIGN to change active "
+                       "phase/sign.\n");
+        }
+        posterior_g0 = clamp01(posterior_g0);
+        posterior_power = std::max(posterior_power, 1.0e-12);
+        if (b_compensation_alpha < 0.0)
+        {
+            TBOX_ERROR("B_COMPENSATION_ALPHA must be non-negative.\n");
+        }
+        if (active_envelope_mode ==
+            ActiveEnvelopeMode::POSTERIOR_B_COMPENSATED)
+        {
+            if (active_moment_scaling_mode !=
+                ActiveMomentScalingMode::B_KAPPA_TARGET)
+            {
+                TBOX_ERROR("POSTERIOR_B_COMPENSATED requires "
+                           "ACTIVE_MOMENT_SCALING=\"B_KAPPA_TARGET\".\n");
+            }
+            if (target_bending_B_caudal <= 0.0)
+            {
+                TBOX_ERROR("POSTERIOR_B_COMPENSATED requires B_CAUDAL > 0 "
+                           "because B_CAUDAL is the compensation reference.\n");
+            }
+        }
+        tail_taper_width = std::max(0.0, tail_taper_width);
+        active_envelope_cap_safe_over_E =
+            std::max(0.0, active_envelope_cap_safe_over_E);
         reference_profile_bins = std::max(8, reference_profile_bins);
         laplace_head_bc_width_over_L = std::max(0.0, laplace_head_bc_width_over_L);
         laplace_tail_bc_width_over_L = std::max(0.0, laplace_tail_bc_width_over_L);
@@ -5433,13 +5811,41 @@ int main(int argc, char* argv[])
         pout << "  active mapping: FE-normalized zero-force/unit-moment q(eta), "
                 "PK1 stress only\n";
         pout << "  active moment mode = " << active_moment_mode_name()
-             << ", beta_act = " << beta_act
+             << ", scaling = " << active_moment_scaling_mode_name()
+             << ", ACTIVE_KAPPA_AMP = " << active_kappa_amp
+             << ", BETA_ACT legacy fallback = " << beta_act
              << ", static M0 = " << static_moment_m0
              << ", initial bend amplitude = " << initial_bend_amplitude << "\n";
-        pout << "  beta_act = " << beta_act
-             << ", K_shape = " << active_k_shape_formula_string()
+        pout << "  BETA_ACT is used only by H2_LEGACY or as the "
+                "ACTIVE_KAPPA_AMP default when ACTIVE_KAPPA_AMP is absent.\n";
+        pout << "  active envelope mode = " << active_envelope_mode_name()
+             << ", K_shape fallback = " << active_k_shape_formula_string()
+             << ", POSTERIOR_G0 = " << posterior_g0
+             << ", POSTERIOR_POWER = " << posterior_power
+             << ", B_COMPENSATION_ALPHA = " << b_compensation_alpha
+             << ", TAIL_TAPER_WIDTH = " << tail_taper_width
+             << ", envelope cap safe/E = "
+             << (active_envelope_cap_safe_over_E > 0.0 ?
+                 std::to_string(active_envelope_cap_safe_over_E) :
+                 "disabled")
              << "\n";
-        pout << "  active moment = beta_act*w(s)^2*K_shape(xi)*cos(active phase)\n";
+        if (active_envelope_mode ==
+            ActiveEnvelopeMode::POSTERIOR_B_COMPENSATED)
+        {
+            pout << "  B-compensated envelope factor = "
+                    "(B_CAUDAL/B(s))^B_COMPENSATION_ALPHA, B_ref = "
+                 << target_bending_B_caudal << "\n";
+        }
+        if (active_moment_scaling_mode ==
+            ActiveMomentScalingMode::B_KAPPA_TARGET)
+        {
+            pout << "  active target curvature = ACTIVE_KAPPA_AMP*G(s)*cos(active phase)\n";
+            pout << "  active moment = B(s)*active_target_curvature\n";
+        }
+        else
+        {
+            pout << "  active moment = BETA_ACT*h(s)^2*G(s)*cos(active phase) [legacy]\n";
+        }
         pout << "  active zone request s/L = [" << active_s_start << ", ";
         if (active_s_end < 0.0)
             pout << "AUTO_REFERENCE_CENTERLINE_END";
