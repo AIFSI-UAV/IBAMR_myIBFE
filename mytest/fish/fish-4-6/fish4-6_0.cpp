@@ -56,7 +56,8 @@ namespace ModelData
 enum class SwimmerStage
 {
     PENALTY_PRESCRIBED = 1,
-    ACTIVE_STRAIN = 2
+    ACTIVE_STRAIN = 2,
+    ACTIVE_STRAIN_TETHERED_TEST = 3
 };
 
 struct ReferenceGeometry
@@ -65,12 +66,31 @@ struct ReferenceGeometry
     VectorValue<double> normal;
     libMesh::Point head;
     double length = 0.0;
+    double eta_min = 0.0;
+    double eta_max = 0.0;
 };
 
 struct TargetState
 {
     libMesh::Point position;
     VectorValue<double> velocity;
+};
+
+struct ActiveStretchState
+{
+    double curvature = 0.0;
+    double raw = 1.0;
+    double value = 1.0;
+    bool clamped = false;
+};
+
+struct MaterialResponse
+{
+    TensorValue<double> total;
+    TensorValue<double> matrix;
+    TensorValue<double> fiber;
+    TensorValue<double> shear;
+    double J_elastic = 1.0;
 };
 
 struct SwimmerData
@@ -88,16 +108,30 @@ struct SwimmerData
     double prescribed_envelope_power;
     double penalty_stiffness;
     double penalty_damping;
+    bool penalty_zero_net_force;
+    bool penalty_zero_net_torque;
+    VectorValue<double> penalty_projection_translation;
+    double penalty_projection_rotation = 0.0;
+    libMesh::Point penalty_projection_center;
 
     double passive_mu;
     double passive_lambda;
     double passive_fiber_modulus;
     double passive_shear_modulus;
+    double stage1_passive_scale;
 
     double active_curvature_tail;
     double active_envelope_power;
     double active_stretch_min;
     double active_stretch_max;
+    bool allow_active_stretch_clamp;
+    double active_test_tether_fraction;
+    double active_test_tether_stiffness;
+    double active_test_tether_damping;
+
+    bool run_material_self_checks;
+    double material_self_check_tolerance;
+    double diagnostic_station_half_width;
 
     SwimmerData(Pointer<Database> input_db, const ReferenceGeometry& reference_geometry)
         : stage(static_cast<SwimmerStage>(input_db->getInteger("SWIMMER_STAGE"))),
@@ -113,20 +147,31 @@ struct SwimmerData
           prescribed_envelope_power(input_db->getDouble("PRESCRIBED_ENVELOPE_POWER")),
           penalty_stiffness(input_db->getDouble("PENALTY_STIFFNESS")),
           penalty_damping(input_db->getDouble("PENALTY_DAMPING")),
+          penalty_zero_net_force(input_db->getBool("PENALTY_ZERO_NET_FORCE")),
+          penalty_zero_net_torque(input_db->getBool("PENALTY_ZERO_NET_TORQUE")),
           passive_mu(input_db->getDouble("PASSIVE_MU")),
           passive_lambda(input_db->getDouble("PASSIVE_LAMBDA")),
           passive_fiber_modulus(input_db->getDouble("PASSIVE_FIBER_MODULUS")),
           passive_shear_modulus(input_db->getDouble("PASSIVE_SHEAR_MODULUS")),
+          stage1_passive_scale(input_db->getDouble("STAGE1_PASSIVE_SCALE")),
           active_curvature_tail(input_db->getDouble("ACTIVE_CURVATURE_TAIL_TIMES_L") /
                                 reference_geometry.length),
           active_envelope_power(input_db->getDouble("ACTIVE_ENVELOPE_POWER")),
           active_stretch_min(input_db->getDouble("ACTIVE_STRETCH_MIN")),
-          active_stretch_max(input_db->getDouble("ACTIVE_STRETCH_MAX"))
+          active_stretch_max(input_db->getDouble("ACTIVE_STRETCH_MAX")),
+          allow_active_stretch_clamp(input_db->getBool("ALLOW_ACTIVE_STRETCH_CLAMP")),
+          active_test_tether_fraction(input_db->getDouble("ACTIVE_TEST_TETHER_FRACTION")),
+          active_test_tether_stiffness(input_db->getDouble("ACTIVE_TEST_TETHER_STIFFNESS")),
+          active_test_tether_damping(input_db->getDouble("ACTIVE_TEST_TETHER_DAMPING")),
+          run_material_self_checks(input_db->getBool("RUN_MATERIAL_SELF_CHECKS")),
+          material_self_check_tolerance(input_db->getDouble("MATERIAL_SELF_CHECK_TOLERANCE")),
+          diagnostic_station_half_width(input_db->getDouble("DIAGNOSTIC_STATION_HALF_WIDTH"))
     {
         const int stage_number = static_cast<int>(stage);
-        if (stage_number != 1 && stage_number != 2)
+        if (stage_number < 1 || stage_number > 3)
         {
-            TBOX_ERROR("SWIMMER_STAGE must be 1 (penalty prescribed) or 2 (active strain).\n");
+            TBOX_ERROR("SWIMMER_STAGE must be 1 (penalty), 2 (active strain), or 3 "
+                       "(tethered active-strain test).\n");
         }
         if (geometry.length <= 0.0) TBOX_ERROR("The reference mesh has nonpositive body length.\n");
         if (frequency <= 0.0) TBOX_ERROR("WAVE_FREQUENCY must be positive.\n");
@@ -153,6 +198,10 @@ struct SwimmerData
         {
             TBOX_ERROR("Passive material coefficients are invalid.\n");
         }
+        if (stage1_passive_scale < 0.0)
+        {
+            TBOX_ERROR("STAGE1_PASSIVE_SCALE must be nonnegative.\n");
+        }
         if (active_envelope_power < 0.0)
         {
             TBOX_ERROR("ACTIVE_ENVELOPE_POWER must be nonnegative.\n");
@@ -161,7 +210,39 @@ struct SwimmerData
         {
             TBOX_ERROR("Require 0 < ACTIVE_STRETCH_MIN < 1 < ACTIVE_STRETCH_MAX.\n");
         }
+        if (!(0.0 < active_test_tether_fraction && active_test_tether_fraction <= 1.0))
+        {
+            TBOX_ERROR("ACTIVE_TEST_TETHER_FRACTION must be in (0,1].\n");
+        }
+        if (active_test_tether_stiffness < 0.0 || active_test_tether_damping < 0.0)
+        {
+            TBOX_ERROR("Active-test tether coefficients must be nonnegative.\n");
+        }
+        if (stage == SwimmerStage::ACTIVE_STRAIN_TETHERED_TEST &&
+            active_test_tether_stiffness <= 0.0)
+        {
+            TBOX_ERROR("Stage 3 requires ACTIVE_TEST_TETHER_STIFFNESS > 0.\n");
+        }
+        if (material_self_check_tolerance <= 0.0)
+        {
+            TBOX_ERROR("MATERIAL_SELF_CHECK_TOLERANCE must be positive.\n");
+        }
+        if (!(0.0 < diagnostic_station_half_width && diagnostic_station_half_width < 0.1))
+        {
+            TBOX_ERROR("DIAGNOSTIC_STATION_HALF_WIDTH must be in (0,0.1).\n");
+        }
+        penalty_projection_translation.zero();
+        penalty_projection_center = geometry.head + 0.5 * geometry.length * geometry.tangent;
     }
+};
+
+struct PenaltyProjectionContext
+{
+    Mesh* mesh = nullptr;
+    EquationSystems* equation_systems = nullptr;
+    std::string coords_system_name;
+    std::string velocity_system_name;
+    SwimmerData* swimmer_data = nullptr;
 };
 
 double
@@ -339,12 +420,23 @@ active_curvature(const libMesh::Point& X, const double time, const SwimmerData& 
            std::sin(phase);
 }
 
-double
-active_stretch(const libMesh::Point& X, const double time, const SwimmerData& data)
+bool
+uses_active_strain(const SwimmerData& data)
 {
-    if (data.stage != SwimmerStage::ACTIVE_STRAIN) return 1.0;
-    const double stretch = 1.0 - reference_eta(X, data) * active_curvature(X, time, data);
-    return std::clamp(stretch, data.active_stretch_min, data.active_stretch_max);
+    return data.stage == SwimmerStage::ACTIVE_STRAIN ||
+           data.stage == SwimmerStage::ACTIVE_STRAIN_TETHERED_TEST;
+}
+
+ActiveStretchState
+active_stretch_state(const libMesh::Point& X, const double time, const SwimmerData& data)
+{
+    ActiveStretchState state;
+    if (!uses_active_strain(data)) return state;
+    state.curvature = active_curvature(X, time, data);
+    state.raw = 1.0 - reference_eta(X, data) * state.curvature;
+    state.value = std::clamp(state.raw, data.active_stretch_min, data.active_stretch_max);
+    state.clamped = !IBTK::rel_equal_eps(state.raw, state.value);
+    return state;
 }
 
 TensorValue<double>
@@ -359,51 +451,93 @@ dyad(const VectorValue<double>& a, const VectorValue<double>& b)
     return result;
 }
 
-void
-PK1_material_function(TensorValue<double>& PP,
-                      const TensorValue<double>& FF,
-                      const libMesh::Point& /*x*/,
-                      const libMesh::Point& X,
-                      Elem* const /*elem*/,
-                      const vector<const vector<double>*>& /*var_data*/,
-                      const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                      const double time,
-                      void* ctx)
+double
+frobenius_norm(const TensorValue<double>& tensor)
 {
-    const auto& data = *static_cast<SwimmerData*>(ctx);
-    const double lambda_active = active_stretch(X, time, data);
-    const double J_active = lambda_active;
+    double norm_squared = 0.0;
+    for (unsigned int i = 0; i < NDIM; ++i)
+    {
+        for (unsigned int j = 0; j < NDIM; ++j) norm_squared += tensor(i, j) * tensor(i, j);
+    }
+    return std::sqrt(norm_squared);
+}
 
-    const TensorValue<double> tt = dyad(data.geometry.tangent, data.geometry.tangent);
-    const TensorValue<double> nn = dyad(data.geometry.normal, data.geometry.normal);
-    const TensorValue<double> Fa_inverse = (1.0 / lambda_active) * tt + nn;
-
-    TensorValue<double> Fe;
-    Fe.zero();
+TensorValue<double>
+multiply2(const TensorValue<double>& left, const TensorValue<double>& right)
+{
+    TensorValue<double> result;
+    result.zero();
     for (unsigned int i = 0; i < NDIM; ++i)
     {
         for (unsigned int j = 0; j < NDIM; ++j)
         {
-            for (unsigned int k = 0; k < NDIM; ++k) Fe(i, j) += FF(i, k) * Fa_inverse(k, j);
+            for (unsigned int k = 0; k < NDIM; ++k) result(i, j) += left(i, k) * right(k, j);
         }
     }
+    result(2, 2) = 1.0;
+    return result;
+}
 
-    const double J_elastic = Fe(0, 0) * Fe(1, 1) - Fe(0, 1) * Fe(1, 0);
-    if (!(J_elastic > 0.0) || !std::isfinite(J_elastic))
-    {
-        TBOX_ERROR("Nonpositive elastic Jacobian in active-strain material at time "
-                   << time << ", X=(" << X(0) << "," << X(1) << "), Je=" << J_elastic << "\n");
-    }
-
-    const TensorValue<double> Fe_inverse_transpose = tensor_inverse_transpose(Fe, NDIM);
-    TensorValue<double> Pe;
-    Pe.zero();
+TensorValue<double>
+pull_back_active_stress(const TensorValue<double>& elastic_stress,
+                        const TensorValue<double>& Fa_inverse,
+                        const double J_active)
+{
+    TensorValue<double> result;
+    result.zero();
     for (unsigned int i = 0; i < NDIM; ++i)
     {
         for (unsigned int j = 0; j < NDIM; ++j)
         {
-            Pe(i, j) = data.passive_mu * (Fe(i, j) - Fe_inverse_transpose(i, j)) +
-                       data.passive_lambda * std::log(J_elastic) * Fe_inverse_transpose(i, j);
+            for (unsigned int k = 0; k < NDIM; ++k)
+            {
+                result(i, j) += J_active * elastic_stress(i, k) * Fa_inverse(j, k);
+            }
+        }
+    }
+    return result;
+}
+
+MaterialResponse
+evaluate_material(const TensorValue<double>& FF,
+                  const double lambda_active,
+                  const SwimmerData& data,
+                  const libMesh::Point* X,
+                  const double time)
+{
+    const TensorValue<double> tt = dyad(data.geometry.tangent, data.geometry.tangent);
+    const TensorValue<double> nn = dyad(data.geometry.normal, data.geometry.normal);
+    TensorValue<double> Fa_inverse = (1.0 / lambda_active) * tt + nn;
+    Fa_inverse(2, 2) = 1.0;
+    const TensorValue<double> Fe = multiply2(FF, Fa_inverse);
+
+    MaterialResponse response;
+    response.J_elastic = Fe(0, 0) * Fe(1, 1) - Fe(0, 1) * Fe(1, 0);
+    if (!(response.J_elastic > 0.0) || !std::isfinite(response.J_elastic))
+    {
+        if (X)
+        {
+            TBOX_ERROR("Nonpositive elastic Jacobian in active-strain material at time "
+                       << time << ", X=(" << (*X)(0) << "," << (*X)(1)
+                       << "), Je=" << response.J_elastic << "\n");
+        }
+        TBOX_ERROR("Nonpositive elastic Jacobian in active-strain material self-check: Je="
+                   << response.J_elastic << "\n");
+    }
+
+    const double material_scale =
+        data.stage == SwimmerStage::PENALTY_PRESCRIBED ? data.stage1_passive_scale : 1.0;
+    const TensorValue<double> Fe_inverse_transpose = tensor_inverse_transpose(Fe, NDIM);
+    TensorValue<double> Pe_matrix;
+    Pe_matrix.zero();
+    for (unsigned int i = 0; i < NDIM; ++i)
+    {
+        for (unsigned int j = 0; j < NDIM; ++j)
+        {
+            Pe_matrix(i, j) =
+                material_scale *
+                (data.passive_mu * (Fe(i, j) - Fe_inverse_transpose(i, j)) +
+                 data.passive_lambda * std::log(response.J_elastic) * Fe_inverse_transpose(i, j));
         }
     }
 
@@ -420,96 +554,346 @@ PK1_material_function(TensorValue<double>& PP,
         }
     }
 
+    TensorValue<double> Pe_fiber;
+    Pe_fiber.zero();
     const double fiber_stretch = std::sqrt(dot2(fiber, fiber));
     if (fiber_stretch > 1.0)
     {
-        const double coefficient =
-            data.passive_fiber_modulus * (fiber_stretch - 1.0) / fiber_stretch;
-        Pe += coefficient * dyad(fiber, data.geometry.tangent);
+        const double coefficient = material_scale * data.passive_fiber_modulus *
+                                   (fiber_stretch - 1.0) / fiber_stretch;
+        Pe_fiber = coefficient * dyad(fiber, data.geometry.tangent);
     }
 
-    const double shear = dot2(fiber, transverse);
-    Pe += data.passive_shear_modulus * shear *
-          (dyad(transverse, data.geometry.tangent) + dyad(fiber, data.geometry.normal));
+    const double shear_measure = dot2(fiber, transverse);
+    const TensorValue<double> Pe_shear =
+        material_scale * data.passive_shear_modulus * shear_measure *
+        (dyad(transverse, data.geometry.tangent) + dyad(fiber, data.geometry.normal));
 
-    PP.zero();
-    for (unsigned int i = 0; i < NDIM; ++i)
+    response.matrix = pull_back_active_stress(Pe_matrix, Fa_inverse, lambda_active);
+    response.fiber = pull_back_active_stress(Pe_fiber, Fa_inverse, lambda_active);
+    response.shear = pull_back_active_stress(Pe_shear, Fa_inverse, lambda_active);
+    response.total = response.matrix + response.fiber + response.shear;
+    return response;
+}
+
+void
+PK1_material_function(TensorValue<double>& PP,
+                      const TensorValue<double>& FF,
+                      const libMesh::Point& /*x*/,
+                      const libMesh::Point& X,
+                      Elem* const /*elem*/,
+                      const vector<const vector<double>*>& /*var_data*/,
+                      const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
+                      const double time,
+                      void* ctx)
+{
+    const auto& data = *static_cast<SwimmerData*>(ctx);
+    const ActiveStretchState stretch = active_stretch_state(X, time, data);
+    PP = evaluate_material(FF, stretch.value, data, &X, time).total;
+}
+
+void
+raw_penalty_force(VectorValue<double>& F,
+                  const libMesh::Point& x,
+                  const libMesh::Point& X,
+                  const VectorValue<double>& velocity,
+                  const double time,
+                  const SwimmerData& data)
+{
+    const TargetState target = target_state(X, time, data);
+    for (unsigned int d = 0; d < NDIM; ++d)
     {
-        for (unsigned int j = 0; j < NDIM; ++j)
+        F(d) = data.penalty_stiffness * (target.position(d) - x(d)) +
+               data.penalty_damping * (target.velocity(d) - velocity(d));
+    }
+}
+
+double
+smooth_head_weight(const double xi, const double tether_fraction)
+{
+    if (xi >= tether_fraction) return 0.0;
+    const double coordinate = std::clamp(xi / tether_fraction, 0.0, 1.0);
+    return 0.5 * (1.0 + std::cos(M_PI * coordinate));
+}
+
+void
+evaluate_lag_body_force(VectorValue<double>& F,
+                        const libMesh::Point& x,
+                        const libMesh::Point& X,
+                        const VectorValue<double>& velocity,
+                        const double time,
+                        const SwimmerData& data)
+{
+    F.zero();
+    if (data.stage == SwimmerStage::PENALTY_PRESCRIBED)
+    {
+        raw_penalty_force(F, x, X, velocity, time, data);
+        if (data.penalty_zero_net_force) F -= data.penalty_projection_translation;
+        if (data.penalty_zero_net_torque)
         {
-            for (unsigned int k = 0; k < NDIM; ++k)
-            {
-                PP(i, j) += J_active * Pe(i, k) * Fa_inverse(j, k);
-            }
+            const VectorValue<double> radius = x - data.penalty_projection_center;
+            F(0) += data.penalty_projection_rotation * radius(1);
+            F(1) -= data.penalty_projection_rotation * radius(0);
+        }
+    }
+    else if (data.stage == SwimmerStage::ACTIVE_STRAIN_TETHERED_TEST)
+    {
+        const double weight =
+            smooth_head_weight(unit_coordinate(reference_s(X, data), data), data.active_test_tether_fraction);
+        for (unsigned int d = 0; d < NDIM; ++d)
+        {
+            F(d) = weight * (data.active_test_tether_stiffness * (X(d) - x(d)) -
+                             data.active_test_tether_damping * velocity(d));
         }
     }
 }
 
 void
-penalty_force_function(VectorValue<double>& F,
-                       const TensorValue<double>& /*FF*/,
-                       const libMesh::Point& x,
-                       const libMesh::Point& X,
-                       Elem* const /*elem*/,
-                       const vector<const vector<double>*>& var_data,
-                       const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
-                       const double time,
-                       void* ctx)
+lag_body_force_function(VectorValue<double>& F,
+                        const TensorValue<double>& /*FF*/,
+                        const libMesh::Point& x,
+                        const libMesh::Point& X,
+                        Elem* const /*elem*/,
+                        const vector<const vector<double>*>& var_data,
+                        const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
+                        const double time,
+                        void* ctx)
 {
     const auto& data = *static_cast<SwimmerData*>(ctx);
-    const TargetState target = target_state(X, time, data);
-    const vector<double>& velocity = *var_data[0];
-    for (unsigned int d = 0; d < NDIM; ++d)
-    {
-        F(d) = data.penalty_stiffness * (target.position(d) - x(d)) +
-               data.penalty_damping * (target.velocity(d) - velocity[d]);
-    }
+    VectorValue<double> velocity;
+    for (unsigned int d = 0; d < NDIM; ++d) velocity(d) = (*var_data[0])[d];
+    evaluate_lag_body_force(F, x, X, velocity, time, data);
 }
 
 ReferenceGeometry
 build_reference_geometry(const Mesh& mesh, Pointer<Database> input_db)
 {
+    VectorValue<double> axis;
+    axis(0) = input_db->getDoubleWithDefault("REFERENCE_AXIS_X", 1.0);
+    axis(1) = input_db->getDoubleWithDefault("REFERENCE_AXIS_Y", 0.0);
+    const double axis_norm = std::sqrt(dot2(axis, axis));
+    if (axis_norm <= 0.0) TBOX_ERROR("The reference axis must be nonzero.\n");
+    axis /= axis_norm;
+
+    double projection_min = std::numeric_limits<double>::max();
+    double projection_max = -std::numeric_limits<double>::max();
+    for (auto node_it = mesh.nodes_begin(); node_it != mesh.nodes_end(); ++node_it)
+    {
+        const Node& node = **node_it;
+        const VectorValue<double> position(node(0), node(1));
+        const double projection = dot2(position, axis);
+        projection_min = std::min(projection_min, projection);
+        projection_max = std::max(projection_max, projection);
+    }
+    IBTK_MPI::minReduction(&projection_min, 1);
+    IBTK_MPI::maxReduction(&projection_max, 1);
+
+    const std::string head_end = input_db->getString("REFERENCE_HEAD_END");
     VectorValue<double> tangent;
-    tangent(0) = input_db->getDoubleWithDefault("REFERENCE_TANGENT_X", 1.0);
-    tangent(1) = input_db->getDoubleWithDefault("REFERENCE_TANGENT_Y", 0.0);
-    const double tangent_norm = std::sqrt(dot2(tangent, tangent));
-    if (tangent_norm <= 0.0) TBOX_ERROR("The reference tangent must be nonzero.\n");
-    tangent /= tangent_norm;
+    double head_projection = 0.0;
+    if (head_end == "MAX_PROJECTION")
+    {
+        tangent = -axis;
+        head_projection = projection_max;
+    }
+    else if (head_end == "MIN_PROJECTION")
+    {
+        tangent = axis;
+        head_projection = projection_min;
+    }
+    else
+    {
+        TBOX_ERROR("REFERENCE_HEAD_END must be MAX_PROJECTION or MIN_PROJECTION.\n");
+    }
 
     VectorValue<double> normal;
     normal(0) = -tangent(1);
     normal(1) = tangent(0);
-
-    double s_min = std::numeric_limits<double>::max();
-    double s_max = -std::numeric_limits<double>::max();
     double eta_min = std::numeric_limits<double>::max();
     double eta_max = -std::numeric_limits<double>::max();
     for (auto node_it = mesh.nodes_begin(); node_it != mesh.nodes_end(); ++node_it)
     {
         const Node& node = **node_it;
         const VectorValue<double> position(node(0), node(1));
-        const double s = dot2(position, tangent);
         const double eta = dot2(position, normal);
-        s_min = std::min(s_min, s);
-        s_max = std::max(s_max, s);
         eta_min = std::min(eta_min, eta);
         eta_max = std::max(eta_max, eta);
     }
-    IBTK_MPI::minReduction(&s_min, 1);
-    IBTK_MPI::maxReduction(&s_max, 1);
     IBTK_MPI::minReduction(&eta_min, 1);
     IBTK_MPI::maxReduction(&eta_max, 1);
 
     ReferenceGeometry geometry;
     geometry.tangent = tangent;
     geometry.normal = normal;
-    geometry.length = s_max - s_min;
+    geometry.length = projection_max - projection_min;
+    geometry.eta_min = eta_min;
+    geometry.eta_max = eta_max;
     const double eta_center = 0.5 * (eta_min + eta_max);
     for (unsigned int d = 0; d < NDIM; ++d)
     {
-        geometry.head(d) = s_min * tangent(d) + eta_center * normal(d);
+        geometry.head(d) = head_projection * axis(d) + eta_center * normal(d);
     }
     return geometry;
+}
+
+void
+update_penalty_projection(const double current_time,
+                          const double new_time,
+                          const int /*num_cycles*/,
+                          void* ctx)
+{
+    auto& projection = *static_cast<PenaltyProjectionContext*>(ctx);
+    SwimmerData& data = *projection.swimmer_data;
+    data.penalty_projection_translation.zero();
+    data.penalty_projection_rotation = 0.0;
+    if (data.stage != SwimmerStage::PENALTY_PRESCRIBED ||
+        (!data.penalty_zero_net_force && !data.penalty_zero_net_torque))
+    {
+        return;
+    }
+
+    Mesh& mesh = *projection.mesh;
+    EquationSystems& equation_systems = *projection.equation_systems;
+    System& X_system = equation_systems.get_system(projection.coords_system_name);
+    System& U_system = equation_systems.get_system(projection.velocity_system_name);
+    NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
+    NumericVector<double>* U_ghost_vec = U_system.current_local_solution.get();
+    copy_and_synch(*X_system.solution, *X_ghost_vec);
+    copy_and_synch(*U_system.solution, *U_ghost_vec);
+
+    const DofMap& dof_map = X_system.get_dof_map();
+    vector<vector<unsigned int> > dof_indices(NDIM);
+    std::unique_ptr<FEBase> fe(FEBase::build(mesh.mesh_dimension(), dof_map.variable_type(0)));
+    std::unique_ptr<QBase> qrule = QBase::build(QGAUSS, mesh.mesh_dimension(), FIFTH);
+    fe->attach_quadrature_rule(qrule.get());
+    const vector<double>& JxW = fe->get_JxW();
+    const vector<libMesh::Point>& reference_points = fe->get_xyz();
+    const vector<vector<double> >& phi = fe->get_phi();
+
+    boost::multi_array<double, 2> X_node;
+    boost::multi_array<double, 2> U_node;
+    VectorValue<double> x;
+    VectorValue<double> velocity;
+    VectorValue<double> raw_force;
+    const double projection_time = 0.5 * (current_time + new_time);
+
+    double volume = 0.0;
+    double center_integral[NDIM] = { 0.0, 0.0 };
+    double force_integral[NDIM] = { 0.0, 0.0 };
+    for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
+    {
+        Elem* const elem = *elem_it;
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d) dof_map.dof_indices(elem, dof_indices[d], d);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+        get_values_for_interpolation(U_node, *U_ghost_vec, dof_indices);
+        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
+        {
+            interpolate(x, qp, X_node, phi);
+            interpolate(velocity, qp, U_node, phi);
+            raw_penalty_force(raw_force, x, reference_points[qp], velocity, projection_time, data);
+            const double weight = JxW[qp];
+            volume += weight;
+            for (unsigned int d = 0; d < NDIM; ++d)
+            {
+                center_integral[d] += x(d) * weight;
+                force_integral[d] += raw_force(d) * weight;
+            }
+        }
+    }
+    IBTK_MPI::sumReduction(&volume, 1);
+    IBTK_MPI::sumReduction(center_integral, NDIM);
+    IBTK_MPI::sumReduction(force_integral, NDIM);
+    if (volume <= 0.0) TBOX_ERROR("Cannot project penalty force on a zero-volume mesh.\n");
+
+    for (unsigned int d = 0; d < NDIM; ++d)
+    {
+        data.penalty_projection_center(d) = center_integral[d] / volume;
+        if (data.penalty_zero_net_force)
+        {
+            data.penalty_projection_translation(d) = force_integral[d] / volume;
+        }
+    }
+
+    if (!data.penalty_zero_net_torque) return;
+    double torque = 0.0;
+    double polar_moment = 0.0;
+    for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
+    {
+        Elem* const elem = *elem_it;
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d) dof_map.dof_indices(elem, dof_indices[d], d);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+        get_values_for_interpolation(U_node, *U_ghost_vec, dof_indices);
+        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
+        {
+            interpolate(x, qp, X_node, phi);
+            interpolate(velocity, qp, U_node, phi);
+            raw_penalty_force(raw_force, x, reference_points[qp], velocity, projection_time, data);
+            if (data.penalty_zero_net_force) raw_force -= data.penalty_projection_translation;
+            const VectorValue<double> radius = x - data.penalty_projection_center;
+            const double weight = JxW[qp];
+            torque += (radius(0) * raw_force(1) - radius(1) * raw_force(0)) * weight;
+            polar_moment += dot2(radius, radius) * weight;
+        }
+    }
+    IBTK_MPI::sumReduction(&torque, 1);
+    IBTK_MPI::sumReduction(&polar_moment, 1);
+    if (polar_moment <= 0.0) TBOX_ERROR("Cannot project penalty torque with zero polar moment.\n");
+    data.penalty_projection_rotation = torque / polar_moment;
+}
+
+void
+postprocess_penalty_projection(const double /*current_time*/,
+                               const double new_time,
+                               const bool /*skip_synchronize_new_state_data*/,
+                               const int num_cycles,
+                               void* ctx)
+{
+    update_penalty_projection(new_time, new_time, num_cycles, ctx);
+}
+
+void
+run_material_self_checks(const SwimmerData& data)
+{
+    if (!data.run_material_self_checks) return;
+
+    TensorValue<double> identity;
+    identity.zero();
+    for (unsigned int d = 0; d < 3; ++d) identity(d, d) = 1.0;
+    const MaterialResponse passive = evaluate_material(identity, 1.0, data, nullptr, 0.0);
+    const double passive_residual = frobenius_norm(passive.total);
+
+    const double check_time = data.ramp_time + 0.25 / data.frequency;
+    const double eta = 0.5 * (data.geometry.eta_min + data.geometry.eta_max) +
+                       0.45 * (data.geometry.eta_max - data.geometry.eta_min);
+    const libMesh::Point X = data.geometry.head + 0.8 * data.geometry.length * data.geometry.tangent +
+                             eta * data.geometry.normal;
+    ActiveStretchState stretch = active_stretch_state(X, check_time, data);
+    if (!uses_active_strain(data))
+    {
+        stretch.curvature = data.active_curvature_tail * std::pow(0.8, data.active_envelope_power) *
+                            std::sin(wave_number(data) * 0.8 * data.geometry.length -
+                                     angular_frequency(data) * check_time + data.phase0);
+        stretch.raw = 1.0 - eta * stretch.curvature;
+        stretch.value = std::clamp(stretch.raw, data.active_stretch_min, data.active_stretch_max);
+    }
+    TensorValue<double> Fa = stretch.value * dyad(data.geometry.tangent, data.geometry.tangent) +
+                             dyad(data.geometry.normal, data.geometry.normal);
+    Fa(2, 2) = 1.0;
+    const MaterialResponse active_stress_free =
+        evaluate_material(Fa, stretch.value, data, nullptr, check_time);
+    const double active_residual = frobenius_norm(active_stress_free.total);
+
+    pout << "Material self-check: ||P(F=I,Fa=I)|| = " << passive_residual
+         << ", ||P(F=Fa)|| = " << active_residual << "\n";
+    if (!std::isfinite(passive_residual) || !std::isfinite(active_residual) ||
+        passive_residual > data.material_self_check_tolerance ||
+        active_residual > data.material_self_check_tolerance)
+    {
+        TBOX_ERROR("Active-strain material self-check failed. Tolerance = "
+                   << data.material_self_check_tolerance << "\n");
+    }
 }
 } // namespace ModelData
 using namespace ModelData;
@@ -579,8 +963,58 @@ main(int argc, char* argv[])
         const ReferenceGeometry reference_geometry = build_reference_geometry(mesh, input_db);
         SwimmerData swimmer_data(input_db, reference_geometry);
         void* const swimmer_data_ptr = static_cast<void*>(&swimmer_data);
-        plog << "Swimmer stage: " << static_cast<int>(swimmer_data.stage)
-             << ", reference length: " << swimmer_data.geometry.length << "\n";
+        const libMesh::Point reference_tail =
+            swimmer_data.geometry.head + swimmer_data.geometry.length * swimmer_data.geometry.tangent;
+        plog << "Reference head = (" << swimmer_data.geometry.head(0) << ","
+             << swimmer_data.geometry.head(1) << "), tail = (" << reference_tail(0) << ","
+             << reference_tail(1) << "), length = " << swimmer_data.geometry.length << "\n";
+        pout << "Reference convention: s=0 is head at (" << swimmer_data.geometry.head(0) << ","
+             << swimmer_data.geometry.head(1) << "), s=L is tail at (" << reference_tail(0) << ","
+             << reference_tail(1) << ").\n";
+        if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED)
+        {
+            pout << "=== Stage 1: prescribed kinematics via penalty body force ===\n";
+            pout << "Stage-1 passive material scale = " << swimmer_data.stage1_passive_scale << ".\n";
+            if (!swimmer_data.penalty_zero_net_force || !swimmer_data.penalty_zero_net_torque)
+            {
+                pout << "This is a tethered wake-validation case. Unprojected penalty force/torque makes "
+                        "free-swimming speed and efficiency nonphysical.\n";
+            }
+            else
+            {
+                pout << "Penalty rigid-force and rigid-torque modes are projected once per time step. "
+                        "Swimming speed is an approximate prescribed-gait result; penalty efficiency remains "
+                        "nonphysical.\n";
+            }
+        }
+        else if (swimmer_data.stage == SwimmerStage::ACTIVE_STRAIN)
+        {
+            pout << "=== Stage 2: free active-strain FSI ===\n";
+        }
+        else
+        {
+            pout << "=== Stage 3: head-tethered active-strain structural/FSI test ===\n";
+        }
+
+        const double eta_abs_max =
+            std::max(std::abs(swimmer_data.geometry.eta_min), std::abs(swimmer_data.geometry.eta_max));
+        const double raw_stretch_lower = 1.0 - eta_abs_max * std::abs(swimmer_data.active_curvature_tail);
+        const double raw_stretch_upper = 1.0 + eta_abs_max * std::abs(swimmer_data.active_curvature_tail);
+        pout << "Worst-case unclamped active stretch bound = [" << raw_stretch_lower << ","
+             << raw_stretch_upper << "].\n";
+        if (raw_stretch_lower <= 0.0)
+        {
+            TBOX_ERROR("ACTIVE_CURVATURE_TAIL_TIMES_L permits a nonpositive raw active stretch.\n");
+        }
+        if (uses_active_strain(swimmer_data) && !swimmer_data.allow_active_stretch_clamp &&
+            (raw_stretch_lower < swimmer_data.active_stretch_min ||
+             raw_stretch_upper > swimmer_data.active_stretch_max))
+        {
+            TBOX_ERROR("The configured active curvature reaches the active-stretch clamp. Reduce "
+                       "ACTIVE_CURVATURE_TAIL_TIMES_L or set ALLOW_ACTIVE_STRETCH_CLAMP=TRUE "
+                       "for an intentional clipped test.\n");
+        }
+        run_material_self_checks(swimmer_data);
 
         Pointer<INSHierarchyIntegrator> navier_stokes_integrator;
         const string solver_type = app_initializer->getComponentDatabase("Main")->getString("solver_type");
@@ -635,6 +1069,9 @@ main(int argc, char* argv[])
         EquationSystems* equation_systems = ib_method_ops->getFEDataManager()->getEquationSystems();
         const string coords_system_name = ib_method_ops->getCurrentCoordinatesSystemName();
         const string velocity_system_name = ib_method_ops->getVelocitySystemName();
+        PenaltyProjectionContext penalty_projection_context{
+            &mesh, equation_systems, coords_system_name, velocity_system_name, &swimmer_data
+        };
 
         IBFEMethod::PK1StressFcnData PK1_stress_data(
             PK1_material_function, vector<SystemData>(), swimmer_data_ptr);
@@ -642,14 +1079,23 @@ main(int argc, char* argv[])
             Utility::string_to_enum<libMesh::Order>(input_db->getString("PK1_QUAD_ORDER"));
         ib_method_ops->registerPK1StressFunction(PK1_stress_data);
 
-        if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED)
+        if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED ||
+            swimmer_data.stage == SwimmerStage::ACTIVE_STRAIN_TETHERED_TEST)
         {
             vector<int> velocity_variables(NDIM);
             for (unsigned int d = 0; d < NDIM; ++d) velocity_variables[d] = d;
             vector<SystemData> system_data(1, SystemData(velocity_system_name, velocity_variables));
             IBFEMethod::LagBodyForceFcnData body_force_data(
-                penalty_force_function, system_data, swimmer_data_ptr);
+                lag_body_force_function, system_data, swimmer_data_ptr);
             ib_method_ops->registerLagBodyForceFunction(body_force_data);
+        }
+        if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED &&
+            (swimmer_data.penalty_zero_net_force || swimmer_data.penalty_zero_net_torque))
+        {
+            time_integrator->registerPreprocessIntegrateHierarchyCallback(
+                update_penalty_projection, &penalty_projection_context);
+            time_integrator->registerPostprocessIntegrateHierarchyCallback(
+                postprocess_penalty_projection, &penalty_projection_context);
         }
 
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
@@ -694,6 +1140,12 @@ main(int argc, char* argv[])
 
         ib_method_ops->initializeFEData();
         time_integrator->initializePatchHierarchy(patch_hierarchy, gridding_algorithm);
+        if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED &&
+            (swimmer_data.penalty_zero_net_force || swimmer_data.penalty_zero_net_torque))
+        {
+            const double initial_time = time_integrator->getIntegratorTime();
+            update_penalty_projection(initial_time, initial_time, 1, &penalty_projection_context);
+        }
 
         const bool from_restart = RestartManager::getManager()->isFromRestart();
         if (IBTK_MPI::getRank() == 0)
@@ -706,9 +1158,15 @@ main(int argc, char* argv[])
             if (!from_restart)
             {
                 diagnostics_stream
-                    << "step,time,stage,J_min,J_max,lambda_active_min,lambda_active_max,"
-                       "tracking_error_rms,tracking_error_max,penalty_force_x,penalty_force_y,"
-                       "penalty_torque_z,penalty_power,tail_lateral,target_tail_lateral\n";
+                    << "step,time,stage,J_total_min,J_total_max,J_elastic_min,J_elastic_max,"
+                       "lambda_raw_min,lambda_raw_max,lambda_active_min,lambda_active_max,clamp_fraction,"
+                       "P_matrix_mean,P_fiber_mean,P_shear_mean,"
+                       "tracking_error_rms,tracking_error_max,tracking_error_rms_over_L,"
+                       "tracking_error_max_over_L,body_force_x,body_force_y,body_torque_z,body_power,"
+                       "tail_root_lateral,tail_tip_lateral,tail_lateral_over_L,tail_pitch,"
+                       "target_tail_root_lateral,target_tail_tip_lateral,target_tail_pitch,"
+                       "actual_curvature_mid,actual_curvature_tail,target_curvature_mid,"
+                       "target_curvature_tail\n";
             }
         }
 
@@ -802,6 +1260,7 @@ write_diagnostics(Mesh& mesh,
                   const int iteration_num,
                   const double loop_time)
 {
+    static const std::array<double, 8> station_xi = { 0.02, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.98 };
     const unsigned int dim = mesh.mesh_dimension();
     System& X_system = equation_systems->get_system(coords_system_name);
     System& U_system = equation_systems->get_system(velocity_system_name);
@@ -821,27 +1280,44 @@ write_diagnostics(Mesh& mesh,
     const vector<vector<VectorValue<double> > >& dphi = fe->get_dphi();
 
     double volume = 0.0;
+    double clamp_volume = 0.0;
     double tracking_error_squared = 0.0;
     double tracking_error_max = 0.0;
-    double penalty_force_x = 0.0;
-    double penalty_force_y = 0.0;
-    double penalty_torque = 0.0;
-    double penalty_power = 0.0;
-    double tail_weight = 0.0;
-    double tail_lateral = 0.0;
-    double target_tail_lateral = 0.0;
-    double J_min = std::numeric_limits<double>::max();
-    double J_max = -std::numeric_limits<double>::max();
-    double lambda_min = std::numeric_limits<double>::max();
-    double lambda_max = -std::numeric_limits<double>::max();
+    double body_force_x = 0.0;
+    double body_force_y = 0.0;
+    double body_torque = 0.0;
+    double body_power = 0.0;
+    double P_matrix_integral = 0.0;
+    double P_fiber_integral = 0.0;
+    double P_shear_integral = 0.0;
+    double J_total_min = std::numeric_limits<double>::max();
+    double J_total_max = -std::numeric_limits<double>::max();
+    double J_elastic_min = std::numeric_limits<double>::max();
+    double J_elastic_max = -std::numeric_limits<double>::max();
+    double lambda_raw_min = std::numeric_limits<double>::max();
+    double lambda_raw_max = -std::numeric_limits<double>::max();
+    double lambda_active_min = std::numeric_limits<double>::max();
+    double lambda_active_max = -std::numeric_limits<double>::max();
+    std::array<double, station_xi.size()> station_weight{};
+    std::array<double, station_xi.size()> station_x{};
+    std::array<double, station_xi.size()> station_y{};
+    std::array<double, station_xi.size()> target_station_x{};
+    std::array<double, station_xi.size()> target_station_y{};
 
     boost::multi_array<double, 2> X_node;
     boost::multi_array<double, 2> U_node;
     VectorValue<double> x;
     VectorValue<double> velocity;
     TensorValue<double> FF;
-    const libMesh::Point body_center = swimmer_data.geometry.head +
-                                       0.5 * swimmer_data.geometry.length * swimmer_data.geometry.tangent;
+    libMesh::Point torque_center = swimmer_data.penalty_projection_center;
+    if (swimmer_data.stage != SwimmerStage::PENALTY_PRESCRIBED)
+    {
+        torque_center = swimmer_data.geometry.head;
+        for (unsigned int d = 0; d < NDIM; ++d)
+        {
+            torque_center(d) += 0.5 * swimmer_data.geometry.length * swimmer_data.geometry.tangent(d);
+        }
+    }
 
     for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
     {
@@ -858,90 +1334,190 @@ write_diagnostics(Mesh& mesh,
             jacobian(FF, qp, X_node, dphi);
             const libMesh::Point& X = reference_points[qp];
             const double weight = JxW[qp];
-            const double J = FF(0, 0) * FF(1, 1) - FF(0, 1) * FF(1, 0);
-            const double lambda_active = active_stretch(X, loop_time, swimmer_data);
+            const double xi = unit_coordinate(reference_s(X, swimmer_data), swimmer_data);
+            const double J_total = FF(0, 0) * FF(1, 1) - FF(0, 1) * FF(1, 0);
+            const ActiveStretchState stretch = active_stretch_state(X, loop_time, swimmer_data);
+            const MaterialResponse material =
+                evaluate_material(FF, stretch.value, swimmer_data, &X, loop_time);
 
             volume += weight;
-            J_min = std::min(J_min, J);
-            J_max = std::max(J_max, J);
-            lambda_min = std::min(lambda_min, lambda_active);
-            lambda_max = std::max(lambda_max, lambda_active);
+            if (stretch.clamped) clamp_volume += weight;
+            J_total_min = std::min(J_total_min, J_total);
+            J_total_max = std::max(J_total_max, J_total);
+            J_elastic_min = std::min(J_elastic_min, material.J_elastic);
+            J_elastic_max = std::max(J_elastic_max, material.J_elastic);
+            lambda_raw_min = std::min(lambda_raw_min, stretch.raw);
+            lambda_raw_max = std::max(lambda_raw_max, stretch.raw);
+            lambda_active_min = std::min(lambda_active_min, stretch.value);
+            lambda_active_max = std::max(lambda_active_max, stretch.value);
+            P_matrix_integral += frobenius_norm(material.matrix) * weight;
+            P_fiber_integral += frobenius_norm(material.fiber) * weight;
+            P_shear_integral += frobenius_norm(material.shear) * weight;
 
             TargetState target;
             target.position = X;
             target.velocity.zero();
-            VectorValue<double> penalty_force;
-            penalty_force.zero();
+            VectorValue<double> body_force;
+            evaluate_lag_body_force(body_force, x, X, velocity, loop_time, swimmer_data);
             if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED)
             {
                 target = target_state(X, loop_time, swimmer_data);
-                for (unsigned int d = 0; d < NDIM; ++d)
-                {
-                    penalty_force(d) =
-                        swimmer_data.penalty_stiffness * (target.position(d) - x(d)) +
-                        swimmer_data.penalty_damping * (target.velocity(d) - velocity(d));
-                }
                 const double error_x = target.position(0) - x(0);
                 const double error_y = target.position(1) - x(1);
                 const double error_squared = error_x * error_x + error_y * error_y;
                 tracking_error_squared += error_squared * weight;
                 tracking_error_max = std::max(tracking_error_max, std::sqrt(error_squared));
-                penalty_force_x += penalty_force(0) * weight;
-                penalty_force_y += penalty_force(1) * weight;
-                penalty_torque += ((x(0) - body_center(0)) * penalty_force(1) -
-                                   (x(1) - body_center(1)) * penalty_force(0)) *
-                                  weight;
-                penalty_power += dot2(penalty_force, target.velocity) * weight;
             }
 
-            if (unit_coordinate(reference_s(X, swimmer_data), swimmer_data) >= 0.95)
+            body_force_x += body_force(0) * weight;
+            body_force_y += body_force(1) * weight;
+            body_torque += ((x(0) - torque_center(0)) * body_force(1) -
+                            (x(1) - torque_center(1)) * body_force(0)) *
+                           weight;
+            body_power += dot2(body_force, velocity) * weight;
+
+            for (std::size_t station = 0; station < station_xi.size(); ++station)
             {
-                const VectorValue<double> current_offset = x - swimmer_data.geometry.head;
-                tail_weight += weight;
-                tail_lateral += dot2(current_offset, swimmer_data.geometry.normal) * weight;
+                const double distance = std::abs(xi - station_xi[station]);
+                if (distance >= swimmer_data.diagnostic_station_half_width) continue;
+                const double station_kernel =
+                    1.0 - distance / swimmer_data.diagnostic_station_half_width;
+                const double station_quadrature_weight = station_kernel * weight;
+                station_weight[station] += station_quadrature_weight;
+                station_x[station] += x(0) * station_quadrature_weight;
+                station_y[station] += x(1) * station_quadrature_weight;
                 if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED)
                 {
-                    const VectorValue<double> target_offset =
-                        target.position - swimmer_data.geometry.head;
-                    target_tail_lateral +=
-                        dot2(target_offset, swimmer_data.geometry.normal) * weight;
+                    target_station_x[station] += target.position(0) * station_quadrature_weight;
+                    target_station_y[station] += target.position(1) * station_quadrature_weight;
                 }
             }
         }
     }
 
-    const std::array<double*, 8> sums = { &volume,
-                                          &tracking_error_squared,
-                                          &penalty_force_x,
-                                          &penalty_force_y,
-                                          &penalty_torque,
-                                          &penalty_power,
-                                          &tail_weight,
-                                          &tail_lateral };
+    const std::array<double*, 10> sums = { &volume,
+                                           &clamp_volume,
+                                           &tracking_error_squared,
+                                           &body_force_x,
+                                           &body_force_y,
+                                           &body_torque,
+                                           &body_power,
+                                           &P_matrix_integral,
+                                           &P_fiber_integral,
+                                           &P_shear_integral };
     for (double* value : sums) IBTK_MPI::sumReduction(value, 1);
-    IBTK_MPI::sumReduction(&target_tail_lateral, 1);
+    IBTK_MPI::sumReduction(station_weight.data(), station_weight.size());
+    IBTK_MPI::sumReduction(station_x.data(), station_x.size());
+    IBTK_MPI::sumReduction(station_y.data(), station_y.size());
+    IBTK_MPI::sumReduction(target_station_x.data(), target_station_x.size());
+    IBTK_MPI::sumReduction(target_station_y.data(), target_station_y.size());
     IBTK_MPI::maxReduction(&tracking_error_max, 1);
-    IBTK_MPI::minReduction(&J_min, 1);
-    IBTK_MPI::maxReduction(&J_max, 1);
-    IBTK_MPI::minReduction(&lambda_min, 1);
-    IBTK_MPI::maxReduction(&lambda_max, 1);
+    IBTK_MPI::minReduction(&J_total_min, 1);
+    IBTK_MPI::maxReduction(&J_total_max, 1);
+    IBTK_MPI::minReduction(&J_elastic_min, 1);
+    IBTK_MPI::maxReduction(&J_elastic_max, 1);
+    IBTK_MPI::minReduction(&lambda_raw_min, 1);
+    IBTK_MPI::maxReduction(&lambda_raw_max, 1);
+    IBTK_MPI::minReduction(&lambda_active_min, 1);
+    IBTK_MPI::maxReduction(&lambda_active_max, 1);
 
     const double tracking_error_rms =
         volume > 0.0 ? std::sqrt(tracking_error_squared / volume) : 0.0;
-    if (tail_weight > 0.0)
+    const double clamp_fraction = volume > 0.0 ? clamp_volume / volume : 0.0;
+    const double P_matrix_mean = volume > 0.0 ? P_matrix_integral / volume : 0.0;
+    const double P_fiber_mean = volume > 0.0 ? P_fiber_integral / volume : 0.0;
+    const double P_shear_mean = volume > 0.0 ? P_shear_integral / volume : 0.0;
+
+    std::array<libMesh::Point, station_xi.size()> stations;
+    std::array<libMesh::Point, station_xi.size()> target_stations;
+    for (std::size_t station = 0; station < station_xi.size(); ++station)
     {
-        tail_lateral /= tail_weight;
-        target_tail_lateral /= tail_weight;
+        if (station_weight[station] <= 0.0)
+        {
+            TBOX_ERROR("No diagnostic quadrature points found near xi=" << station_xi[station]
+                                                                        << ". Increase "
+                                                                           "DIAGNOSTIC_STATION_HALF_WIDTH.\n");
+        }
+        stations[station](0) = station_x[station] / station_weight[station];
+        stations[station](1) = station_y[station] / station_weight[station];
+        if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED)
+        {
+            target_stations[station](0) = target_station_x[station] / station_weight[station];
+            target_stations[station](1) = target_station_y[station] / station_weight[station];
+        }
+    }
+
+    const auto lateral = [&](const libMesh::Point& point) {
+        return dot2(point - swimmer_data.geometry.head, swimmer_data.geometry.normal);
+    };
+    const auto pitch = [&](const libMesh::Point& root, const libMesh::Point& tip) {
+        const VectorValue<double> direction = tip - root;
+        return std::atan2(dot2(direction, swimmer_data.geometry.normal),
+                          dot2(direction, swimmer_data.geometry.tangent));
+    };
+    const auto curvature = [](const libMesh::Point& a,
+                              const libMesh::Point& b,
+                              const libMesh::Point& c) {
+        const double ab = (b - a).norm();
+        const double bc = (c - b).norm();
+        const double ac = (c - a).norm();
+        const double denominator = ab * bc * ac;
+        if (denominator <= std::numeric_limits<double>::epsilon()) return 0.0;
+        const double cross = (b(0) - a(0)) * (c(1) - a(1)) -
+                             (b(1) - a(1)) * (c(0) - a(0));
+        return 2.0 * cross / denominator;
+    };
+
+    const double tail_root_lateral = lateral(stations[5]);
+    const double tail_tip_lateral = lateral(stations[7]);
+    const double tail_lateral_over_L =
+        (tail_tip_lateral - lateral(stations[0])) / swimmer_data.geometry.length;
+    const double tail_pitch = pitch(stations[5], stations[7]);
+    const double actual_curvature_mid = curvature(stations[1], stations[2], stations[3]);
+    const double actual_curvature_tail = curvature(stations[4], stations[5], stations[6]);
+
+    double target_tail_root_lateral = std::numeric_limits<double>::quiet_NaN();
+    double target_tail_tip_lateral = std::numeric_limits<double>::quiet_NaN();
+    double target_tail_pitch = std::numeric_limits<double>::quiet_NaN();
+    double target_curvature_mid = 0.0;
+    double target_curvature_tail = 0.0;
+    if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED)
+    {
+        target_tail_root_lateral = lateral(target_stations[5]);
+        target_tail_tip_lateral = lateral(target_stations[7]);
+        target_tail_pitch = pitch(target_stations[5], target_stations[7]);
+        target_curvature_mid = curvature(target_stations[1], target_stations[2], target_stations[3]);
+        target_curvature_tail = curvature(target_stations[4], target_stations[5], target_stations[6]);
+    }
+    else
+    {
+        const libMesh::Point X_mid =
+            swimmer_data.geometry.head + station_xi[2] * swimmer_data.geometry.length *
+                                             swimmer_data.geometry.tangent;
+        const libMesh::Point X_tail =
+            swimmer_data.geometry.head + station_xi[5] * swimmer_data.geometry.length *
+                                             swimmer_data.geometry.tangent;
+        target_curvature_mid = active_curvature(X_mid, loop_time, swimmer_data);
+        target_curvature_tail = active_curvature(X_tail, loop_time, swimmer_data);
     }
 
     if (IBTK_MPI::getRank() == 0)
     {
         diagnostics_stream << iteration_num << "," << loop_time << ","
-                           << static_cast<int>(swimmer_data.stage) << "," << J_min << "," << J_max << ","
-                           << lambda_min << "," << lambda_max << "," << tracking_error_rms << ","
-                           << tracking_error_max << "," << penalty_force_x << "," << penalty_force_y << ","
-                           << penalty_torque << "," << penalty_power << "," << tail_lateral << ","
-                           << target_tail_lateral << "\n";
+                           << static_cast<int>(swimmer_data.stage) << "," << J_total_min << ","
+                           << J_total_max << "," << J_elastic_min << "," << J_elastic_max << ","
+                           << lambda_raw_min << "," << lambda_raw_max << "," << lambda_active_min << ","
+                           << lambda_active_max << "," << clamp_fraction << "," << P_matrix_mean << ","
+                           << P_fiber_mean << "," << P_shear_mean << "," << tracking_error_rms << ","
+                           << tracking_error_max << ","
+                           << tracking_error_rms / swimmer_data.geometry.length << ","
+                           << tracking_error_max / swimmer_data.geometry.length << "," << body_force_x << ","
+                           << body_force_y << "," << body_torque << "," << body_power << ","
+                           << tail_root_lateral << "," << tail_tip_lateral << "," << tail_lateral_over_L << ","
+                           << tail_pitch << "," << target_tail_root_lateral << ","
+                           << target_tail_tip_lateral << "," << target_tail_pitch << ","
+                           << actual_curvature_mid << "," << actual_curvature_tail << ","
+                           << target_curvature_mid << "," << target_curvature_tail << "\n";
         diagnostics_stream.flush();
     }
 }

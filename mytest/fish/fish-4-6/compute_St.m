@@ -17,14 +17,14 @@ function [St, f_tail, A_pp] = compute_St(filename, U_ref, t_start)
   end
 
   data = readtable(filename);
-  required = ["time", "tail_lateral"];
+  required = ["time", "tail_tip_lateral"];
   if ~all(ismember(required, string(data.Properties.VariableNames)))
-    error("The diagnostics file must contain time and tail_lateral columns.");
+    error("The diagnostics file must contain time and tail_tip_lateral columns.");
   end
 
-  keep = isfinite(data.time) & isfinite(data.tail_lateral) & data.time >= t_start;
+  keep = isfinite(data.time) & isfinite(data.tail_tip_lateral) & data.time >= t_start;
   time = data.time(keep);
-  tail = data.tail_lateral(keep);
+  tail = data.tail_tip_lateral(keep);
   if numel(time) < 8
     error("At least eight diagnostic samples are required after t_start.");
   end

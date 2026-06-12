@@ -1,11 +1,15 @@
 // Stage selector:
 //   1 = prescribed arclength-consistent kinematics through a penalty body force
-//   2 = active strain / time-varying stress-free reference
+//   2 = free active strain / time-varying stress-free reference
+//   3 = head-tethered active-strain structural/FSI self-test
 SWIMMER_STAGE = 1
 
 MESH_FILENAME = "fish2d.msh"
-REFERENCE_TANGENT_X = 1.0
-REFERENCE_TANGENT_Y = 0.0
+// fish2d.geo defines the head at x=1 and tail at x=0. The code orients s from
+// the selected head end to the opposite end, so s=0 is head and s=L is tail.
+REFERENCE_AXIS_X = 1.0
+REFERENCE_AXIS_Y = 0.0
+REFERENCE_HEAD_END = "MAX_PROJECTION"
 
 // Shared travelling wave
 WAVE_FREQUENCY = 1.0
@@ -19,17 +23,25 @@ PRESCRIBED_TAIL_AMPLITUDE_OVER_L = 0.08
 PRESCRIBED_ENVELOPE_POWER = 2.0
 
 // Stage 2: L*kappa_0 = ACTIVE_CURVATURE_TAIL_TIMES_L*(s/L)^p*sin(ks-omega*t)
-ACTIVE_CURVATURE_TAIL_TIMES_L = 5.0
+ACTIVE_CURVATURE_TAIL_TIMES_L = 1.0
 ACTIVE_ENVELOPE_POWER = 2.0
-ACTIVE_STRETCH_MIN = 0.65
-ACTIVE_STRETCH_MAX = 1.35
+ACTIVE_STRETCH_MIN = 0.75
+ACTIVE_STRETCH_MAX = 1.25
+// Keep FALSE for physical runs: clipping makes the stress-free metric nonsmooth.
+ALLOW_ACTIVE_STRETCH_CLAMP = FALSE
 
 // Passive material evaluated with F in Stage 1 and Fe=F*Fa^{-1} in Stage 2
 PASSIVE_MU = 0.5
 PASSIVE_LAMBDA = 40.0
 PASSIVE_FIBER_MODULUS = 0.5
 PASSIVE_SHEAR_MODULUS = 0.25
+// 0 gives a pure penalty kinematic check; 1 gives the full passive material.
+STAGE1_PASSIVE_SCALE = 0.05
 PK1_QUAD_ORDER = "FIFTH"
+
+RUN_MATERIAL_SELF_CHECKS = TRUE
+MATERIAL_SELF_CHECK_TOLERANCE = 1.0e-10
+DIAGNOSTIC_STATION_HALF_WIDTH = 0.015
 
 // Fluid and Cartesian grid
 RHO = 1.0
@@ -55,6 +67,16 @@ ERROR_ON_DT_CHANGE = FALSE
 // ex5 penalty scaling. These coefficients are used only when SWIMMER_STAGE=1.
 PENALTY_STIFFNESS = 2.5*DX/DT^2
 PENALTY_DAMPING = 1.5*DX/DT
+// FALSE/FALSE is the tethered wake-validation case. TRUE/TRUE removes the
+// discrete net force and torque once per time step for an approximate
+// prescribed free-swimming test.
+PENALTY_ZERO_NET_FORCE = FALSE
+PENALTY_ZERO_NET_TORQUE = FALSE
+
+// Used only by SWIMMER_STAGE=3. The cosine window tethers the anterior fraction.
+ACTIVE_TEST_TETHER_FRACTION = 0.10
+ACTIVE_TEST_TETHER_STIFFNESS = 2.5*DX/DT^2
+ACTIVE_TEST_TETHER_DAMPING = 1.5*DX/DT
 
 USE_IB_DELTA_FUNCTIONS = TRUE
 IB_DELTA_FUNCTION = "IB_4"
