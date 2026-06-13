@@ -35,13 +35,17 @@ PASSIVE_MU = 0.5
 PASSIVE_LAMBDA = 40.0
 PASSIVE_FIBER_MODULUS = 0.5
 PASSIVE_SHEAR_MODULUS = 0.25
-// 0 gives a pure penalty kinematic check; 1 gives the full passive material.
-STAGE1_PASSIVE_SCALE = 0.05
+// Keep the full passive material to suppress unresolved element-scale modes.
+STAGE1_PASSIVE_SCALE = 1.0
 PK1_QUAD_ORDER = "FIFTH"
 
 RUN_MATERIAL_SELF_CHECKS = TRUE
 MATERIAL_SELF_CHECK_TOLERANCE = 1.0e-10
 DIAGNOSTIC_STATION_HALF_WIDTH = 0.015
+MIN_ALLOWED_J = 0.75
+MAX_ALLOWED_J = 1.35
+MAX_TRACKING_ERROR_OVER_L = 0.02
+MAX_TRACKING_VELOCITY_ERROR_OVER_LF = 2.0
 
 // Fluid and Cartesian grid
 RHO = 1.0
@@ -61,12 +65,17 @@ DT = 2.5e-4
 START_TIME = 0.0
 END_TIME = 4.0
 GROW_DT = 1.0
-NUM_CYCLES = 1
+// Two matched IB/fluid fixed-point cycles are required for the explicit
+// velocity-dependent penalty force. One cycle develops isolated velocity
+// spikes that force the CFL timestep toward zero.
+NUM_CYCLES = 2
 ERROR_ON_DT_CHANGE = FALSE
 
-// ex5 penalty scaling. These coefficients are used only when SWIMMER_STAGE=1.
-PENALTY_STIFFNESS = 2.5*DX/DT^2
-PENALTY_DAMPING = 1.5*DX/DT
+// The velocity-dependent force is evaluated explicitly. Keep its coefficient
+// on the DX/DT scale: a sqrt(stiffness) "critical damping" estimate assumes a
+// separate structural mass and destabilizes this fluid-coupled formulation.
+PENALTY_STIFFNESS = 0.5*DX/DT^2
+PENALTY_DAMPING = 1.0*DX/DT
 // FALSE/FALSE is the tethered wake-validation case. TRUE/TRUE removes the
 // discrete net force and torque once per time step for an approximate
 // prescribed free-swimming test.
@@ -83,7 +92,7 @@ IB_DELTA_FUNCTION = "IB_4"
 SPLIT_FORCES = FALSE
 USE_JUMP_CONDITIONS = FALSE
 USE_CONSISTENT_MASS_MATRIX = TRUE
-IB_POINT_DENSITY = 3.0
+IB_POINT_DENSITY = 4.0
 ELIMINATE_PRESSURE_JUMPS = FALSE
 
 CONVECTIVE_TS_TYPE = "ADAMS_BASHFORTH"
@@ -157,10 +166,13 @@ IBFEMethod {
    use_jump_conditions = USE_JUMP_CONDITIONS
    use_consistent_mass_matrix = USE_CONSISTENT_MASS_MATRIX
    IB_point_density = IB_POINT_DENSITY
-   patch_association_cfl = 0.10
+   // Smaller values trigger a libMesh ghost-vector failure during frequent
+   // parallel element-to-patch remapping for this distributed mesh.
+   patch_association_cfl = 0.50
 }
 
 INSCollocatedHierarchyIntegrator {
+   num_cycles = NUM_CYCLES
    mu = MU
    rho = RHO
    start_time = START_TIME
@@ -186,6 +198,7 @@ INSCollocatedHierarchyIntegrator {
 }
 
 INSStaggeredHierarchyIntegrator {
+   num_cycles = NUM_CYCLES
    mu = MU
    rho = RHO
    start_time = START_TIME
@@ -218,7 +231,7 @@ Main {
    viz_dump_dirname = "viz_IB2d"
    visit_number_procs_per_file = 1
 
-   restart_dump_interval = 0
+   restart_dump_interval = 1000
    restart_dump_dirname = "restart_IB2d"
 
    data_dump_interval = 20

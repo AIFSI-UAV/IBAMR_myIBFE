@@ -132,6 +132,10 @@ struct SwimmerData
     bool run_material_self_checks;
     double material_self_check_tolerance;
     double diagnostic_station_half_width;
+    double min_allowed_J;
+    double max_allowed_J;
+    double max_tracking_error_over_L;
+    double max_tracking_velocity_error_over_Lf;
 
     SwimmerData(Pointer<Database> input_db, const ReferenceGeometry& reference_geometry)
         : stage(static_cast<SwimmerStage>(input_db->getInteger("SWIMMER_STAGE"))),
@@ -165,7 +169,12 @@ struct SwimmerData
           active_test_tether_damping(input_db->getDouble("ACTIVE_TEST_TETHER_DAMPING")),
           run_material_self_checks(input_db->getBool("RUN_MATERIAL_SELF_CHECKS")),
           material_self_check_tolerance(input_db->getDouble("MATERIAL_SELF_CHECK_TOLERANCE")),
-          diagnostic_station_half_width(input_db->getDouble("DIAGNOSTIC_STATION_HALF_WIDTH"))
+          diagnostic_station_half_width(input_db->getDouble("DIAGNOSTIC_STATION_HALF_WIDTH")),
+          min_allowed_J(input_db->getDouble("MIN_ALLOWED_J")),
+          max_allowed_J(input_db->getDouble("MAX_ALLOWED_J")),
+          max_tracking_error_over_L(input_db->getDouble("MAX_TRACKING_ERROR_OVER_L")),
+          max_tracking_velocity_error_over_Lf(
+              input_db->getDouble("MAX_TRACKING_VELOCITY_ERROR_OVER_LF"))
     {
         const int stage_number = static_cast<int>(stage);
         if (stage_number < 1 || stage_number > 3)
@@ -230,6 +239,18 @@ struct SwimmerData
         if (!(0.0 < diagnostic_station_half_width && diagnostic_station_half_width < 0.1))
         {
             TBOX_ERROR("DIAGNOSTIC_STATION_HALF_WIDTH must be in (0,0.1).\n");
+        }
+        if (!(0.0 < min_allowed_J && min_allowed_J < 1.0 && 1.0 < max_allowed_J))
+        {
+            TBOX_ERROR("Require 0 < MIN_ALLOWED_J < 1 < MAX_ALLOWED_J.\n");
+        }
+        if (max_tracking_error_over_L <= 0.0)
+        {
+            TBOX_ERROR("MAX_TRACKING_ERROR_OVER_L must be positive.\n");
+        }
+        if (max_tracking_velocity_error_over_Lf <= 0.0)
+        {
+            TBOX_ERROR("MAX_TRACKING_VELOCITY_ERROR_OVER_LF must be positive.\n");
         }
         penalty_projection_translation.zero();
         penalty_projection_center = geometry.head + 0.5 * geometry.length * geometry.tangent;
@@ -601,10 +622,20 @@ raw_penalty_force(VectorValue<double>& F,
                   const SwimmerData& data)
 {
     const TargetState target = target_state(X, time, data);
+    VectorValue<double> velocity_error = target.velocity - velocity;
+    const double characteristic_velocity = data.geometry.length * data.frequency;
+    const double velocity_error_over_Lf =
+        std::sqrt(dot2(velocity_error, velocity_error)) / characteristic_velocity;
+    if (velocity_error_over_Lf > data.max_tracking_velocity_error_over_Lf)
+    {
+        TBOX_ERROR("Penalty velocity tracking limit exceeded at time = "
+                   << time << ": |U_target-U|/(L*f) = " << velocity_error_over_Lf
+                   << ", allowed maximum = " << data.max_tracking_velocity_error_over_Lf << ".\n");
+    }
     for (unsigned int d = 0; d < NDIM; ++d)
     {
         F(d) = data.penalty_stiffness * (target.position(d) - x(d)) +
-               data.penalty_damping * (target.velocity(d) - velocity(d));
+               data.penalty_damping * velocity_error(d);
     }
 }
 
@@ -1162,7 +1193,10 @@ main(int argc, char* argv[])
                        "lambda_raw_min,lambda_raw_max,lambda_active_min,lambda_active_max,clamp_fraction,"
                        "P_matrix_mean,P_fiber_mean,P_shear_mean,"
                        "tracking_error_rms,tracking_error_max,tracking_error_rms_over_L,"
-                       "tracking_error_max_over_L,body_force_x,body_force_y,body_torque_z,body_power,"
+                       "tracking_error_max_over_L,tracking_velocity_error_rms,"
+                       "tracking_velocity_error_max,tracking_velocity_error_rms_over_Lf,"
+                       "tracking_velocity_error_max_over_Lf,"
+                       "body_force_x,body_force_y,body_torque_z,body_power,"
                        "tail_root_lateral,tail_tip_lateral,tail_lateral_over_L,tail_pitch,"
                        "target_tail_root_lateral,target_tail_tip_lateral,target_tail_pitch,"
                        "actual_curvature_mid,actual_curvature_tail,target_curvature_mid,"
@@ -1283,6 +1317,8 @@ write_diagnostics(Mesh& mesh,
     double clamp_volume = 0.0;
     double tracking_error_squared = 0.0;
     double tracking_error_max = 0.0;
+    double tracking_velocity_error_squared = 0.0;
+    double tracking_velocity_error_max = 0.0;
     double body_force_x = 0.0;
     double body_force_y = 0.0;
     double body_torque = 0.0;
@@ -1367,6 +1403,11 @@ write_diagnostics(Mesh& mesh,
                 const double error_squared = error_x * error_x + error_y * error_y;
                 tracking_error_squared += error_squared * weight;
                 tracking_error_max = std::max(tracking_error_max, std::sqrt(error_squared));
+                const VectorValue<double> velocity_error = target.velocity - velocity;
+                const double velocity_error_squared = dot2(velocity_error, velocity_error);
+                tracking_velocity_error_squared += velocity_error_squared * weight;
+                tracking_velocity_error_max =
+                    std::max(tracking_velocity_error_max, std::sqrt(velocity_error_squared));
             }
 
             body_force_x += body_force(0) * weight;
@@ -1395,9 +1436,10 @@ write_diagnostics(Mesh& mesh,
         }
     }
 
-    const std::array<double*, 10> sums = { &volume,
+    const std::array<double*, 11> sums = { &volume,
                                            &clamp_volume,
                                            &tracking_error_squared,
+                                           &tracking_velocity_error_squared,
                                            &body_force_x,
                                            &body_force_y,
                                            &body_torque,
@@ -1412,6 +1454,7 @@ write_diagnostics(Mesh& mesh,
     IBTK_MPI::sumReduction(target_station_x.data(), target_station_x.size());
     IBTK_MPI::sumReduction(target_station_y.data(), target_station_y.size());
     IBTK_MPI::maxReduction(&tracking_error_max, 1);
+    IBTK_MPI::maxReduction(&tracking_velocity_error_max, 1);
     IBTK_MPI::minReduction(&J_total_min, 1);
     IBTK_MPI::maxReduction(&J_total_max, 1);
     IBTK_MPI::minReduction(&J_elastic_min, 1);
@@ -1423,6 +1466,9 @@ write_diagnostics(Mesh& mesh,
 
     const double tracking_error_rms =
         volume > 0.0 ? std::sqrt(tracking_error_squared / volume) : 0.0;
+    const double tracking_velocity_error_rms =
+        volume > 0.0 ? std::sqrt(tracking_velocity_error_squared / volume) : 0.0;
+    const double characteristic_velocity = swimmer_data.geometry.length * swimmer_data.frequency;
     const double clamp_fraction = volume > 0.0 ? clamp_volume / volume : 0.0;
     const double P_matrix_mean = volume > 0.0 ? P_matrix_integral / volume : 0.0;
     const double P_fiber_mean = volume > 0.0 ? P_fiber_integral / volume : 0.0;
@@ -1511,7 +1557,10 @@ write_diagnostics(Mesh& mesh,
                            << P_fiber_mean << "," << P_shear_mean << "," << tracking_error_rms << ","
                            << tracking_error_max << ","
                            << tracking_error_rms / swimmer_data.geometry.length << ","
-                           << tracking_error_max / swimmer_data.geometry.length << "," << body_force_x << ","
+                           << tracking_error_max / swimmer_data.geometry.length << ","
+                           << tracking_velocity_error_rms << "," << tracking_velocity_error_max << ","
+                           << tracking_velocity_error_rms / characteristic_velocity << ","
+                           << tracking_velocity_error_max / characteristic_velocity << "," << body_force_x << ","
                            << body_force_y << "," << body_torque << "," << body_power << ","
                            << tail_root_lateral << "," << tail_tip_lateral << "," << tail_lateral_over_L << ","
                            << tail_pitch << "," << target_tail_root_lateral << ","
@@ -1519,5 +1568,30 @@ write_diagnostics(Mesh& mesh,
                            << actual_curvature_mid << "," << actual_curvature_tail << ","
                            << target_curvature_mid << "," << target_curvature_tail << "\n";
         diagnostics_stream.flush();
+    }
+
+    if (J_total_min < swimmer_data.min_allowed_J || J_total_max > swimmer_data.max_allowed_J)
+    {
+        TBOX_ERROR("Structural mesh quality limit exceeded at step "
+                   << iteration_num << ", time = " << loop_time << ": J range = [" << J_total_min << ","
+                   << J_total_max << "], allowed range = [" << swimmer_data.min_allowed_J << ","
+                   << swimmer_data.max_allowed_J << "].\n");
+    }
+    if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED &&
+        tracking_error_max / swimmer_data.geometry.length > swimmer_data.max_tracking_error_over_L)
+    {
+        TBOX_ERROR("Penalty tracking error limit exceeded at step "
+                   << iteration_num << ", time = " << loop_time << ": max error/L = "
+                   << tracking_error_max / swimmer_data.geometry.length
+                   << ", allowed maximum = " << swimmer_data.max_tracking_error_over_L << ".\n");
+    }
+    if (swimmer_data.stage == SwimmerStage::PENALTY_PRESCRIBED &&
+        tracking_velocity_error_max / characteristic_velocity >
+            swimmer_data.max_tracking_velocity_error_over_Lf)
+    {
+        TBOX_ERROR("Penalty velocity tracking limit exceeded at step "
+                   << iteration_num << ", time = " << loop_time << ": max |U_target-U|/(L*f) = "
+                   << tracking_velocity_error_max / characteristic_velocity
+                   << ", allowed maximum = " << swimmer_data.max_tracking_velocity_error_over_Lf << ".\n");
     }
 }
