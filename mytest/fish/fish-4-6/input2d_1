@@ -17,8 +17,12 @@ WAVE_COUNT = 1.0
 WAVE_PHASE0 = 0.0
 WAVE_RAMP_TIME = 2.0
 
-// Prescribed arclength-consistent gait
+// Prescribed arclength-consistent finite-thickness gait. The 2D target map is
+// area-preserving, so local thickness changes dynamically with curvature.
 PRESCRIBED_HEAD_AMPLITUDE_OVER_L = 0.0
+// This is the canonical centerline envelope tail amplitude. The actual
+// anterior-fit body-frame tail amplitude used for St should be measured from
+// the target body-frame columns in midline_target_actual.csv.
 PRESCRIBED_TAIL_AMPLITUDE_OVER_L = 0.08
 PRESCRIBED_ENVELOPE_POWER = 2.0
 
@@ -44,10 +48,12 @@ MIDLINE_USE_BODY_FRAME = TRUE
 BODY_FRAME_FIT_XI_MIN = 0.02
 BODY_FRAME_FIT_XI_MAX = 0.20
 // These are quality warning thresholds. Positive finite J is the hard
-// requirement; set ABORT_ON_MESH_QUALITY_LIMIT=TRUE for strict screening.
+// requirement. Keep ABORT_ON_MESH_QUALITY_LIMIT=FALSE for long runs so a
+// marginal warning-threshold crossing is recorded instead of killing the job;
+// set it TRUE only for short strict screening runs.
 MIN_ALLOWED_J = 0.70
 MAX_ALLOWED_J = 1.30
-ABORT_ON_MESH_QUALITY_LIMIT = TRUE
+ABORT_ON_MESH_QUALITY_LIMIT = FALSE
 MAX_TRACKING_ERROR_OVER_L = 0.005
 MAX_TRACKING_VELOCITY_ERROR_OVER_LF = 0.10
 

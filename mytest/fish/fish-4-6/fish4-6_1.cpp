@@ -132,6 +132,7 @@ struct SwimmerData
     bool penalty_projection_refit_initialized = false;
     RigidTargetFrame free_swimming_target_frame;
     RigidTargetFrame free_swimming_shape_frame;
+    double free_swimming_target_frame_time = std::numeric_limits<double>::quiet_NaN();
     double free_swimming_shape_frame_time = std::numeric_limits<double>::quiet_NaN();
 
     double passive_mu;
@@ -579,77 +580,6 @@ target_shape_state(const libMesh::Point& X, const double time, const SwimmerData
 }
 
 RigidTargetFrame
-make_shape_frame(const double time, const SwimmerData& data)
-{
-    constexpr unsigned int num_fit_points = 33;
-    double weight_sum = 0.0;
-    double s_sum = 0.0;
-    double x_sum = 0.0;
-    double y_sum = 0.0;
-    double u_sum = 0.0;
-    double v_sum = 0.0;
-    std::array<TargetState, num_fit_points> states;
-    std::array<double, num_fit_points> s_values;
-    for (unsigned int i = 0; i < num_fit_points; ++i)
-    {
-        const double alpha = static_cast<double>(i) / static_cast<double>(num_fit_points - 1);
-        const double xi =
-            data.body_frame_fit_xi_min +
-            alpha * (data.body_frame_fit_xi_max - data.body_frame_fit_xi_min);
-        const double s = xi * data.geometry.length;
-        const double weight = (i == 0 || i + 1 == num_fit_points) ? 0.5 : 1.0;
-        states[i] = target_shape_state(s, 0.0, time, data);
-        s_values[i] = s;
-        weight_sum += weight;
-        s_sum += weight * s;
-        x_sum += weight * states[i].position(0);
-        y_sum += weight * states[i].position(1);
-        u_sum += weight * states[i].velocity(0);
-        v_sum += weight * states[i].velocity(1);
-    }
-    if (!(weight_sum > 0.0))
-    {
-        TBOX_ERROR("Cannot define prescribed target shape frame: no fit points were sampled.\n");
-    }
-    const double s_centroid = s_sum / weight_sum;
-    RigidTargetFrame frame;
-    frame.origin(0) = x_sum / weight_sum;
-    frame.origin(1) = y_sum / weight_sum;
-    frame.origin_velocity(0) = u_sum / weight_sum;
-    frame.origin_velocity(1) = v_sum / weight_sum;
-
-    double cos_sum = 0.0;
-    double sin_sum = 0.0;
-    double angular_numerator = 0.0;
-    double angular_denominator = 0.0;
-    for (unsigned int i = 0; i < num_fit_points; ++i)
-    {
-        const double weight = (i == 0 || i + 1 == num_fit_points) ? 0.5 : 1.0;
-        const double a = s_values[i] - s_centroid;
-        const VectorValue<double> radius = states[i].position - frame.origin;
-        const VectorValue<double> relative_velocity = states[i].velocity - frame.origin_velocity;
-        cos_sum += weight * a * radius(0);
-        sin_sum += weight * a * radius(1);
-        angular_numerator +=
-            weight * (radius(0) * relative_velocity(1) - radius(1) * relative_velocity(0));
-        angular_denominator += weight * dot2(radius, radius);
-    }
-    const double tangent_norm = std::sqrt(cos_sum * cos_sum + sin_sum * sin_sum);
-    if (!(tangent_norm > 0.0) || !std::isfinite(tangent_norm))
-    {
-        TBOX_ERROR("Cannot define prescribed target shape frame: fitted tangent is invalid.\n");
-    }
-    frame.tangent(0) = cos_sum / tangent_norm;
-    frame.tangent(1) = sin_sum / tangent_norm;
-    frame.normal(0) = -frame.tangent(1);
-    frame.normal(1) = frame.tangent(0);
-    frame.angular_rate =
-        angular_denominator > 0.0 ? angular_numerator / angular_denominator : 0.0;
-    frame.initialized = true;
-    return frame;
-}
-
-RigidTargetFrame
 make_reference_target_frame(const SwimmerData& data)
 {
     RigidTargetFrame frame;
@@ -715,15 +645,21 @@ target_state(const libMesh::Point& X, const double time, const SwimmerData& data
     const TargetState shape_state = target_shape_state(X, time, data);
     if (data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
     {
-        const bool have_cached_shape_frame =
-            data.free_swimming_shape_frame.initialized &&
-            std::abs(data.free_swimming_shape_frame_time - time) <=
-                10.0 * std::numeric_limits<double>::epsilon() *
-                    std::max(1.0, std::abs(time));
+        if (!data.free_swimming_shape_frame.initialized ||
+            !data.free_swimming_target_frame.initialized ||
+            data.free_swimming_shape_frame_time != time ||
+            data.free_swimming_target_frame_time != time)
+        {
+            TBOX_ERROR("Free-swimming target frame cache does not match body-force stage time. "
+                       "target_state time = "
+                       << time << ", shape frame time = "
+                       << data.free_swimming_shape_frame_time
+                       << ", lab frame time = " << data.free_swimming_target_frame_time
+                       << ". update_penalty_projection() must cache both frames at the exact "
+                          "stage time used by the body-force evaluation.\n");
+        }
         return place_target_shape_state(shape_state,
-                                        have_cached_shape_frame ?
-                                            data.free_swimming_shape_frame :
-                                            make_shape_frame(time, data),
+                                        data.free_swimming_shape_frame,
                                         data.free_swimming_target_frame);
     }
 
@@ -1172,6 +1108,7 @@ update_free_swimming_target_frame(Mesh& mesh,
     data.free_swimming_shape_frame = fitted_frames.target_shape_frame;
     data.free_swimming_shape_frame_time = frame_time;
     data.free_swimming_target_frame = fitted_frames.actual_frame;
+    data.free_swimming_target_frame_time = frame_time;
 }
 
 void
@@ -1672,6 +1609,13 @@ main(int argc, char* argv[])
              << swimmer_data.geometry.head(1) << "), s=L is tail at (" << reference_tail(0) << ","
              << reference_tail(1) << ").\n";
         pout << "=== Prescribed arclength-consistent kinematics via penalty body force ===\n";
+        pout << "Kinematics definition: the finite-thickness 2D target uses an analytic "
+                "area-preserving normal offset zeta(eta,kappa), so thickness varies with "
+                "curvature instead of remaining a fixed normal distance.\n";
+        pout << "Amplitude definition: PRESCRIBED_TAIL_AMPLITUDE_OVER_L is the canonical "
+                "centerline envelope value; the anterior-fit body-frame tail amplitude must "
+                "be measured from the target columns in "
+             << swimmer_data.midline_filename << ".\n";
         pout << "Passive material scale = " << swimmer_data.passive_material_scale << ".\n";
         if (swimmer_data.prescribed_motion_mode == PrescribedMotionMode::TETHERED)
         {
@@ -1691,6 +1635,8 @@ main(int argc, char* argv[])
         {
             pout << "Passive material stress is disabled; only prescribed penalty actuation is active.\n";
         }
+        pout << "Penalty projection diagnostics marked accepted_state_recon_* are reconstructed "
+                "on accepted states; they are not the in-integrator cycle force/power history.\n";
         check_target_mapping_quality(swimmer_data);
 
         Pointer<INSHierarchyIntegrator> navier_stokes_integrator;
@@ -1843,7 +1789,8 @@ main(int argc, char* argv[])
                 if (!from_restart)
                 {
                     midline_stream
-                        << "time,s_norm,x_target,y_target,x_body,y_body,x_lab,y_lab,"
+                        << "time,s_norm,x_target_body,y_target_body,x_actual_body,y_actual_body,"
+                           "x_actual_lab,y_actual_lab,"
                            "theta_target,theta_actual,kappa_target,kappa_actual\n";
                 }
             }
@@ -1888,12 +1835,21 @@ main(int argc, char* argv[])
                     << "time,x_cm,y_cm,u_cm,v_cm,body_angle,pitch_rate,u_parallel,v_perp\n";
                 penalty_projection_stream
                     << "time,Fx_raw,Fy_raw,Mz_raw,"
-                       "Fx_used,Fy_used,Mz_used,Fx_refit,Fy_refit,Mz_refit,"
-                       "power_system_used,power_target_used,"
-                       "power_system_refit,power_target_refit,"
+                       "Fx_accepted_state_recon_used_projection,"
+                       "Fy_accepted_state_recon_used_projection,"
+                       "Mz_accepted_state_recon_used_projection,"
+                       "Fx_accepted_state_recon_refit_projection,"
+                       "Fy_accepted_state_recon_refit_projection,"
+                       "Mz_accepted_state_recon_refit_projection,"
+                       "power_system_accepted_state_recon_used_projection,"
+                       "power_target_accepted_state_recon_used_projection,"
+                       "power_system_accepted_state_recon_refit_projection,"
+                       "power_target_accepted_state_recon_refit_projection,"
                        "penalty_spring_energy,penalty_damping_loss,penalty_force_L1,"
-                       "force_projection_residual_used,torque_projection_residual_used,"
-                       "force_projection_residual_refit,torque_projection_residual_refit,"
+                       "force_projection_residual_accepted_state_recon_used_projection,"
+                       "torque_projection_residual_accepted_state_recon_used_projection,"
+                       "force_projection_residual_accepted_state_recon_refit_projection,"
+                       "torque_projection_residual_accepted_state_recon_refit_projection,"
                        "projection_translation_delta,projection_rotation_delta\n";
             }
         }
@@ -2033,16 +1989,16 @@ write_diagnostics(Mesh& mesh,
     double Fx_raw = 0.0;
     double Fy_raw = 0.0;
     double Mz_raw = 0.0;
-    double Fx_used = 0.0;
-    double Fy_used = 0.0;
-    double Mz_used = 0.0;
-    double Fx_refit = 0.0;
-    double Fy_refit = 0.0;
-    double Mz_refit = 0.0;
-    double power_system_used = 0.0;
-    double power_target_used = 0.0;
-    double power_system_refit = 0.0;
-    double power_target_refit = 0.0;
+    double Fx_recon_used_projection = 0.0;
+    double Fy_recon_used_projection = 0.0;
+    double Mz_recon_used_projection = 0.0;
+    double Fx_recon_refit_projection = 0.0;
+    double Fy_recon_refit_projection = 0.0;
+    double Mz_recon_refit_projection = 0.0;
+    double power_system_recon_used_projection = 0.0;
+    double power_target_recon_used_projection = 0.0;
+    double power_system_recon_refit_projection = 0.0;
+    double power_target_recon_refit_projection = 0.0;
     double penalty_spring_energy = 0.0;
     double penalty_damping_loss = 0.0;
     double penalty_force_L1 = 0.0;
@@ -2109,8 +2065,8 @@ write_diagnostics(Mesh& mesh,
     VectorValue<double> velocity;
     TensorValue<double> FF;
     VectorValue<double> raw_force;
-    VectorValue<double> used_force;
-    VectorValue<double> refit_force;
+    VectorValue<double> recon_used_projection_force;
+    VectorValue<double> recon_refit_projection_force;
     const libMesh::Point torque_center = swimmer_data.penalty_projection_center;
 
     for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
@@ -2188,13 +2144,13 @@ write_diagnostics(Mesh& mesh,
                 std::max(tracking_2d_shape_velocity_error_max, std::sqrt(shape_velocity_error_squared));
 
             raw_penalty_force(raw_force, x, X, velocity, loop_time, swimmer_data);
-            used_force = raw_force;
-            refit_force = raw_force;
+            recon_used_projection_force = raw_force;
+            recon_refit_projection_force = raw_force;
             if (swimmer_data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
             {
                 if (swimmer_data.penalty_projection_used_initialized)
                 {
-                    apply_penalty_projection(used_force,
+                    apply_penalty_projection(recon_used_projection_force,
                                              x,
                                              swimmer_data.penalty_projection_used_translation,
                                              swimmer_data.penalty_projection_used_rotation,
@@ -2202,7 +2158,7 @@ write_diagnostics(Mesh& mesh,
                 }
                 else
                 {
-                    apply_penalty_projection(used_force,
+                    apply_penalty_projection(recon_used_projection_force,
                                              x,
                                              swimmer_data.penalty_projection_translation,
                                              swimmer_data.penalty_projection_rotation,
@@ -2210,7 +2166,7 @@ write_diagnostics(Mesh& mesh,
                 }
                 if (swimmer_data.penalty_projection_refit_initialized)
                 {
-                    apply_penalty_projection(refit_force,
+                    apply_penalty_projection(recon_refit_projection_force,
                                              x,
                                              swimmer_data.penalty_projection_refit_translation,
                                              swimmer_data.penalty_projection_refit_rotation,
@@ -2218,7 +2174,7 @@ write_diagnostics(Mesh& mesh,
                 }
                 else
                 {
-                    apply_penalty_projection(refit_force,
+                    apply_penalty_projection(recon_refit_projection_force,
                                              x,
                                              swimmer_data.penalty_projection_translation,
                                              swimmer_data.penalty_projection_rotation,
@@ -2238,20 +2194,26 @@ write_diagnostics(Mesh& mesh,
                 swimmer_data.penalty_projection_refit_initialized ?
                     swimmer_data.penalty_projection_refit_center :
                     swimmer_data.penalty_projection_center;
-            Fx_used += used_force(0) * weight;
-            Fy_used += used_force(1) * weight;
-            Mz_used += ((x(0) - used_center(0)) * used_force(1) -
-                        (x(1) - used_center(1)) * used_force(0)) *
-                       weight;
-            Fx_refit += refit_force(0) * weight;
-            Fy_refit += refit_force(1) * weight;
-            Mz_refit += ((x(0) - refit_center(0)) * refit_force(1) -
-                         (x(1) - refit_center(1)) * refit_force(0)) *
-                        weight;
-            power_system_used += dot2(used_force, velocity) * weight;
-            power_target_used += dot2(used_force, lab_target.velocity) * weight;
-            power_system_refit += dot2(refit_force, velocity) * weight;
-            power_target_refit += dot2(refit_force, lab_target.velocity) * weight;
+            Fx_recon_used_projection += recon_used_projection_force(0) * weight;
+            Fy_recon_used_projection += recon_used_projection_force(1) * weight;
+            Mz_recon_used_projection +=
+                ((x(0) - used_center(0)) * recon_used_projection_force(1) -
+                 (x(1) - used_center(1)) * recon_used_projection_force(0)) *
+                weight;
+            Fx_recon_refit_projection += recon_refit_projection_force(0) * weight;
+            Fy_recon_refit_projection += recon_refit_projection_force(1) * weight;
+            Mz_recon_refit_projection +=
+                ((x(0) - refit_center(0)) * recon_refit_projection_force(1) -
+                 (x(1) - refit_center(1)) * recon_refit_projection_force(0)) *
+                weight;
+            power_system_recon_used_projection +=
+                dot2(recon_used_projection_force, velocity) * weight;
+            power_target_recon_used_projection +=
+                dot2(recon_used_projection_force, lab_target.velocity) * weight;
+            power_system_recon_refit_projection +=
+                dot2(recon_refit_projection_force, velocity) * weight;
+            power_target_recon_refit_projection +=
+                dot2(recon_refit_projection_force, lab_target.velocity) * weight;
             const double position_error_squared =
                 (lab_target.position(0) - x(0)) * (lab_target.position(0) - x(0)) +
                 (lab_target.position(1) - x(1)) * (lab_target.position(1) - x(1));
@@ -2311,16 +2273,16 @@ write_diagnostics(Mesh& mesh,
                                            &Fx_raw,
                                            &Fy_raw,
                                            &Mz_raw,
-                                           &Fx_used,
-                                           &Fy_used,
-                                           &Mz_used,
-                                           &Fx_refit,
-                                           &Fy_refit,
-                                           &Mz_refit,
-                                           &power_system_used,
-                                           &power_target_used,
-                                           &power_system_refit,
-                                           &power_target_refit,
+                                           &Fx_recon_used_projection,
+                                           &Fy_recon_used_projection,
+                                           &Mz_recon_used_projection,
+                                           &Fx_recon_refit_projection,
+                                           &Fy_recon_refit_projection,
+                                           &Mz_recon_refit_projection,
+                                           &power_system_recon_used_projection,
+                                           &power_target_recon_used_projection,
+                                           &power_system_recon_refit_projection,
+                                           &power_target_recon_refit_projection,
                                            &penalty_spring_energy,
                                            &penalty_damping_loss,
                                            &penalty_force_L1,
@@ -2506,17 +2468,19 @@ write_diagnostics(Mesh& mesh,
     const double projection_epsilon =
         100.0 * std::numeric_limits<double>::epsilon() *
         std::max(1.0, penalty_force_L1);
-    const double force_projection_residual_used =
-        std::sqrt(Fx_used * Fx_used + Fy_used * Fy_used) /
+    const double force_projection_residual_recon_used_projection =
+        std::sqrt(Fx_recon_used_projection * Fx_recon_used_projection +
+                  Fy_recon_used_projection * Fy_recon_used_projection) /
         (penalty_force_L1 + projection_epsilon);
-    const double torque_projection_residual_used =
-        std::abs(Mz_used) /
+    const double torque_projection_residual_recon_used_projection =
+        std::abs(Mz_recon_used_projection) /
         (swimmer_data.geometry.length * penalty_force_L1 + projection_epsilon);
-    const double force_projection_residual_refit =
-        std::sqrt(Fx_refit * Fx_refit + Fy_refit * Fy_refit) /
+    const double force_projection_residual_recon_refit_projection =
+        std::sqrt(Fx_recon_refit_projection * Fx_recon_refit_projection +
+                  Fy_recon_refit_projection * Fy_recon_refit_projection) /
         (penalty_force_L1 + projection_epsilon);
-    const double torque_projection_residual_refit =
-        std::abs(Mz_refit) /
+    const double torque_projection_residual_recon_refit_projection =
+        std::abs(Mz_recon_refit_projection) /
         (swimmer_data.geometry.length * penalty_force_L1 + projection_epsilon);
     const VectorValue<double>& projection_used_translation =
         swimmer_data.penalty_projection_used_initialized ?
@@ -2578,16 +2542,22 @@ write_diagnostics(Mesh& mesh,
                             << v_perp << "\n";
         penalty_projection_stream << loop_time << "," << Fx_raw << "," << Fy_raw << ","
                                   << Mz_raw << ","
-                                  << Fx_used << "," << Fy_used << "," << Mz_used << ","
-                                  << Fx_refit << "," << Fy_refit << "," << Mz_refit << ","
-                                  << power_system_used << "," << power_target_used << ","
-                                  << power_system_refit << "," << power_target_refit << ","
+                                  << Fx_recon_used_projection << ","
+                                  << Fy_recon_used_projection << ","
+                                  << Mz_recon_used_projection << ","
+                                  << Fx_recon_refit_projection << ","
+                                  << Fy_recon_refit_projection << ","
+                                  << Mz_recon_refit_projection << ","
+                                  << power_system_recon_used_projection << ","
+                                  << power_target_recon_used_projection << ","
+                                  << power_system_recon_refit_projection << ","
+                                  << power_target_recon_refit_projection << ","
                                   << penalty_spring_energy << "," << penalty_damping_loss << ","
                                   << penalty_force_L1 << ","
-                                  << force_projection_residual_used << ","
-                                  << torque_projection_residual_used << ","
-                                  << force_projection_residual_refit << ","
-                                  << torque_projection_residual_refit << ","
+                                  << force_projection_residual_recon_used_projection << ","
+                                  << torque_projection_residual_recon_used_projection << ","
+                                  << force_projection_residual_recon_refit_projection << ","
+                                  << torque_projection_residual_recon_refit_projection << ","
                                   << projection_translation_delta_norm << ","
                                   << projection_rotation_delta << "\n";
         tracking_arclength_stream.flush();
