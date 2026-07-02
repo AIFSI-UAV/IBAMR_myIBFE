@@ -56,8 +56,7 @@ namespace ModelData
 enum class PrescribedMotionMode
 {
     TETHERED,
-    FREE_SWIMMING,
-    FREE_SWIMMING_UNPROJECTED
+    FREE_SWIMMING
 };
 
 PrescribedMotionMode
@@ -65,17 +64,8 @@ parse_prescribed_motion_mode(const std::string& value)
 {
     if (value == "TETHERED") return PrescribedMotionMode::TETHERED;
     if (value == "FREE_SWIMMING") return PrescribedMotionMode::FREE_SWIMMING;
-    if (value == "FREE_SWIMMING_UNPROJECTED") return PrescribedMotionMode::FREE_SWIMMING_UNPROJECTED;
-    TBOX_ERROR("PRESCRIBED_MOTION_MODE must be TETHERED, FREE_SWIMMING, or "
-               "FREE_SWIMMING_UNPROJECTED.\n");
+    TBOX_ERROR("PRESCRIBED_MOTION_MODE must be TETHERED or FREE_SWIMMING.\n");
     return PrescribedMotionMode::FREE_SWIMMING;
-}
-
-bool
-target_follows_body_frame(const PrescribedMotionMode mode)
-{
-    return mode == PrescribedMotionMode::FREE_SWIMMING ||
-           mode == PrescribedMotionMode::FREE_SWIMMING_UNPROJECTED;
 }
 
 struct ReferenceGeometry
@@ -128,8 +118,6 @@ struct SwimmerData
     double prescribed_envelope_power;
     double penalty_stiffness;
     double penalty_damping;
-    bool penalty_zero_net_force;
-    bool penalty_zero_net_torque;
     VectorValue<double> penalty_projection_translation;
     double penalty_projection_rotation = 0.0;
     libMesh::Point penalty_projection_center;
@@ -162,6 +150,8 @@ struct SwimmerData
     bool midline_use_body_frame;
     double midline_body_frame_head_xi;
     double midline_body_frame_tangent_xi;
+    double body_frame_fit_xi_min;
+    double body_frame_fit_xi_max;
 
     SwimmerData(Pointer<Database> input_db, const ReferenceGeometry& reference_geometry)
         : prescribed_motion_mode(parse_prescribed_motion_mode(
@@ -178,8 +168,6 @@ struct SwimmerData
           prescribed_envelope_power(input_db->getDouble("PRESCRIBED_ENVELOPE_POWER")),
           penalty_stiffness(input_db->getDouble("PENALTY_STIFFNESS")),
           penalty_damping(input_db->getDouble("PENALTY_DAMPING")),
-          penalty_zero_net_force(false),
-          penalty_zero_net_torque(false),
           passive_mu(input_db->getDouble("PASSIVE_MU")),
           passive_lambda(input_db->getDouble("PASSIVE_LAMBDA")),
           passive_fiber_modulus(input_db->getDouble("PASSIVE_FIBER_MODULUS")),
@@ -212,10 +200,10 @@ struct SwimmerData
           midline_body_frame_head_xi(
               input_db->getDoubleWithDefault("MIDLINE_BODY_FRAME_HEAD_XI", 0.02)),
           midline_body_frame_tangent_xi(
-              input_db->getDoubleWithDefault("MIDLINE_BODY_FRAME_TANGENT_XI", 0.10))
+              input_db->getDoubleWithDefault("MIDLINE_BODY_FRAME_TANGENT_XI", 0.10)),
+          body_frame_fit_xi_min(input_db->getDoubleWithDefault("BODY_FRAME_FIT_XI_MIN", 0.02)),
+          body_frame_fit_xi_max(input_db->getDoubleWithDefault("BODY_FRAME_FIT_XI_MAX", 0.20))
     {
-        penalty_zero_net_force = prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING;
-        penalty_zero_net_torque = prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING;
         if (geometry.length <= 0.0) TBOX_ERROR("The reference mesh has nonpositive body length.\n");
         if (frequency <= 0.0) TBOX_ERROR("WAVE_FREQUENCY must be positive.\n");
         if (wave_count <= 0.0) TBOX_ERROR("WAVE_COUNT must be positive.\n");
@@ -240,14 +228,15 @@ struct SwimmerData
         {
             TBOX_ERROR("Prescribed penalty kinematics requires PENALTY_STIFFNESS > 0.\n");
         }
-        if (passive_mu <= 0.0 || passive_lambda < 0.0 || passive_fiber_modulus < 0.0 ||
-            passive_shear_modulus < 0.0)
-        {
-            TBOX_ERROR("Passive material coefficients are invalid.\n");
-        }
         if (passive_material_scale < 0.0)
         {
             TBOX_ERROR("PASSIVE_MATERIAL_SCALE must be nonnegative.\n");
+        }
+        if (passive_material_scale > 0.0 &&
+            (passive_mu <= 0.0 || passive_lambda < 0.0 || passive_fiber_modulus < 0.0 ||
+             passive_shear_modulus < 0.0))
+        {
+            TBOX_ERROR("Passive material coefficients are invalid.\n");
         }
         if (material_self_check_tolerance <= 0.0)
         {
@@ -288,13 +277,19 @@ struct SwimmerData
             TBOX_ERROR("Require 0 <= MIDLINE_BODY_FRAME_HEAD_XI < "
                        "MIDLINE_BODY_FRAME_TANGENT_XI <= 1.\n");
         }
+        if (!(0.0 <= body_frame_fit_xi_min && body_frame_fit_xi_min < body_frame_fit_xi_max &&
+              body_frame_fit_xi_max <= 1.0))
+        {
+            TBOX_ERROR("Require 0 <= BODY_FRAME_FIT_XI_MIN < BODY_FRAME_FIT_XI_MAX <= 1.\n");
+        }
         penalty_projection_translation.zero();
         penalty_projection_center = geometry.head + 0.5 * geometry.length * geometry.tangent;
         free_swimming_target_frame.origin = geometry.head;
+        const double frame_fit_center_xi = 0.5 * (body_frame_fit_xi_min + body_frame_fit_xi_max);
         for (unsigned int d = 0; d < NDIM; ++d)
         {
             free_swimming_target_frame.origin(d) +=
-                midline_body_frame_head_xi * geometry.length * geometry.tangent(d);
+                frame_fit_center_xi * geometry.length * geometry.tangent(d);
         }
         free_swimming_target_frame.tangent = geometry.tangent;
         free_swimming_target_frame.normal = geometry.normal;
@@ -312,6 +307,12 @@ struct PenaltyProjectionContext
     std::string coords_system_name;
     std::string velocity_system_name;
     SwimmerData* swimmer_data = nullptr;
+};
+
+struct BodyFrameFitResult
+{
+    RigidTargetFrame actual_frame;
+    RigidTargetFrame target_shape_frame;
 };
 
 struct MidlineSample
@@ -438,21 +439,6 @@ target_angle(const double s,
     theta_time = slope_time / (1.0 + slope * slope);
 }
 
-double
-frame_angular_rate_from_points(const libMesh::Point& origin,
-                               const libMesh::Point& tangent_point,
-                               const VectorValue<double>& origin_velocity,
-                               const VectorValue<double>& tangent_point_velocity)
-{
-    const VectorValue<double> direction = tangent_point - origin;
-    const VectorValue<double> direction_velocity = tangent_point_velocity - origin_velocity;
-    const double direction_norm_squared = dot2(direction, direction);
-    if (direction_norm_squared <= std::numeric_limits<double>::epsilon()) return 0.0;
-    return (direction(0) * direction_velocity(1) -
-            direction(1) * direction_velocity(0)) /
-           direction_norm_squared;
-}
-
 TargetState
 target_shape_state(const double s, const double eta, const double time, const SwimmerData& data)
 {
@@ -521,25 +507,70 @@ target_shape_state(const libMesh::Point& X, const double time, const SwimmerData
 RigidTargetFrame
 make_shape_frame(const double time, const SwimmerData& data)
 {
-    const TargetState origin =
-        target_shape_state(data.midline_body_frame_head_xi * data.geometry.length, 0.0, time, data);
-    const TargetState tangent_point =
-        target_shape_state(data.midline_body_frame_tangent_xi * data.geometry.length, 0.0, time, data);
-
+    constexpr unsigned int num_fit_points = 33;
+    double weight_sum = 0.0;
+    double s_sum = 0.0;
+    double x_sum = 0.0;
+    double y_sum = 0.0;
+    double u_sum = 0.0;
+    double v_sum = 0.0;
+    std::array<TargetState, num_fit_points> states;
+    std::array<double, num_fit_points> s_values;
+    for (unsigned int i = 0; i < num_fit_points; ++i)
+    {
+        const double alpha = static_cast<double>(i) / static_cast<double>(num_fit_points - 1);
+        const double xi =
+            data.body_frame_fit_xi_min +
+            alpha * (data.body_frame_fit_xi_max - data.body_frame_fit_xi_min);
+        const double s = xi * data.geometry.length;
+        const double weight = (i == 0 || i + 1 == num_fit_points) ? 0.5 : 1.0;
+        states[i] = target_shape_state(s, 0.0, time, data);
+        s_values[i] = s;
+        weight_sum += weight;
+        s_sum += weight * s;
+        x_sum += weight * states[i].position(0);
+        y_sum += weight * states[i].position(1);
+        u_sum += weight * states[i].velocity(0);
+        v_sum += weight * states[i].velocity(1);
+    }
+    if (!(weight_sum > 0.0))
+    {
+        TBOX_ERROR("Cannot define prescribed target shape frame: no fit points were sampled.\n");
+    }
+    const double s_centroid = s_sum / weight_sum;
     RigidTargetFrame frame;
-    frame.origin = origin.position;
-    frame.tangent = tangent_point.position - origin.position;
-    const double tangent_norm = std::sqrt(dot2(frame.tangent, frame.tangent));
+    frame.origin(0) = x_sum / weight_sum;
+    frame.origin(1) = y_sum / weight_sum;
+    frame.origin_velocity(0) = u_sum / weight_sum;
+    frame.origin_velocity(1) = v_sum / weight_sum;
+
+    double cos_sum = 0.0;
+    double sin_sum = 0.0;
+    double angular_numerator = 0.0;
+    double angular_denominator = 0.0;
+    for (unsigned int i = 0; i < num_fit_points; ++i)
+    {
+        const double weight = (i == 0 || i + 1 == num_fit_points) ? 0.5 : 1.0;
+        const double a = s_values[i] - s_centroid;
+        const VectorValue<double> radius = states[i].position - frame.origin;
+        const VectorValue<double> relative_velocity = states[i].velocity - frame.origin_velocity;
+        cos_sum += weight * a * radius(0);
+        sin_sum += weight * a * radius(1);
+        angular_numerator +=
+            weight * (radius(0) * relative_velocity(1) - radius(1) * relative_velocity(0));
+        angular_denominator += weight * dot2(radius, radius);
+    }
+    const double tangent_norm = std::sqrt(cos_sum * cos_sum + sin_sum * sin_sum);
     if (!(tangent_norm > 0.0) || !std::isfinite(tangent_norm))
     {
-        TBOX_ERROR("Cannot define prescribed target shape frame: frame stations are invalid.\n");
+        TBOX_ERROR("Cannot define prescribed target shape frame: fitted tangent is invalid.\n");
     }
-    frame.tangent /= tangent_norm;
+    frame.tangent(0) = cos_sum / tangent_norm;
+    frame.tangent(1) = sin_sum / tangent_norm;
     frame.normal(0) = -frame.tangent(1);
     frame.normal(1) = frame.tangent(0);
-    frame.origin_velocity = origin.velocity;
-    frame.angular_rate = frame_angular_rate_from_points(
-        origin.position, tangent_point.position, origin.velocity, tangent_point.velocity);
+    frame.angular_rate =
+        angular_denominator > 0.0 ? angular_numerator / angular_denominator : 0.0;
     frame.initialized = true;
     return frame;
 }
@@ -608,7 +639,7 @@ TargetState
 target_state(const libMesh::Point& X, const double time, const SwimmerData& data)
 {
     const TargetState shape_state = target_shape_state(X, time, data);
-    if (target_follows_body_frame(data.prescribed_motion_mode))
+    if (data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
     {
         const bool have_cached_shape_frame =
             data.free_swimming_shape_frame.initialized &&
@@ -751,11 +782,11 @@ evaluate_material(const TensorValue<double>& FF,
 void
 PK1_material_function(TensorValue<double>& PP,
                       const TensorValue<double>& FF,
-                      const libMesh::Point& /*x*/,
+                      const libMesh::Point&,
                       const libMesh::Point& X,
-                      Elem* const /*elem*/,
-                      const vector<const vector<double>*>& /*var_data*/,
-                      const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
+                      Elem* const,
+                      const vector<const vector<double>*>&,
+                      const vector<const vector<VectorValue<double> >*>&,
                       const double time,
                       void* ctx)
 {
@@ -810,9 +841,9 @@ evaluate_lag_body_force(VectorValue<double>& F,
 {
     F.zero();
     raw_penalty_force(F, x, X, velocity, time, data);
-    if (data.penalty_zero_net_force) F -= data.penalty_projection_translation;
-    if (data.penalty_zero_net_torque)
+    if (data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
     {
+        F -= data.penalty_projection_translation;
         const VectorValue<double> radius = x - data.penalty_projection_center;
         F(0) += data.penalty_projection_rotation * radius(1);
         F(1) -= data.penalty_projection_rotation * radius(0);
@@ -821,12 +852,12 @@ evaluate_lag_body_force(VectorValue<double>& F,
 
 void
 lag_body_force_function(VectorValue<double>& F,
-                        const TensorValue<double>& /*FF*/,
+                        const TensorValue<double>&,
                         const libMesh::Point& x,
                         const libMesh::Point& X,
-                        Elem* const /*elem*/,
+                        Elem* const,
                         const vector<const vector<double>*>& var_data,
-                        const vector<const vector<VectorValue<double> >*>& /*grad_var_data*/,
+                        const vector<const vector<VectorValue<double> >*>&,
                         const double time,
                         void* ctx)
 {
@@ -907,18 +938,43 @@ build_reference_geometry(const Mesh& mesh, Pointer<Database> input_db)
     return geometry;
 }
 
-void
-update_free_swimming_target_frame(Mesh& mesh,
-                                  EquationSystems& equation_systems,
-                                  const std::string& coords_system_name,
-                                  const std::string& velocity_system_name,
-                                  SwimmerData& data,
-                                  const double frame_time)
+RigidTargetFrame
+make_fitted_frame(const libMesh::Point& origin,
+                  const VectorValue<double>& origin_velocity,
+                  const double cos_sum,
+                  const double sin_sum,
+                  const double angular_numerator,
+                  const double angular_denominator,
+                  const std::string& frame_name,
+                  const double frame_time)
 {
-    if (data.prescribed_motion_mode != PrescribedMotionMode::FREE_SWIMMING) return;
-    data.free_swimming_shape_frame = make_shape_frame(frame_time, data);
-    data.free_swimming_shape_frame_time = frame_time;
+    RigidTargetFrame frame;
+    frame.origin = origin;
+    frame.origin_velocity = origin_velocity;
+    const double tangent_norm = std::sqrt(cos_sum * cos_sum + sin_sum * sin_sum);
+    if (!(tangent_norm > 0.0) || !std::isfinite(tangent_norm))
+    {
+        TBOX_ERROR("Cannot fit " << frame_name << " body frame at time = " << frame_time
+                                 << ": fitted tangent is invalid.\n");
+    }
+    frame.tangent(0) = cos_sum / tangent_norm;
+    frame.tangent(1) = sin_sum / tangent_norm;
+    frame.normal(0) = -frame.tangent(1);
+    frame.normal(1) = frame.tangent(0);
+    frame.angular_rate =
+        angular_denominator > 0.0 ? angular_numerator / angular_denominator : 0.0;
+    frame.initialized = true;
+    return frame;
+}
 
+BodyFrameFitResult
+fit_body_frames_from_quadrature(Mesh& mesh,
+                                EquationSystems& equation_systems,
+                                const std::string& coords_system_name,
+                                const std::string& velocity_system_name,
+                                const SwimmerData& data,
+                                const double frame_time)
+{
     System& X_system = equation_systems.get_system(coords_system_name);
     System& U_system = equation_systems.get_system(velocity_system_name);
     NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
@@ -935,23 +991,12 @@ update_free_swimming_target_frame(Mesh& mesh,
     const vector<libMesh::Point>& reference_points = fe->get_xyz();
     const vector<vector<double> >& phi = fe->get_phi();
 
-    const std::array<double, 2> frame_xi = { data.midline_body_frame_head_xi,
-                                             data.midline_body_frame_tangent_xi };
-    std::array<double, 2> section_weight = { 0.0, 0.0 };
-    std::array<double, 2> section_x = { 0.0, 0.0 };
-    std::array<double, 2> section_y = { 0.0, 0.0 };
-    std::array<double, 2> section_u = { 0.0, 0.0 };
-    std::array<double, 2> section_v = { 0.0, 0.0 };
-    std::array<double, 2> centerline_weight = { 0.0, 0.0 };
-    std::array<double, 2> centerline_x = { 0.0, 0.0 };
-    std::array<double, 2> centerline_y = { 0.0, 0.0 };
-    std::array<double, 2> centerline_u = { 0.0, 0.0 };
-    std::array<double, 2> centerline_v = { 0.0, 0.0 };
-
     boost::multi_array<double, 2> X_node;
     boost::multi_array<double, 2> U_node;
     VectorValue<double> x;
     VectorValue<double> velocity;
+
+    std::array<double, 11> centroid_sums = { 0.0 };
     for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
     {
         Elem* const elem = *elem_it;
@@ -961,91 +1006,136 @@ update_free_swimming_target_frame(Mesh& mesh,
         get_values_for_interpolation(U_node, *U_ghost_vec, dof_indices);
         for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
         {
+            const libMesh::Point& X = reference_points[qp];
+            const double s = reference_s(X, data);
+            const double xi = unit_coordinate(s, data);
+            if (xi < data.body_frame_fit_xi_min || xi > data.body_frame_fit_xi_max) continue;
             interpolate(x, qp, X_node, phi);
             interpolate(velocity, qp, U_node, phi);
-            const libMesh::Point& X = reference_points[qp];
-            const double xi = unit_coordinate(reference_s(X, data), data);
-            const double eta_abs = std::abs(reference_eta(X, data));
-            for (std::size_t station = 0; station < frame_xi.size(); ++station)
-            {
-                const double distance = std::abs(xi - frame_xi[station]);
-                if (distance >= data.midline_station_half_width) continue;
-                const double sk =
-                    (1.0 - distance / data.midline_station_half_width) * JxW[qp];
-                section_weight[station] += sk;
-                section_x[station] += x(0) * sk;
-                section_y[station] += x(1) * sk;
-                section_u[station] += velocity(0) * sk;
-                section_v[station] += velocity(1) * sk;
-                if (eta_abs < data.midline_centerline_half_thickness)
-                {
-                    const double ek =
-                        (1.0 - eta_abs / data.midline_centerline_half_thickness) * sk;
-                    centerline_weight[station] += ek;
-                    centerline_x[station] += x(0) * ek;
-                    centerline_y[station] += x(1) * ek;
-                    centerline_u[station] += velocity(0) * ek;
-                    centerline_v[station] += velocity(1) * ek;
-                }
-            }
+            const double eta = reference_eta(X, data);
+            const TargetState shape = target_shape_state(s, eta, frame_time, data);
+            const double weight = JxW[qp];
+            centroid_sums[0] += weight;
+            centroid_sums[1] += weight * s;
+            centroid_sums[2] += weight * eta;
+            centroid_sums[3] += weight * x(0);
+            centroid_sums[4] += weight * x(1);
+            centroid_sums[5] += weight * velocity(0);
+            centroid_sums[6] += weight * velocity(1);
+            centroid_sums[7] += weight * shape.position(0);
+            centroid_sums[8] += weight * shape.position(1);
+            centroid_sums[9] += weight * shape.velocity(0);
+            centroid_sums[10] += weight * shape.velocity(1);
         }
     }
+    IBTK_MPI::sumReduction(centroid_sums.data(), centroid_sums.size());
 
-    IBTK_MPI::sumReduction(section_weight.data(), section_weight.size());
-    IBTK_MPI::sumReduction(section_x.data(), section_x.size());
-    IBTK_MPI::sumReduction(section_y.data(), section_y.size());
-    IBTK_MPI::sumReduction(section_u.data(), section_u.size());
-    IBTK_MPI::sumReduction(section_v.data(), section_v.size());
-    IBTK_MPI::sumReduction(centerline_weight.data(), centerline_weight.size());
-    IBTK_MPI::sumReduction(centerline_x.data(), centerline_x.size());
-    IBTK_MPI::sumReduction(centerline_y.data(), centerline_y.size());
-    IBTK_MPI::sumReduction(centerline_u.data(), centerline_u.size());
-    IBTK_MPI::sumReduction(centerline_v.data(), centerline_v.size());
-
-    std::array<libMesh::Point, 2> positions;
-    std::array<VectorValue<double>, 2> velocities;
-    for (std::size_t station = 0; station < frame_xi.size(); ++station)
+    const double weight_sum = centroid_sums[0];
+    if (!(weight_sum > 0.0) || !std::isfinite(weight_sum))
     {
-        const bool have_centerline = centerline_weight[station] > 0.0;
-        const double weight = have_centerline ? centerline_weight[station] :
-                                                section_weight[station];
-        if (!(weight > 0.0))
+        TBOX_ERROR("Cannot fit body frame at time = " << frame_time
+                                                      << ": no quadrature points in BODY_FRAME_FIT_XI range ["
+                                                      << data.body_frame_fit_xi_min << ","
+                                                      << data.body_frame_fit_xi_max << "].\n");
+    }
+
+    const double ref_s_centroid = centroid_sums[1] / weight_sum;
+    const double ref_eta_centroid = centroid_sums[2] / weight_sum;
+    libMesh::Point actual_origin;
+    actual_origin(0) = centroid_sums[3] / weight_sum;
+    actual_origin(1) = centroid_sums[4] / weight_sum;
+    VectorValue<double> actual_origin_velocity;
+    actual_origin_velocity(0) = centroid_sums[5] / weight_sum;
+    actual_origin_velocity(1) = centroid_sums[6] / weight_sum;
+    libMesh::Point shape_origin;
+    shape_origin(0) = centroid_sums[7] / weight_sum;
+    shape_origin(1) = centroid_sums[8] / weight_sum;
+    VectorValue<double> shape_origin_velocity;
+    shape_origin_velocity(0) = centroid_sums[9] / weight_sum;
+    shape_origin_velocity(1) = centroid_sums[10] / weight_sum;
+
+    std::array<double, 8> fit_sums = { 0.0 };
+    for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
+    {
+        Elem* const elem = *elem_it;
+        fe->reinit(elem);
+        for (unsigned int d = 0; d < NDIM; ++d) dof_map.dof_indices(elem, dof_indices[d], d);
+        get_values_for_interpolation(X_node, *X_ghost_vec, dof_indices);
+        get_values_for_interpolation(U_node, *U_ghost_vec, dof_indices);
+        for (unsigned int qp = 0; qp < qrule->n_points(); ++qp)
         {
-            TBOX_ERROR("Unable to extract free-swimming target frame at time = "
-                       << frame_time << ", frame station s/L = " << frame_xi[station]
-                       << ". Increase MIDLINE_STATION_HALF_WIDTH or check the mesh.\n");
-        }
-        positions[station](0) = (have_centerline ? centerline_x[station] : section_x[station]) / weight;
-        positions[station](1) = (have_centerline ? centerline_y[station] : section_y[station]) / weight;
-        velocities[station](0) =
-            (have_centerline ? centerline_u[station] : section_u[station]) / weight;
-        velocities[station](1) =
-            (have_centerline ? centerline_v[station] : section_v[station]) / weight;
-    }
+            const libMesh::Point& X = reference_points[qp];
+            const double s = reference_s(X, data);
+            const double xi = unit_coordinate(s, data);
+            if (xi < data.body_frame_fit_xi_min || xi > data.body_frame_fit_xi_max) continue;
+            interpolate(x, qp, X_node, phi);
+            interpolate(velocity, qp, U_node, phi);
+            const double eta = reference_eta(X, data);
+            const TargetState shape = target_shape_state(s, eta, frame_time, data);
+            const double a_s = s - ref_s_centroid;
+            const double a_eta = eta - ref_eta_centroid;
+            const double weight = JxW[qp];
 
-    RigidTargetFrame frame;
-    frame.origin = positions[0];
-    frame.tangent = positions[1] - positions[0];
-    const double tangent_norm = std::sqrt(dot2(frame.tangent, frame.tangent));
-    if (!(tangent_norm > 0.0) || !std::isfinite(tangent_norm))
-    {
-        TBOX_ERROR("Cannot update free-swimming target frame at time = "
-                   << frame_time << ": frame stations are coincident or invalid.\n");
+            const VectorValue<double> actual_radius = x - actual_origin;
+            const VectorValue<double> actual_relative_velocity =
+                velocity - actual_origin_velocity;
+            fit_sums[0] += weight * (a_s * actual_radius(0) + a_eta * actual_radius(1));
+            fit_sums[1] += weight * (a_s * actual_radius(1) - a_eta * actual_radius(0));
+            fit_sums[2] += weight * (actual_radius(0) * actual_relative_velocity(1) -
+                                     actual_radius(1) * actual_relative_velocity(0));
+            fit_sums[3] += weight * dot2(actual_radius, actual_radius);
+
+            const VectorValue<double> shape_radius = shape.position - shape_origin;
+            const VectorValue<double> shape_relative_velocity =
+                shape.velocity - shape_origin_velocity;
+            fit_sums[4] += weight * (a_s * shape_radius(0) + a_eta * shape_radius(1));
+            fit_sums[5] += weight * (a_s * shape_radius(1) - a_eta * shape_radius(0));
+            fit_sums[6] += weight * (shape_radius(0) * shape_relative_velocity(1) -
+                                     shape_radius(1) * shape_relative_velocity(0));
+            fit_sums[7] += weight * dot2(shape_radius, shape_radius);
+        }
     }
-    frame.tangent /= tangent_norm;
-    frame.normal(0) = -frame.tangent(1);
-    frame.normal(1) = frame.tangent(0);
-    frame.origin_velocity = velocities[0];
-    frame.angular_rate = frame_angular_rate_from_points(
-        positions[0], positions[1], velocities[0], velocities[1]);
-    frame.initialized = true;
-    data.free_swimming_target_frame = frame;
+    IBTK_MPI::sumReduction(fit_sums.data(), fit_sums.size());
+
+    BodyFrameFitResult result;
+    result.actual_frame = make_fitted_frame(actual_origin,
+                                            actual_origin_velocity,
+                                            fit_sums[0],
+                                            fit_sums[1],
+                                            fit_sums[2],
+                                            fit_sums[3],
+                                            "actual",
+                                            frame_time);
+    result.target_shape_frame = make_fitted_frame(shape_origin,
+                                                  shape_origin_velocity,
+                                                  fit_sums[4],
+                                                  fit_sums[5],
+                                                  fit_sums[6],
+                                                  fit_sums[7],
+                                                  "target-shape",
+                                                  frame_time);
+    return result;
+}
+
+void
+update_free_swimming_target_frame(Mesh& mesh,
+                                  EquationSystems& equation_systems,
+                                  const std::string& coords_system_name,
+                                  const std::string& velocity_system_name,
+                                  SwimmerData& data,
+                                  const double frame_time)
+{
+    const BodyFrameFitResult fitted_frames = fit_body_frames_from_quadrature(
+        mesh, equation_systems, coords_system_name, velocity_system_name, data, frame_time);
+    data.free_swimming_shape_frame = fitted_frames.target_shape_frame;
+    data.free_swimming_shape_frame_time = frame_time;
+    data.free_swimming_target_frame = fitted_frames.actual_frame;
 }
 
 void
 update_penalty_projection(const double current_time,
                           const double new_time,
-                          const int /*num_cycles*/,
+                          const int,
                           void* ctx)
 {
     auto& projection = *static_cast<PenaltyProjectionContext*>(ctx);
@@ -1056,19 +1146,12 @@ update_penalty_projection(const double current_time,
     Mesh& mesh = *projection.mesh;
     EquationSystems& equation_systems = *projection.equation_systems;
     const double projection_time = 0.5 * (current_time + new_time);
-    if (target_follows_body_frame(data.prescribed_motion_mode))
-    {
-        update_free_swimming_target_frame(mesh,
-                                          equation_systems,
-                                          projection.coords_system_name,
-                                          projection.velocity_system_name,
-                                          data,
-                                          projection_time);
-    }
-    if (!data.penalty_zero_net_force && !data.penalty_zero_net_torque)
-    {
-        return;
-    }
+    update_free_swimming_target_frame(mesh,
+                                      equation_systems,
+                                      projection.coords_system_name,
+                                      projection.velocity_system_name,
+                                      data,
+                                      projection_time);
 
     System& X_system = equation_systems.get_system(projection.coords_system_name);
     System& U_system = equation_systems.get_system(projection.velocity_system_name);
@@ -1123,13 +1206,9 @@ update_penalty_projection(const double current_time,
     for (unsigned int d = 0; d < NDIM; ++d)
     {
         data.penalty_projection_center(d) = center_integral[d] / volume;
-        if (data.penalty_zero_net_force)
-        {
-            data.penalty_projection_translation(d) = force_integral[d] / volume;
-        }
+        data.penalty_projection_translation(d) = force_integral[d] / volume;
     }
 
-    if (!data.penalty_zero_net_torque) return;
     double torque = 0.0;
     double polar_moment = 0.0;
     for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
@@ -1144,7 +1223,7 @@ update_penalty_projection(const double current_time,
             interpolate(x, qp, X_node, phi);
             interpolate(velocity, qp, U_node, phi);
             raw_penalty_force(raw_force, x, reference_points[qp], velocity, projection_time, data);
-            if (data.penalty_zero_net_force) raw_force -= data.penalty_projection_translation;
+            raw_force -= data.penalty_projection_translation;
             const VectorValue<double> radius = x - data.penalty_projection_center;
             const double weight = JxW[qp];
             torque += (radius(0) * raw_force(1) - radius(1) * raw_force(0)) * weight;
@@ -1158,9 +1237,9 @@ update_penalty_projection(const double current_time,
 }
 
 void
-postprocess_penalty_projection(const double /*current_time*/,
+postprocess_penalty_projection(const double,
                                const double new_time,
-                               const bool /*skip_synchronize_new_state_data*/,
+                               const bool,
                                const int num_cycles,
                                void* ctx)
 {
@@ -1246,8 +1325,7 @@ reference_centerline_point(const double xi, const SwimmerData& swimmer_data)
 
 MidlineFrame
 make_midline_frame(const libMesh::Point& origin,
-                   const libMesh::Point& tangent_point,
-                   const SwimmerData& swimmer_data)
+                   const libMesh::Point& tangent_point)
 {
     MidlineFrame frame;
     frame.origin = origin;
@@ -1261,7 +1339,6 @@ make_midline_frame(const libMesh::Point& origin,
     frame.tangent /= tangent_norm;
     frame.normal(0) = -frame.tangent(1);
     frame.normal(1) = frame.tangent(0);
-    (void)swimmer_data;
     return frame;
 }
 
@@ -1275,11 +1352,35 @@ make_reference_midline_frame(const SwimmerData& swimmer_data)
     return frame;
 }
 
+MidlineFrame
+make_midline_frame_from_rigid_frame(const RigidTargetFrame& rigid_frame)
+{
+    MidlineFrame frame;
+    frame.origin = rigid_frame.origin;
+    frame.tangent = rigid_frame.tangent;
+    frame.normal = rigid_frame.normal;
+    return frame;
+}
+
 std::array<double, 2>
 body_frame_coordinates(const libMesh::Point& point, const MidlineFrame& frame)
 {
     const VectorValue<double> displacement = point - frame.origin;
     return { dot2(displacement, frame.tangent), dot2(displacement, frame.normal) };
+}
+
+std::array<double, 2>
+deformation_velocity_components(const libMesh::Point& point,
+                                const VectorValue<double>& velocity,
+                                const RigidTargetFrame& frame)
+{
+    const VectorValue<double> radius = point - frame.origin;
+    VectorValue<double> rigid_velocity;
+    rigid_velocity(0) = frame.origin_velocity(0) - frame.angular_rate * radius(1);
+    rigid_velocity(1) = frame.origin_velocity(1) + frame.angular_rate * radius(0);
+    const VectorValue<double> deformation_velocity = velocity - rigid_velocity;
+    return { dot2(deformation_velocity, frame.tangent),
+             dot2(deformation_velocity, frame.normal) };
 }
 
 double
@@ -1315,21 +1416,6 @@ midline_curvature(const std::vector<libMesh::Point>& points, const std::size_t i
     const std::size_t i2 = index + 1 < points.size() ? index + 1 : points.size() - 1;
     if (i0 == i1 || i1 == i2) return 0.0;
     return point_curvature(points[i0], points[i1], points[i2]);
-}
-
-double
-frame_angular_rate(const libMesh::Point& origin,
-                   const libMesh::Point& tangent_point,
-                   const VectorValue<double>& origin_velocity,
-                   const VectorValue<double>& tangent_point_velocity)
-{
-    const VectorValue<double> direction = tangent_point - origin;
-    const VectorValue<double> direction_velocity = tangent_point_velocity - origin_velocity;
-    const double direction_norm_squared = dot2(direction, direction);
-    if (direction_norm_squared <= std::numeric_limits<double>::epsilon()) return 0.0;
-    return (direction(0) * direction_velocity(1) -
-            direction(1) * direction_velocity(0)) /
-           direction_norm_squared;
 }
 
 int
@@ -1402,8 +1488,7 @@ write_midline_output(const std::vector<MidlineSample>& samples,
     if (swimmer_data.midline_use_body_frame)
     {
         actual_frame = make_midline_frame(samples[frame_head_index].position,
-                                          samples[frame_tangent_index].position,
-                                          swimmer_data);
+                                          samples[frame_tangent_index].position);
     }
 
     std::vector<libMesh::Point> actual_points(num_output_stations);
@@ -1424,8 +1509,7 @@ write_midline_output(const std::vector<MidlineSample>& samples,
     if (swimmer_data.midline_use_body_frame)
     {
         target_frame = make_midline_frame(target_points_all[frame_head_index],
-                                          target_points_all[frame_tangent_index],
-                                          swimmer_data);
+                                          target_points_all[frame_tangent_index]);
     }
 
     if (IBTK_MPI::getRank() != 0) return;
@@ -1466,7 +1550,6 @@ write_midline_output(const std::vector<MidlineSample>& samples,
                        << kappa_target << "," << kappa_actual << "\n";
     }
     midline_stream.flush();
-    (void)iteration_num;
 }
 
 void
@@ -1546,19 +1629,20 @@ main(int argc, char* argv[])
         {
             pout << "Prescribed motion mode = TETHERED. The penalty target is fixed in the lab frame.\n";
         }
-        else if (swimmer_data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
+        else
         {
             pout << "Prescribed motion mode = FREE_SWIMMING. Net penalty force and torque are "
                     "projected out each step, and the target shape is placed in the "
                     "instantaneous body frame so the fish can recoil and swim.\n";
         }
+        if (swimmer_data.passive_material_scale > 0.0)
+        {
+            run_material_self_checks(swimmer_data);
+        }
         else
         {
-            pout << "Prescribed motion mode = FREE_SWIMMING_UNPROJECTED. The target shape is "
-                    "placed in the instantaneous body frame, but net penalty force and torque "
-                    "are not projected out.\n";
+            pout << "Passive material stress is disabled; only prescribed penalty actuation is active.\n";
         }
-        run_material_self_checks(swimmer_data);
         check_target_mapping_quality(swimmer_data);
 
         Pointer<INSHierarchyIntegrator> navier_stokes_integrator;
@@ -1618,11 +1702,14 @@ main(int argc, char* argv[])
             &mesh, equation_systems, coords_system_name, velocity_system_name, &swimmer_data
         };
 
-        IBFEMethod::PK1StressFcnData PK1_stress_data(
-            PK1_material_function, vector<SystemData>(), swimmer_data_ptr);
-        PK1_stress_data.quad_order =
-            Utility::string_to_enum<libMesh::Order>(input_db->getString("PK1_QUAD_ORDER"));
-        ib_method_ops->registerPK1StressFunction(PK1_stress_data);
+        if (swimmer_data.passive_material_scale > 0.0)
+        {
+            IBFEMethod::PK1StressFcnData PK1_stress_data(
+                PK1_material_function, vector<SystemData>(), swimmer_data_ptr);
+            PK1_stress_data.quad_order =
+                Utility::string_to_enum<libMesh::Order>(input_db->getString("PK1_QUAD_ORDER"));
+            ib_method_ops->registerPK1StressFunction(PK1_stress_data);
+        }
 
         vector<int> velocity_variables(NDIM);
         for (unsigned int d = 0; d < NDIM; ++d) velocity_variables[d] = d;
@@ -1630,16 +1717,15 @@ main(int argc, char* argv[])
         IBFEMethod::LagBodyForceFcnData body_force_data(
             lag_body_force_function, system_data, swimmer_data_ptr);
         ib_method_ops->registerLagBodyForceFunction(body_force_data);
-        if (target_follows_body_frame(swimmer_data.prescribed_motion_mode) ||
-            swimmer_data.penalty_zero_net_force || swimmer_data.penalty_zero_net_torque)
+        if (swimmer_data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
         {
             time_integrator->registerPreprocessIntegrateHierarchyCallback(
                 update_penalty_projection, &penalty_projection_context);
             time_integrator->registerIntegrateHierarchyCallback(
                 update_penalty_projection, &penalty_projection_context);
+            time_integrator->registerPostprocessIntegrateHierarchyCallback(
+                postprocess_penalty_projection, &penalty_projection_context);
         }
-        time_integrator->registerPostprocessIntegrateHierarchyCallback(
-            postprocess_penalty_projection, &penalty_projection_context);
 
         if (input_db->getBoolWithDefault("ELIMINATE_PRESSURE_JUMPS", false))
         {
@@ -1683,8 +1769,7 @@ main(int argc, char* argv[])
 
         ib_method_ops->initializeFEData();
         time_integrator->initializePatchHierarchy(patch_hierarchy, gridding_algorithm);
-        if (target_follows_body_frame(swimmer_data.prescribed_motion_mode) ||
-            swimmer_data.penalty_zero_net_force || swimmer_data.penalty_zero_net_torque)
+        if (swimmer_data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
         {
             const double initial_time = time_integrator->getIntegratorTime();
             update_penalty_projection(initial_time, initial_time, 1, &penalty_projection_context);
@@ -1739,7 +1824,15 @@ main(int argc, char* argv[])
             if (!from_restart)
             {
                 tracking_arclength_stream
-                    << "time,tracking_rms_over_L,tracking_max_over_L,velocity_rms_over_Lf,"
+                    << "time,lab_tracking_2d_rms_over_L,lab_tracking_2d_max_over_L,"
+                       "lab_tracking_velocity_2d_rms_over_Lf,"
+                       "lab_tracking_velocity_2d_max_over_Lf,"
+                       "shape_tracking_2d_rms_over_L,shape_tracking_2d_max_over_L,"
+                       "shape_tracking_velocity_2d_rms_over_Lf,"
+                       "shape_tracking_velocity_2d_max_over_Lf,"
+                       "tracking_midline_rms_over_L,tracking_midline_max_over_L,"
+                       "tracking_midline_velocity_rms_over_Lf,"
+                       "tracking_midline_velocity_max_over_Lf,"
                        "L_target_rel_error,L_actual_rel_error,lambda_actual_min,lambda_actual_max,"
                        "J_min,area_error\n";
                 rigid_motion_stream
@@ -1868,6 +1961,13 @@ write_diagnostics(Mesh& mesh,
     const vector<vector<double> >& phi = fe->get_phi();
     const vector<vector<VectorValue<double> > >& dphi = fe->get_dphi();
 
+    const BodyFrameFitResult body_frame_fit = fit_body_frames_from_quadrature(
+        mesh, *equation_systems, coords_system_name, velocity_system_name, swimmer_data, loop_time);
+    const MidlineFrame fitted_actual_frame =
+        make_midline_frame_from_rigid_frame(body_frame_fit.actual_frame);
+    const MidlineFrame fitted_target_shape_frame =
+        make_midline_frame_from_rigid_frame(body_frame_fit.target_shape_frame);
+
     double volume = 0.0;
     double current_area = 0.0;
     double cm_x_integral = 0.0;
@@ -1884,6 +1984,14 @@ write_diagnostics(Mesh& mesh,
     double penalty_force_L1 = 0.0;
     double J_total_min = std::numeric_limits<double>::max();
     double J_total_max = -std::numeric_limits<double>::max();
+    double tracking_2d_lab_error_squared = 0.0;
+    double tracking_2d_lab_error_max = 0.0;
+    double tracking_2d_lab_velocity_error_squared = 0.0;
+    double tracking_2d_lab_velocity_error_max = 0.0;
+    double tracking_2d_shape_error_squared = 0.0;
+    double tracking_2d_shape_error_max = 0.0;
+    double tracking_2d_shape_velocity_error_squared = 0.0;
+    double tracking_2d_shape_velocity_error_max = 0.0;
 
     const int ml_num_output = swimmer_data.midline_num_stations;
     std::vector<double> ml_station_xi;
@@ -1954,11 +2062,53 @@ write_diagnostics(Mesh& mesh,
             J_total_min = std::min(J_total_min, J_total);
             J_total_max = std::max(J_total_max, J_total);
 
+            const TargetState lab_target = target_state(X, loop_time, swimmer_data);
+            const double lab_position_error_squared =
+                (lab_target.position(0) - x(0)) * (lab_target.position(0) - x(0)) +
+                (lab_target.position(1) - x(1)) * (lab_target.position(1) - x(1));
+            const double lab_velocity_error_squared =
+                (lab_target.velocity(0) - velocity(0)) * (lab_target.velocity(0) - velocity(0)) +
+                (lab_target.velocity(1) - velocity(1)) * (lab_target.velocity(1) - velocity(1));
+            tracking_2d_lab_error_squared += lab_position_error_squared * weight;
+            tracking_2d_lab_error_max =
+                std::max(tracking_2d_lab_error_max, std::sqrt(lab_position_error_squared));
+            tracking_2d_lab_velocity_error_squared += lab_velocity_error_squared * weight;
+            tracking_2d_lab_velocity_error_max =
+                std::max(tracking_2d_lab_velocity_error_max, std::sqrt(lab_velocity_error_squared));
+
+            const TargetState shape_target = target_shape_state(X, loop_time, swimmer_data);
+            const std::array<double, 2> actual_shape_position =
+                body_frame_coordinates(x, fitted_actual_frame);
+            const std::array<double, 2> target_shape_position =
+                body_frame_coordinates(shape_target.position, fitted_target_shape_frame);
+            const double shape_position_error_squared =
+                (target_shape_position[0] - actual_shape_position[0]) *
+                    (target_shape_position[0] - actual_shape_position[0]) +
+                (target_shape_position[1] - actual_shape_position[1]) *
+                    (target_shape_position[1] - actual_shape_position[1]);
+            const std::array<double, 2> actual_shape_velocity =
+                deformation_velocity_components(x, velocity, body_frame_fit.actual_frame);
+            const std::array<double, 2> target_shape_velocity =
+                deformation_velocity_components(shape_target.position,
+                                                shape_target.velocity,
+                                                body_frame_fit.target_shape_frame);
+            const double shape_velocity_error_squared =
+                (target_shape_velocity[0] - actual_shape_velocity[0]) *
+                    (target_shape_velocity[0] - actual_shape_velocity[0]) +
+                (target_shape_velocity[1] - actual_shape_velocity[1]) *
+                    (target_shape_velocity[1] - actual_shape_velocity[1]);
+            tracking_2d_shape_error_squared += shape_position_error_squared * weight;
+            tracking_2d_shape_error_max =
+                std::max(tracking_2d_shape_error_max, std::sqrt(shape_position_error_squared));
+            tracking_2d_shape_velocity_error_squared += shape_velocity_error_squared * weight;
+            tracking_2d_shape_velocity_error_max =
+                std::max(tracking_2d_shape_velocity_error_max, std::sqrt(shape_velocity_error_squared));
+
             raw_penalty_force(raw_force, x, X, velocity, loop_time, swimmer_data);
             projected_force = raw_force;
-            if (swimmer_data.penalty_zero_net_force) projected_force -= swimmer_data.penalty_projection_translation;
-            if (swimmer_data.penalty_zero_net_torque)
+            if (swimmer_data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
             {
+                projected_force -= swimmer_data.penalty_projection_translation;
                 const VectorValue<double> radius = x - swimmer_data.penalty_projection_center;
                 projected_force(0) += swimmer_data.penalty_projection_rotation * radius(1);
                 projected_force(1) -= swimmer_data.penalty_projection_rotation * radius(0);
@@ -2001,7 +2151,7 @@ write_diagnostics(Mesh& mesh,
         }
     }
 
-    const std::array<double*, 14> sums = { &volume,
+    const std::array<double*, 18> sums = { &volume,
                                            &current_area,
                                            &cm_x_integral,
                                            &cm_y_integral,
@@ -2014,10 +2164,18 @@ write_diagnostics(Mesh& mesh,
                                            &Fy_projected,
                                            &Mz_projected,
                                            &penalty_power,
-                                           &penalty_force_L1 };
+                                           &penalty_force_L1,
+                                           &tracking_2d_lab_error_squared,
+                                           &tracking_2d_lab_velocity_error_squared,
+                                           &tracking_2d_shape_error_squared,
+                                           &tracking_2d_shape_velocity_error_squared };
     for (double* value : sums) IBTK_MPI::sumReduction(value, 1);
     IBTK_MPI::minReduction(&J_total_min, 1);
     IBTK_MPI::maxReduction(&J_total_max, 1);
+    IBTK_MPI::maxReduction(&tracking_2d_lab_error_max, 1);
+    IBTK_MPI::maxReduction(&tracking_2d_lab_velocity_error_max, 1);
+    IBTK_MPI::maxReduction(&tracking_2d_shape_error_max, 1);
+    IBTK_MPI::maxReduction(&tracking_2d_shape_velocity_error_max, 1);
     IBTK_MPI::sumReduction(ml_section_weight.data(), ml_section_weight.size());
     IBTK_MPI::sumReduction(ml_section_x.data(), ml_section_x.size());
     IBTK_MPI::sumReduction(ml_section_y.data(), ml_section_y.size());
@@ -2044,54 +2202,34 @@ write_diagnostics(Mesh& mesh,
     center_velocity(0) = u_x_integral / volume;
     center_velocity(1) = u_y_integral / volume;
     MidlineFrame actual_frame = make_reference_midline_frame(swimmer_data);
+    RigidTargetFrame actual_tracking_frame = make_reference_target_frame(swimmer_data);
     if (swimmer_data.midline_use_body_frame)
     {
-        actual_frame = make_midline_frame(ml_samples[ml_frame_head_index].position,
-                                          ml_samples[ml_frame_tangent_index].position,
-                                          swimmer_data);
+        actual_frame = fitted_actual_frame;
+        actual_tracking_frame = body_frame_fit.actual_frame;
     }
-    libMesh::Point actual_frame_origin = actual_frame.origin;
-    VectorValue<double> actual_frame_origin_velocity;
-    actual_frame_origin_velocity.zero();
-    double actual_frame_pitch_rate = 0.0;
-    if (swimmer_data.midline_use_body_frame)
-    {
-        actual_frame_origin = ml_samples[ml_frame_head_index].position;
-        actual_frame_origin_velocity = ml_samples[ml_frame_head_index].velocity;
-        actual_frame_pitch_rate = frame_angular_rate(
-            ml_samples[ml_frame_head_index].position,
-            ml_samples[ml_frame_tangent_index].position,
-            ml_samples[ml_frame_head_index].velocity,
-            ml_samples[ml_frame_tangent_index].velocity);
-    }
-    const double body_angle = std::atan2(dot2(actual_frame.tangent, swimmer_data.geometry.normal),
-                                         dot2(actual_frame.tangent, swimmer_data.geometry.tangent));
+    const double body_angle = std::atan2(dot2(body_frame_fit.actual_frame.tangent,
+                                             swimmer_data.geometry.normal),
+                                         dot2(body_frame_fit.actual_frame.tangent,
+                                              swimmer_data.geometry.tangent));
+    const double actual_frame_pitch_rate = body_frame_fit.actual_frame.angular_rate;
 
     std::vector<libMesh::Point> actual_points(ml_num_output);
     std::vector<libMesh::Point> target_points(ml_num_output);
     std::vector<TargetState> target_samples(ml_station_xi.size());
+    std::vector<TargetState> target_shape_samples(ml_station_xi.size());
     for (std::size_t station = 0; station < ml_station_xi.size(); ++station)
     {
         const libMesh::Point X = reference_centerline_point(ml_station_xi[station], swimmer_data);
         target_samples[station] = target_state(X, loop_time, swimmer_data);
+        target_shape_samples[station] = target_shape_state(X, loop_time, swimmer_data);
     }
     MidlineFrame target_frame = make_reference_midline_frame(swimmer_data);
-    libMesh::Point target_frame_origin = target_frame.origin;
-    VectorValue<double> target_frame_origin_velocity;
-    target_frame_origin_velocity.zero();
-    double target_frame_pitch_rate = 0.0;
+    RigidTargetFrame target_tracking_frame = make_reference_target_frame(swimmer_data);
     if (swimmer_data.midline_use_body_frame)
     {
-        target_frame = make_midline_frame(target_samples[ml_frame_head_index].position,
-                                          target_samples[ml_frame_tangent_index].position,
-                                          swimmer_data);
-        target_frame_origin = target_samples[ml_frame_head_index].position;
-        target_frame_origin_velocity = target_samples[ml_frame_head_index].velocity;
-        target_frame_pitch_rate = frame_angular_rate(
-            target_samples[ml_frame_head_index].position,
-            target_samples[ml_frame_tangent_index].position,
-            target_samples[ml_frame_head_index].velocity,
-            target_samples[ml_frame_tangent_index].velocity);
+        target_frame = fitted_target_shape_frame;
+        target_tracking_frame = body_frame_fit.target_shape_frame;
     }
     for (int station = 0; station < ml_num_output; ++station)
     {
@@ -2123,54 +2261,62 @@ write_diagnostics(Mesh& mesh,
     double tracking_error_squared = 0.0;
     double tracking_error_max = 0.0;
     double tracking_velocity_error_squared = 0.0;
+    double tracking_velocity_error_max = 0.0;
     for (int station = 0; station < ml_num_output; ++station)
     {
         const std::size_t index = static_cast<std::size_t>(station);
-        const std::array<double, 2> actual_body =
-            body_frame_coordinates(actual_points[index], actual_frame);
-        const std::array<double, 2> target_body =
-            body_frame_coordinates(target_points[index], target_frame);
-        const double ex = target_body[0] - actual_body[0];
-        const double ey = target_body[1] - actual_body[1];
+        double ex = 0.0;
+        double ey = 0.0;
+        double eu = 0.0;
+        double ev = 0.0;
+        if (swimmer_data.midline_use_body_frame)
+        {
+            const std::array<double, 2> actual_body =
+                body_frame_coordinates(actual_points[index], actual_frame);
+            const std::array<double, 2> target_body =
+                body_frame_coordinates(target_shape_samples[index].position, target_frame);
+            ex = target_body[0] - actual_body[0];
+            ey = target_body[1] - actual_body[1];
+
+            const std::array<double, 2> actual_velocity_body =
+                deformation_velocity_components(actual_points[index],
+                                                ml_samples[index].velocity,
+                                                actual_tracking_frame);
+            const std::array<double, 2> target_velocity_body =
+                deformation_velocity_components(target_shape_samples[index].position,
+                                                target_shape_samples[index].velocity,
+                                                target_tracking_frame);
+            eu = target_velocity_body[0] - actual_velocity_body[0];
+            ev = target_velocity_body[1] - actual_velocity_body[1];
+        }
+        else
+        {
+            ex = target_points[index](0) - actual_points[index](0);
+            ey = target_points[index](1) - actual_points[index](1);
+            eu = target_samples[index].velocity(0) - ml_samples[index].velocity(0);
+            ev = target_samples[index].velocity(1) - ml_samples[index].velocity(1);
+        }
         const double error_squared = ex * ex + ey * ey;
         tracking_error_squared += error_squared;
         tracking_error_max = std::max(tracking_error_max, std::sqrt(error_squared));
-
-        VectorValue<double> actual_rigid_velocity;
-        const VectorValue<double> actual_radius = actual_points[index] - actual_frame_origin;
-        actual_rigid_velocity(0) =
-            actual_frame_origin_velocity(0) - actual_frame_pitch_rate * actual_radius(1);
-        actual_rigid_velocity(1) =
-            actual_frame_origin_velocity(1) + actual_frame_pitch_rate * actual_radius(0);
-        VectorValue<double> actual_deformation_velocity;
-        actual_deformation_velocity(0) = ml_samples[index].velocity(0) - actual_rigid_velocity(0);
-        actual_deformation_velocity(1) = ml_samples[index].velocity(1) - actual_rigid_velocity(1);
-
-        VectorValue<double> target_rigid_velocity;
-        const VectorValue<double> target_radius = target_points[index] - target_frame_origin;
-        target_rigid_velocity(0) =
-            target_frame_origin_velocity(0) - target_frame_pitch_rate * target_radius(1);
-        target_rigid_velocity(1) =
-            target_frame_origin_velocity(1) + target_frame_pitch_rate * target_radius(0);
-        VectorValue<double> target_deformation_velocity;
-        target_deformation_velocity(0) =
-            target_samples[index].velocity(0) - target_rigid_velocity(0);
-        target_deformation_velocity(1) =
-            target_samples[index].velocity(1) - target_rigid_velocity(1);
-
-        const double actual_u_body = dot2(actual_deformation_velocity, actual_frame.tangent);
-        const double actual_v_body = dot2(actual_deformation_velocity, actual_frame.normal);
-        const double target_u_body = dot2(target_deformation_velocity, target_frame.tangent);
-        const double target_v_body = dot2(target_deformation_velocity, target_frame.normal);
-        const double eu = target_u_body - actual_u_body;
-        const double ev = target_v_body - actual_v_body;
-        tracking_velocity_error_squared += eu * eu + ev * ev;
+        const double velocity_error_squared = eu * eu + ev * ev;
+        tracking_velocity_error_squared += velocity_error_squared;
+        tracking_velocity_error_max =
+            std::max(tracking_velocity_error_max, std::sqrt(velocity_error_squared));
     }
     const double tracking_error_rms =
         std::sqrt(tracking_error_squared / static_cast<double>(ml_num_output));
     const double tracking_velocity_error_rms =
         std::sqrt(tracking_velocity_error_squared / static_cast<double>(ml_num_output));
     const double characteristic_velocity = swimmer_data.geometry.length * swimmer_data.frequency;
+    const double tracking_2d_lab_error_rms =
+        std::sqrt(tracking_2d_lab_error_squared / volume);
+    const double tracking_2d_lab_velocity_error_rms =
+        std::sqrt(tracking_2d_lab_velocity_error_squared / volume);
+    const double tracking_2d_shape_error_rms =
+        std::sqrt(tracking_2d_shape_error_squared / volume);
+    const double tracking_2d_shape_velocity_error_rms =
+        std::sqrt(tracking_2d_shape_velocity_error_squared / volume);
     const double L_target_rel_error = (L_target - swimmer_data.geometry.length) / swimmer_data.geometry.length;
     const double L_actual_rel_error = (L_actual - swimmer_data.geometry.length) / swimmer_data.geometry.length;
     const double area_error = (current_area - volume) / volume;
@@ -2192,9 +2338,19 @@ write_diagnostics(Mesh& mesh,
         rigid_motion_stream.setf(std::ios::scientific);
         penalty_projection_stream.setf(std::ios::scientific);
         tracking_arclength_stream
-            << loop_time << "," << tracking_error_rms / swimmer_data.geometry.length << ","
+            << loop_time << ","
+            << tracking_2d_lab_error_rms / swimmer_data.geometry.length << ","
+            << tracking_2d_lab_error_max / swimmer_data.geometry.length << ","
+            << tracking_2d_lab_velocity_error_rms / characteristic_velocity << ","
+            << tracking_2d_lab_velocity_error_max / characteristic_velocity << ","
+            << tracking_2d_shape_error_rms / swimmer_data.geometry.length << ","
+            << tracking_2d_shape_error_max / swimmer_data.geometry.length << ","
+            << tracking_2d_shape_velocity_error_rms / characteristic_velocity << ","
+            << tracking_2d_shape_velocity_error_max / characteristic_velocity << ","
+            << tracking_error_rms / swimmer_data.geometry.length << ","
             << tracking_error_max / swimmer_data.geometry.length << ","
             << tracking_velocity_error_rms / characteristic_velocity << ","
+            << tracking_velocity_error_max / characteristic_velocity << ","
             << L_target_rel_error << "," << L_actual_rel_error << ","
             << lambda_actual_min << "," << lambda_actual_max << ","
             << J_total_min << "," << area_error << "\n";
@@ -2241,19 +2397,32 @@ write_diagnostics(Mesh& mesh,
                  << swimmer_data.max_allowed_J << "].\n";
         }
     }
-    if (tracking_error_max / swimmer_data.geometry.length > swimmer_data.max_tracking_error_over_L)
+    const bool use_lab_tracking_limit =
+        swimmer_data.prescribed_motion_mode == PrescribedMotionMode::TETHERED;
+    const double tracking_limit_error =
+        use_lab_tracking_limit ? tracking_2d_lab_error_max : tracking_2d_shape_error_max;
+    const double tracking_limit_velocity_error =
+        use_lab_tracking_limit ? tracking_2d_lab_velocity_error_max :
+                                 tracking_2d_shape_velocity_error_max;
+    const std::string tracking_limit_name =
+        use_lab_tracking_limit ? "lab-frame 2D" : "body-frame shape 2D";
+    if (tracking_limit_error / swimmer_data.geometry.length >
+        swimmer_data.max_tracking_error_over_L)
     {
         TBOX_ERROR("Penalty tracking error limit exceeded at step "
-                  << iteration_num << ", time = " << loop_time << ": max error/L = "
-                  << tracking_error_max / swimmer_data.geometry.length
-                  << ", allowed maximum = " << swimmer_data.max_tracking_error_over_L << ".\n");
+                   << iteration_num << ", time = " << loop_time << ": "
+                   << tracking_limit_name << " max error/L = "
+                   << tracking_limit_error / swimmer_data.geometry.length
+                   << ", allowed maximum = " << swimmer_data.max_tracking_error_over_L << ".\n");
     }
-    if (tracking_velocity_error_rms / characteristic_velocity >
+    if (tracking_limit_velocity_error / characteristic_velocity >
         swimmer_data.max_tracking_velocity_error_over_Lf)
     {
         TBOX_ERROR("Penalty velocity tracking limit exceeded at step "
-                  << iteration_num << ", time = " << loop_time << ": rms |U_target-U|/(L*f) = "
-                  << tracking_velocity_error_rms / characteristic_velocity
-                  << ", allowed maximum = " << swimmer_data.max_tracking_velocity_error_over_Lf << ".\n");
+                   << iteration_num << ", time = " << loop_time << ": "
+                   << tracking_limit_name << " max |U_target-U|/(L*f) = "
+                   << tracking_limit_velocity_error / characteristic_velocity
+                   << ", allowed maximum = " << swimmer_data.max_tracking_velocity_error_over_Lf
+                   << ".\n");
     }
 }
