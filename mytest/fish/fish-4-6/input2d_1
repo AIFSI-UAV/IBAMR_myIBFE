@@ -1,0 +1,279 @@
+// mpirun -np 6 ./main2d input2d_1
+// mpirun -np 6 ./main2d input2d_1 restart_IB2d 5000
+// TETHERED keeps the prescribed target fixed in the lab frame.
+// FREE_SWIMMING projects out net penalty force and torque so the fish can recoil.
+PRESCRIBED_MOTION_MODE = "FREE_SWIMMING"
+
+MESH_FILENAME = "fish2d.msh"
+// fish2d.geo defines the head at x=1 and tail at x=0. The code orients s from
+// the selected head end to the opposite end, so s=0 is head and s=L is tail.
+REFERENCE_AXIS_X = 1.0
+REFERENCE_AXIS_Y = 0.0
+REFERENCE_HEAD_END = "MAX_PROJECTION"
+
+// Shared travelling wave
+WAVE_FREQUENCY = 1.0
+WAVE_COUNT = 1.0
+WAVE_PHASE0 = 0.0
+WAVE_RAMP_TIME = 2.0
+
+// Prescribed arclength-consistent gait
+PRESCRIBED_HEAD_AMPLITUDE_OVER_L = 0.0
+PRESCRIBED_TAIL_AMPLITUDE_OVER_L = 0.08
+PRESCRIBED_ENVELOPE_POWER = 2.0
+
+// Passive material evaluated with F.
+PASSIVE_MU = 0.5
+PASSIVE_LAMBDA = 40.0
+PASSIVE_FIBER_MODULUS = 0.5
+PASSIVE_SHEAR_MODULUS = 0.25
+// Keep the full passive material to suppress unresolved element-scale modes.
+PASSIVE_MATERIAL_SCALE = 1.0
+PK1_QUAD_ORDER = "FIFTH"
+
+RUN_MATERIAL_SELF_CHECKS = TRUE
+MATERIAL_SELF_CHECK_TOLERANCE = 1.0e-10
+WRITE_MIDLINE_DATA = TRUE
+MIDLINE_FILENAME = "midline_target_actual.csv"
+TRACKING_ARCLENGTH_FILENAME = "tracking_arclength_diag.csv"
+RIGID_MOTION_FILENAME = "rigid_motion_diag.csv"
+PENALTY_PROJECTION_FILENAME = "penalty_projection_diag.csv"
+MIDLINE_NUM_STATIONS = 151
+MIDLINE_STATION_HALF_WIDTH = 0.008
+MIDLINE_CENTERLINE_HALF_THICKNESS = 0.003
+MIDLINE_USE_BODY_FRAME = TRUE
+MIDLINE_BODY_FRAME_HEAD_XI = 0.02
+MIDLINE_BODY_FRAME_TANGENT_XI = 0.10
+// These are quality warning thresholds. Positive finite J is the hard
+// requirement; set ABORT_ON_MESH_QUALITY_LIMIT=TRUE for strict screening.
+MIN_ALLOWED_J = 0.50
+MAX_ALLOWED_J = 1.75
+ABORT_ON_MESH_QUALITY_LIMIT = FALSE
+MIN_ALLOWED_TARGET_J = 0.50
+MAX_TRACKING_ERROR_OVER_L = 0.02
+MAX_TRACKING_VELOCITY_ERROR_OVER_LF = 2.0
+
+// Fluid and Cartesian grid
+RHO = 1.0
+MU = 0.001
+DOMAIN_LENGTH_X = 8.0
+DOMAIN_LENGTH_Y = 4.0
+NX = 128
+NY = 64
+MAX_LEVELS = 3
+REF_RATIO = 4
+NFINEST_X = (REF_RATIO^(MAX_LEVELS - 1))*NX
+DX = DOMAIN_LENGTH_X/NFINEST_X
+
+SOLVER_TYPE = "STAGGERED"
+CFL_MAX = 0.15
+DT = 2.5e-4
+START_TIME = 0.0
+END_TIME = 10.0
+GROW_DT = 1.2
+// Two matched IB/fluid fixed-point cycles are required for the explicit
+// velocity-dependent penalty force. One cycle develops isolated velocity
+// spikes that force the CFL timestep toward zero.
+NUM_CYCLES = 2
+ERROR_ON_DT_CHANGE = FALSE
+
+// The velocity-dependent force is evaluated explicitly. Keep its coefficient
+// on the DX/DT scale: a sqrt(stiffness) "critical damping" estimate assumes a
+// separate structural mass and destabilizes this fluid-coupled formulation.
+PENALTY_STIFFNESS = 0.5*DX/DT^2
+PENALTY_DAMPING = 1.0*DX/DT
+
+USE_IB_DELTA_FUNCTIONS = TRUE
+IB_DELTA_FUNCTION = "IB_4"
+SPLIT_FORCES = FALSE
+USE_JUMP_CONDITIONS = FALSE
+USE_CONSISTENT_MASS_MATRIX = TRUE
+IB_POINT_DENSITY = 4.0
+ELIMINATE_PRESSURE_JUMPS = FALSE
+
+// MIDPOINT_RULE is consistent with the two fixed-point cycles above.
+CONVECTIVE_TS_TYPE = "MIDPOINT_RULE"
+CONVECTIVE_OP_TYPE = "PPM"
+CONVECTIVE_FORM = "ADVECTIVE"
+NORMALIZE_PRESSURE = TRUE
+VORTICITY_TAGGING = TRUE
+TAG_BUFFER = 2
+REGRID_CFL_INTERVAL = 0.25
+ENABLE_LOGGING = TRUE
+
+OUTPUT_U = TRUE
+OUTPUT_P = TRUE
+OUTPUT_F = TRUE
+OUTPUT_OMEGA = TRUE
+OUTPUT_DIV_U = TRUE
+
+PROJECTION_METHOD_TYPE = "PRESSURE_UPDATE"
+SECOND_ORDER_PRESSURE_UPDATE = TRUE
+
+VelocityBcCoefs_0 {
+   acoef_function_0 = "1.0"
+   acoef_function_1 = "0.0"
+   acoef_function_2 = "0.0"
+   acoef_function_3 = "0.0"
+
+   bcoef_function_0 = "0.0"
+   bcoef_function_1 = "1.0"
+   bcoef_function_2 = "1.0"
+   bcoef_function_3 = "1.0"
+
+   gcoef_function_0 = "0.0"
+   gcoef_function_1 = "0.0"
+   gcoef_function_2 = "0.0"
+   gcoef_function_3 = "0.0"
+}
+
+VelocityBcCoefs_1 {
+   acoef_function_0 = "1.0"
+   acoef_function_1 = "0.0"
+   acoef_function_2 = "1.0"
+   acoef_function_3 = "1.0"
+
+   bcoef_function_0 = "0.0"
+   bcoef_function_1 = "1.0"
+   bcoef_function_2 = "0.0"
+   bcoef_function_3 = "0.0"
+
+   gcoef_function_0 = "0.0"
+   gcoef_function_1 = "0.0"
+   gcoef_function_2 = "0.0"
+   gcoef_function_3 = "0.0"
+}
+
+IBHierarchyIntegrator {
+   start_time = START_TIME
+   end_time = END_TIME
+   grow_dt = GROW_DT
+   num_cycles = NUM_CYCLES
+   regrid_cfl_interval = REGRID_CFL_INTERVAL
+   dt_max = DT
+   error_on_dt_change = ERROR_ON_DT_CHANGE
+   enable_logging = ENABLE_LOGGING
+}
+
+IBFEMethod {
+   use_IB_spread_operator = USE_IB_DELTA_FUNCTIONS
+   use_IB_interp_operator = USE_IB_DELTA_FUNCTIONS
+   IB_delta_fcn = IB_DELTA_FUNCTION
+   split_forces = SPLIT_FORCES
+   use_jump_conditions = USE_JUMP_CONDITIONS
+   use_consistent_mass_matrix = USE_CONSISTENT_MASS_MATRIX
+   IB_point_density = IB_POINT_DENSITY
+   // Smaller values trigger a libMesh ghost-vector failure during frequent
+   // parallel element-to-patch remapping for this distributed mesh.
+   patch_association_cfl = 0.50
+}
+
+INSCollocatedHierarchyIntegrator {
+   num_cycles = NUM_CYCLES
+   mu = MU
+   rho = RHO
+   start_time = START_TIME
+   end_time = END_TIME
+   grow_dt = GROW_DT
+   convective_time_stepping_type = CONVECTIVE_TS_TYPE
+   convective_op_type = CONVECTIVE_OP_TYPE
+   convective_difference_form = CONVECTIVE_FORM
+   normalize_pressure = NORMALIZE_PRESSURE
+   cfl = CFL_MAX
+   dt_max = DT
+   using_vorticity_tagging = VORTICITY_TAGGING
+   vorticity_rel_thresh = 0.10,0.05
+   tag_buffer = TAG_BUFFER
+   output_U = OUTPUT_U
+   output_P = OUTPUT_P
+   output_F = OUTPUT_F
+   output_Omega = OUTPUT_OMEGA
+   output_Div_U = OUTPUT_DIV_U
+   enable_logging = ENABLE_LOGGING
+   projection_method_type = PROJECTION_METHOD_TYPE
+   use_2nd_order_pressure_update = SECOND_ORDER_PRESSURE_UPDATE
+}
+
+INSStaggeredHierarchyIntegrator {
+   num_cycles = NUM_CYCLES
+   mu = MU
+   rho = RHO
+   start_time = START_TIME
+   end_time = END_TIME
+   grow_dt = GROW_DT
+   convective_time_stepping_type = CONVECTIVE_TS_TYPE
+   convective_op_type = CONVECTIVE_OP_TYPE
+   convective_difference_form = CONVECTIVE_FORM
+   normalize_pressure = NORMALIZE_PRESSURE
+   cfl = CFL_MAX
+   dt_max = DT
+   using_vorticity_tagging = VORTICITY_TAGGING
+   vorticity_rel_thresh = 0.10,0.05
+   tag_buffer = TAG_BUFFER
+   output_U = OUTPUT_U
+   output_P = OUTPUT_P
+   output_F = OUTPUT_F
+   output_Omega = OUTPUT_OMEGA
+   output_Div_U = OUTPUT_DIV_U
+   enable_logging = ENABLE_LOGGING
+}
+
+Main {
+   solver_type = SOLVER_TYPE
+   log_file_name = "IB2d.log"
+   log_all_nodes = FALSE
+
+   viz_writer = "VisIt","ExodusII"
+   viz_dump_interval = 200
+   viz_dump_dirname = "viz_IB2d"
+   visit_number_procs_per_file = 1
+
+   restart_dump_interval = 1000
+   restart_dump_dirname = "restart_IB2d"
+
+   data_dump_interval = 20
+   data_dump_dirname = "diagnostics"
+
+   timer_dump_interval = 0
+}
+
+CartesianGeometry {
+   domain_boxes = [ (0,0),(NX - 1,NY - 1) ]
+   x_lo = -4.0,-0.5*DOMAIN_LENGTH_Y
+   x_up = 4.0,0.5*DOMAIN_LENGTH_Y
+   periodic_dimension = 0,0
+}
+
+GriddingAlgorithm {
+   max_levels = MAX_LEVELS
+   ratio_to_coarser {
+      level_1 = REF_RATIO,REF_RATIO
+      level_2 = REF_RATIO,REF_RATIO
+      level_3 = REF_RATIO,REF_RATIO
+      level_4 = REF_RATIO,REF_RATIO
+   }
+   largest_patch_size {
+      level_0 = 512,512
+   }
+   smallest_patch_size {
+      level_0 = 8,8
+   }
+   efficiency_tolerance = 0.85
+   combine_efficiency = 0.85
+}
+
+StandardTagAndInitialize {
+   tagging_method = "GRADIENT_DETECTOR"
+}
+
+LoadBalancer {
+   bin_pack_method = "SPATIAL"
+   max_workload_factor = 1
+}
+
+TimerManager {
+   print_exclusive = FALSE
+   print_total = TRUE
+   print_threshold = 0.1
+   timer_list = "IBAMR::*::*","IBTK::*::*","*::*::*"
+}
