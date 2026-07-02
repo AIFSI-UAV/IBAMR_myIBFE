@@ -121,6 +121,15 @@ struct SwimmerData
     VectorValue<double> penalty_projection_translation;
     double penalty_projection_rotation = 0.0;
     libMesh::Point penalty_projection_center;
+    bool penalty_projection_initialized = false;
+    VectorValue<double> penalty_projection_used_translation;
+    double penalty_projection_used_rotation = 0.0;
+    libMesh::Point penalty_projection_used_center;
+    bool penalty_projection_used_initialized = false;
+    VectorValue<double> penalty_projection_refit_translation;
+    double penalty_projection_refit_rotation = 0.0;
+    libMesh::Point penalty_projection_refit_center;
+    bool penalty_projection_refit_initialized = false;
     RigidTargetFrame free_swimming_target_frame;
     RigidTargetFrame free_swimming_shape_frame;
     double free_swimming_shape_frame_time = std::numeric_limits<double>::quiet_NaN();
@@ -136,7 +145,6 @@ struct SwimmerData
     double min_allowed_J;
     double max_allowed_J;
     bool abort_on_mesh_quality_limit;
-    double min_allowed_target_J;
     double max_tracking_error_over_L;
     double max_tracking_velocity_error_over_Lf;
     bool write_midline_data;
@@ -148,8 +156,6 @@ struct SwimmerData
     double midline_station_half_width;
     double midline_centerline_half_thickness;
     bool midline_use_body_frame;
-    double midline_body_frame_head_xi;
-    double midline_body_frame_tangent_xi;
     double body_frame_fit_xi_min;
     double body_frame_fit_xi_max;
 
@@ -178,7 +184,6 @@ struct SwimmerData
           min_allowed_J(input_db->getDouble("MIN_ALLOWED_J")),
           max_allowed_J(input_db->getDouble("MAX_ALLOWED_J")),
           abort_on_mesh_quality_limit(input_db->getBool("ABORT_ON_MESH_QUALITY_LIMIT")),
-          min_allowed_target_J(input_db->getDoubleWithDefault("MIN_ALLOWED_TARGET_J", 0.50)),
           max_tracking_error_over_L(input_db->getDouble("MAX_TRACKING_ERROR_OVER_L")),
           max_tracking_velocity_error_over_Lf(
               input_db->getDouble("MAX_TRACKING_VELOCITY_ERROR_OVER_LF")),
@@ -197,10 +202,6 @@ struct SwimmerData
           midline_centerline_half_thickness(
               input_db->getDoubleWithDefault("MIDLINE_CENTERLINE_HALF_THICKNESS", 0.003)),
           midline_use_body_frame(input_db->getBoolWithDefault("MIDLINE_USE_BODY_FRAME", true)),
-          midline_body_frame_head_xi(
-              input_db->getDoubleWithDefault("MIDLINE_BODY_FRAME_HEAD_XI", 0.02)),
-          midline_body_frame_tangent_xi(
-              input_db->getDoubleWithDefault("MIDLINE_BODY_FRAME_TANGENT_XI", 0.10)),
           body_frame_fit_xi_min(input_db->getDoubleWithDefault("BODY_FRAME_FIT_XI_MIN", 0.02)),
           body_frame_fit_xi_max(input_db->getDoubleWithDefault("BODY_FRAME_FIT_XI_MAX", 0.20))
     {
@@ -246,10 +247,6 @@ struct SwimmerData
         {
             TBOX_ERROR("Require 0 < MIN_ALLOWED_J < 1 < MAX_ALLOWED_J.\n");
         }
-        if (min_allowed_target_J <= 0.0)
-        {
-            TBOX_ERROR("MIN_ALLOWED_TARGET_J must be positive.\n");
-        }
         if (max_tracking_error_over_L <= 0.0)
         {
             TBOX_ERROR("MAX_TRACKING_ERROR_OVER_L must be positive.\n");
@@ -270,13 +267,6 @@ struct SwimmerData
         {
             TBOX_ERROR("MIDLINE_CENTERLINE_HALF_THICKNESS must be positive.\n");
         }
-        if (!(0.0 <= midline_body_frame_head_xi && midline_body_frame_head_xi < 1.0 &&
-              midline_body_frame_head_xi < midline_body_frame_tangent_xi &&
-              midline_body_frame_tangent_xi <= 1.0))
-        {
-            TBOX_ERROR("Require 0 <= MIDLINE_BODY_FRAME_HEAD_XI < "
-                       "MIDLINE_BODY_FRAME_TANGENT_XI <= 1.\n");
-        }
         if (!(0.0 <= body_frame_fit_xi_min && body_frame_fit_xi_min < body_frame_fit_xi_max &&
               body_frame_fit_xi_max <= 1.0))
         {
@@ -284,6 +274,10 @@ struct SwimmerData
         }
         penalty_projection_translation.zero();
         penalty_projection_center = geometry.head + 0.5 * geometry.length * geometry.tangent;
+        penalty_projection_used_translation.zero();
+        penalty_projection_used_center = penalty_projection_center;
+        penalty_projection_refit_translation.zero();
+        penalty_projection_refit_center = penalty_projection_center;
         free_swimming_target_frame.origin = geometry.head;
         const double frame_fit_center_xi = 0.5 * (body_frame_fit_xi_min + body_frame_fit_xi_max);
         for (unsigned int d = 0; d < NDIM; ++d)
@@ -371,9 +365,9 @@ ramp(const double time, const SwimmerData& data, double& value, double& derivati
     }
     else
     {
-        const double argument = M_PI * time / data.ramp_time;
-        value = 0.5 * (1.0 - std::cos(argument));
-        derivative = 0.5 * M_PI / data.ramp_time * std::sin(argument);
+        const double tau = time / data.ramp_time;
+        value = tau * tau * tau * (10.0 + tau * (-15.0 + 6.0 * tau));
+        derivative = 30.0 * tau * tau * (1.0 - tau) * (1.0 - tau) / data.ramp_time;
     }
 }
 
@@ -434,9 +428,80 @@ target_angle(const double s,
         -omega * amplitude_derivative * std::cos(phase) + omega * amplitude * k * std::sin(phase);
     const double slope = ramp_value * spatial_wave;
     const double slope_time = ramp_derivative * spatial_wave + ramp_value * spatial_wave_time;
+    const double cosine_squared = 1.0 - slope * slope;
+    if (!(cosine_squared > 0.0) || !std::isfinite(cosine_squared))
+    {
+        TBOX_ERROR("Invalid prescribed arclength kinematics at time = "
+                   << time << ", s/L = " << unit_coordinate(s, data)
+                   << ": require |dy_target/ds| < 1, got " << std::abs(slope) << ".\n");
+    }
 
-    theta = std::atan(slope);
-    theta_time = slope_time / (1.0 + slope * slope);
+    theta = std::asin(slope);
+    theta_time = slope_time / std::sqrt(cosine_squared);
+}
+
+void
+target_curvature_state(const double s,
+                       const double time,
+                       const SwimmerData& data,
+                       double& kappa,
+                       double& kappa_time)
+{
+    double ramp_value = 0.0;
+    double ramp_derivative = 0.0;
+    ramp(time, data, ramp_value, ramp_derivative);
+
+    const double k = wave_number(data);
+    const double omega = angular_frequency(data);
+    const double phase = k * s - omega * time + data.phase0;
+    double amplitude = 0.0;
+    double amplitude_s = 0.0;
+    prescribed_amplitude(s, data, amplitude, amplitude_s);
+    const double amplitude_ss = prescribed_amplitude_second_derivative(s, data);
+
+    const double h_s = amplitude_s * std::sin(phase) + amplitude * k * std::cos(phase);
+    const double h_st =
+        -omega * amplitude_s * std::cos(phase) + omega * amplitude * k * std::sin(phase);
+    const double h_ss = amplitude_ss * std::sin(phase) +
+                        2.0 * amplitude_s * k * std::cos(phase) -
+                        amplitude * k * k * std::sin(phase);
+    const double h_sst = omega * ((amplitude * k * k - amplitude_ss) * std::cos(phase) +
+                                  2.0 * amplitude_s * k * std::sin(phase));
+
+    const double slope = ramp_value * h_s;
+    const double slope_time = ramp_derivative * h_s + ramp_value * h_st;
+    const double slope_s = ramp_value * h_ss;
+    const double slope_st = ramp_derivative * h_ss + ramp_value * h_sst;
+    const double cosine_squared = 1.0 - slope * slope;
+    if (!(cosine_squared > 0.0) || !std::isfinite(cosine_squared))
+    {
+        TBOX_ERROR("Invalid prescribed curvature at time = "
+                   << time << ", s/L = " << unit_coordinate(s, data)
+                   << ": require |dy_target/ds| < 1, got " << std::abs(slope) << ".\n");
+    }
+
+    const double cosine = std::sqrt(cosine_squared);
+    kappa = slope_s / cosine;
+    kappa_time = slope_st / cosine +
+                 slope_s * slope * slope_time / (cosine_squared * cosine);
+}
+
+void
+area_preserving_normal_offset(const double eta,
+                              const double kappa,
+                              const double kappa_time,
+                              double& zeta,
+                              double& zeta_time)
+{
+    const double sqrt_argument = 1.0 - 2.0 * eta * kappa;
+    if (!(sqrt_argument > 0.0) || !std::isfinite(sqrt_argument))
+    {
+        TBOX_ERROR("Invalid area-preserving prescribed map: require 1-2*eta*kappa > 0, got "
+                   << sqrt_argument << ".\n");
+    }
+    const double denominator = std::sqrt(sqrt_argument);
+    zeta = 2.0 * eta / (1.0 + denominator);
+    zeta_time = 0.5 * kappa_time * zeta * zeta / denominator;
 }
 
 TargetState
@@ -485,10 +550,19 @@ target_shape_state(const double s, const double eta, const double time, const Sw
     const double normal_velocity_x = -std::cos(theta) * theta_time;
     const double normal_velocity_y = -std::sin(theta) * theta_time;
 
-    const double local_x = center_x + eta * normal_x;
-    const double local_y = center_y + eta * normal_y;
-    const double local_velocity_x = center_velocity_x + eta * normal_velocity_x;
-    const double local_velocity_y = center_velocity_y + eta * normal_velocity_y;
+    double kappa = 0.0;
+    double kappa_time = 0.0;
+    target_curvature_state(s, time, data, kappa, kappa_time);
+    double zeta = 0.0;
+    double zeta_time = 0.0;
+    area_preserving_normal_offset(eta, kappa, kappa_time, zeta, zeta_time);
+
+    const double local_x = center_x + zeta * normal_x;
+    const double local_y = center_y + zeta * normal_y;
+    const double local_velocity_x =
+        center_velocity_x + zeta_time * normal_x + zeta * normal_velocity_x;
+    const double local_velocity_y =
+        center_velocity_y + zeta_time * normal_y + zeta * normal_velocity_y;
 
     TargetState target;
     target.position(0) = local_x;
@@ -668,22 +742,10 @@ target_state(const libMesh::Point& X, const double time, const SwimmerData& data
 double
 target_curvature_at_s(const double s, const double time, const SwimmerData& data)
 {
-    double ramp_value = 0.0;
-    double ramp_derivative = 0.0;
-    ramp(time, data, ramp_value, ramp_derivative);
-
-    const double k = wave_number(data);
-    const double phase = k * s - angular_frequency(data) * time + data.phase0;
-    double amplitude = 0.0;
-    double amplitude_s = 0.0;
-    prescribed_amplitude(s, data, amplitude, amplitude_s);
-    const double amplitude_ss = prescribed_amplitude_second_derivative(s, data);
-    const double h_s = amplitude_s * std::sin(phase) + amplitude * k * std::cos(phase);
-    const double h_ss = amplitude_ss * std::sin(phase) +
-                        2.0 * amplitude_s * k * std::cos(phase) -
-                        amplitude * k * k * std::sin(phase);
-    const double slope = ramp_value * h_s;
-    return ramp_value * h_ss / (1.0 + slope * slope);
+    double kappa = 0.0;
+    double kappa_time = 0.0;
+    target_curvature_state(s, time, data, kappa, kappa_time);
+    return kappa;
 }
 
 TensorValue<double>
@@ -804,31 +866,11 @@ raw_penalty_force(VectorValue<double>& F,
 {
     const TargetState target = target_state(X, time, data);
     VectorValue<double> velocity_error = target.velocity - velocity;
-    if (data.prescribed_motion_mode == PrescribedMotionMode::TETHERED)
-    {
-        const double characteristic_velocity = data.geometry.length * data.frequency;
-        const double velocity_error_over_Lf =
-            std::sqrt(dot2(velocity_error, velocity_error)) / characteristic_velocity;
-        if (velocity_error_over_Lf > data.max_tracking_velocity_error_over_Lf)
-        {
-            TBOX_ERROR("Penalty velocity tracking limit exceeded at time = "
-                       << time << ": |U_target-U|/(L*f) = " << velocity_error_over_Lf
-                       << ", allowed maximum = " << data.max_tracking_velocity_error_over_Lf << ".\n");
-        }
-    }
     for (unsigned int d = 0; d < NDIM; ++d)
     {
         F(d) = data.penalty_stiffness * (target.position(d) - x(d)) +
                data.penalty_damping * velocity_error(d);
     }
-}
-
-double
-smooth_head_weight(const double xi, const double tether_fraction)
-{
-    if (xi >= tether_fraction) return 0.0;
-    const double coordinate = std::clamp(xi / tether_fraction, 0.0, 1.0);
-    return 0.5 * (1.0 + std::cos(M_PI * coordinate));
 }
 
 void
@@ -1133,28 +1175,40 @@ update_free_swimming_target_frame(Mesh& mesh,
 }
 
 void
-update_penalty_projection(const double current_time,
-                          const double new_time,
-                          const int,
-                          void* ctx)
+apply_penalty_projection(VectorValue<double>& projected_force,
+                         const libMesh::Point& x,
+                         const VectorValue<double>& translation,
+                         const double rotation,
+                         const libMesh::Point& center)
 {
-    auto& projection = *static_cast<PenaltyProjectionContext*>(ctx);
-    SwimmerData& data = *projection.swimmer_data;
-    data.penalty_projection_translation.zero();
-    data.penalty_projection_rotation = 0.0;
+    projected_force -= translation;
+    const VectorValue<double> radius = x - center;
+    projected_force(0) += rotation * radius(1);
+    projected_force(1) -= rotation * radius(0);
+}
 
-    Mesh& mesh = *projection.mesh;
-    EquationSystems& equation_systems = *projection.equation_systems;
-    const double projection_time = 0.5 * (current_time + new_time);
+void
+compute_penalty_projection(Mesh& mesh,
+                           EquationSystems& equation_systems,
+                           const std::string& coords_system_name,
+                           const std::string& velocity_system_name,
+                           SwimmerData& data,
+                           const double projection_time,
+                           VectorValue<double>& translation,
+                           double& rotation,
+                           libMesh::Point& center)
+{
+    translation.zero();
+    rotation = 0.0;
     update_free_swimming_target_frame(mesh,
                                       equation_systems,
-                                      projection.coords_system_name,
-                                      projection.velocity_system_name,
+                                      coords_system_name,
+                                      velocity_system_name,
                                       data,
                                       projection_time);
 
-    System& X_system = equation_systems.get_system(projection.coords_system_name);
-    System& U_system = equation_systems.get_system(projection.velocity_system_name);
+    System& X_system = equation_systems.get_system(coords_system_name);
+    System& U_system = equation_systems.get_system(velocity_system_name);
     NumericVector<double>* X_ghost_vec = X_system.current_local_solution.get();
     NumericVector<double>* U_ghost_vec = U_system.current_local_solution.get();
     copy_and_synch(*X_system.solution, *X_ghost_vec);
@@ -1205,8 +1259,8 @@ update_penalty_projection(const double current_time,
 
     for (unsigned int d = 0; d < NDIM; ++d)
     {
-        data.penalty_projection_center(d) = center_integral[d] / volume;
-        data.penalty_projection_translation(d) = force_integral[d] / volume;
+        center(d) = center_integral[d] / volume;
+        translation(d) = force_integral[d] / volume;
     }
 
     double torque = 0.0;
@@ -1223,8 +1277,8 @@ update_penalty_projection(const double current_time,
             interpolate(x, qp, X_node, phi);
             interpolate(velocity, qp, U_node, phi);
             raw_penalty_force(raw_force, x, reference_points[qp], velocity, projection_time, data);
-            raw_force -= data.penalty_projection_translation;
-            const VectorValue<double> radius = x - data.penalty_projection_center;
+            raw_force -= translation;
+            const VectorValue<double> radius = x - center;
             const double weight = JxW[qp];
             torque += (radius(0) * raw_force(1) - radius(1) * raw_force(0)) * weight;
             polar_moment += dot2(radius, radius) * weight;
@@ -1233,17 +1287,57 @@ update_penalty_projection(const double current_time,
     IBTK_MPI::sumReduction(&torque, 1);
     IBTK_MPI::sumReduction(&polar_moment, 1);
     if (polar_moment <= 0.0) TBOX_ERROR("Cannot project penalty torque with zero polar moment.\n");
-    data.penalty_projection_rotation = torque / polar_moment;
+    rotation = torque / polar_moment;
+}
+
+void
+update_penalty_projection(const double current_time,
+                          const double new_time,
+                          const int,
+                          void* ctx)
+{
+    auto& projection = *static_cast<PenaltyProjectionContext*>(ctx);
+    SwimmerData& data = *projection.swimmer_data;
+    if (data.penalty_projection_initialized)
+    {
+        data.penalty_projection_used_translation = data.penalty_projection_translation;
+        data.penalty_projection_used_rotation = data.penalty_projection_rotation;
+        data.penalty_projection_used_center = data.penalty_projection_center;
+        data.penalty_projection_used_initialized = true;
+    }
+    data.penalty_projection_refit_initialized = false;
+
+    compute_penalty_projection(*projection.mesh,
+                               *projection.equation_systems,
+                               projection.coords_system_name,
+                               projection.velocity_system_name,
+                               data,
+                               0.5 * (current_time + new_time),
+                               data.penalty_projection_translation,
+                               data.penalty_projection_rotation,
+                               data.penalty_projection_center);
+    data.penalty_projection_initialized = true;
 }
 
 void
 postprocess_penalty_projection(const double,
                                const double new_time,
                                const bool,
-                               const int num_cycles,
+                               const int,
                                void* ctx)
 {
-    update_penalty_projection(new_time, new_time, num_cycles, ctx);
+    auto& projection = *static_cast<PenaltyProjectionContext*>(ctx);
+    SwimmerData& data = *projection.swimmer_data;
+    compute_penalty_projection(*projection.mesh,
+                               *projection.equation_systems,
+                               projection.coords_system_name,
+                               projection.velocity_system_name,
+                               data,
+                               new_time,
+                               data.penalty_projection_refit_translation,
+                               data.penalty_projection_refit_rotation,
+                               data.penalty_projection_refit_center);
+    data.penalty_projection_refit_initialized = true;
 }
 
 void
@@ -1272,7 +1366,7 @@ check_target_mapping_quality(const SwimmerData& data)
     constexpr unsigned int num_space_samples = 512;
     constexpr unsigned int num_time_samples = 512;
     const double end_time = data.ramp_time + 1.0 / data.frequency;
-    double J_min = std::numeric_limits<double>::max();
+    double sqrt_argument_min = std::numeric_limits<double>::max();
     double kappa_abs_max = 0.0;
     for (unsigned int ti = 0; ti <= num_time_samples; ++ti)
     {
@@ -1284,16 +1378,17 @@ check_target_mapping_quality(const SwimmerData& data)
             kappa_abs_max = std::max(kappa_abs_max, std::abs(kappa));
             for (const double eta : { data.geometry.eta_min, data.geometry.eta_max })
             {
-                J_min = std::min(J_min, 1.0 - eta * kappa);
+                sqrt_argument_min = std::min(sqrt_argument_min, 1.0 - 2.0 * eta * kappa);
             }
         }
     }
-    pout << "Target mapping scan: min(1-eta*kappa_target) = " << J_min
-         << ", max |kappa_target|*L = " << kappa_abs_max * data.geometry.length << "\n";
-    if (!(J_min > data.min_allowed_target_J) || !std::isfinite(J_min))
+    pout << "Target mapping scan: min(1-2*eta*kappa_target) = " << sqrt_argument_min
+         << ", J_target in [1,1], max |kappa_target|*L = "
+         << kappa_abs_max * data.geometry.length << "\n";
+    if (!(sqrt_argument_min > 0.0) || !std::isfinite(sqrt_argument_min))
     {
-        TBOX_ERROR("Target mapping quality limit failed: min(1-eta*kappa_target) = "
-                   << J_min << ", required > " << data.min_allowed_target_J << ".\n");
+        TBOX_ERROR("Target mapping quality limit failed: min(1-2*eta*kappa_target) = "
+                   << sqrt_argument_min << ", required > 0.\n");
     }
 }
 } // namespace ModelData
@@ -1310,36 +1405,6 @@ join_output_path(const std::string& directory, const std::string& filename)
     if (filename.empty() || filename[0] == '/' || directory.empty()) return filename;
     if (directory.back() == '/') return directory + filename;
     return directory + "/" + filename;
-}
-
-libMesh::Point
-reference_centerline_point(const double xi, const SwimmerData& swimmer_data)
-{
-    libMesh::Point point = swimmer_data.geometry.head;
-    for (unsigned int d = 0; d < NDIM; ++d)
-    {
-        point(d) += xi * swimmer_data.geometry.length * swimmer_data.geometry.tangent(d);
-    }
-    return point;
-}
-
-MidlineFrame
-make_midline_frame(const libMesh::Point& origin,
-                   const libMesh::Point& tangent_point)
-{
-    MidlineFrame frame;
-    frame.origin = origin;
-    frame.tangent = tangent_point - origin;
-    const double tangent_norm = std::sqrt(dot2(frame.tangent, frame.tangent));
-    if (!(tangent_norm > 0.0) || !std::isfinite(tangent_norm))
-    {
-        TBOX_ERROR("Cannot define midline body frame: the head and tangent stations are "
-                   "coincident or invalid.\n");
-    }
-    frame.tangent /= tangent_norm;
-    frame.normal(0) = -frame.tangent(1);
-    frame.normal(1) = frame.tangent(0);
-    return frame;
 }
 
 MidlineFrame
@@ -1473,43 +1538,25 @@ assemble_midline_samples(const std::vector<double>& section_weight,
 
 void
 write_midline_output(const std::vector<MidlineSample>& samples,
+                     const std::vector<MidlineSample>& target_samples,
                      const std::vector<double>& station_xi,
-                     const std::size_t frame_head_index,
-                     const std::size_t frame_tangent_index,
                      const int num_output_stations,
                      const int fallback_count,
                      const SwimmerData& swimmer_data,
                      const int iteration_num,
-                     const double loop_time)
+                     const double loop_time,
+                     const MidlineFrame& actual_frame,
+                     const MidlineFrame& target_frame)
 {
     if (!swimmer_data.write_midline_data) return;
 
-    MidlineFrame actual_frame = make_reference_midline_frame(swimmer_data);
-    if (swimmer_data.midline_use_body_frame)
-    {
-        actual_frame = make_midline_frame(samples[frame_head_index].position,
-                                          samples[frame_tangent_index].position);
-    }
-
     std::vector<libMesh::Point> actual_points(num_output_stations);
-    std::vector<libMesh::Point> target_points_all(station_xi.size());
     std::vector<libMesh::Point> target_points(num_output_stations);
-    for (std::size_t station = 0; station < station_xi.size(); ++station)
-    {
-        const libMesh::Point X = reference_centerline_point(station_xi[station], swimmer_data);
-        target_points_all[station] = target_state(X, loop_time, swimmer_data).position;
-    }
     for (int station = 0; station < num_output_stations; ++station)
     {
         const std::size_t index = static_cast<std::size_t>(station);
         actual_points[index] = samples[index].position;
-        target_points[index] = target_points_all[index];
-    }
-    MidlineFrame target_frame = make_reference_midline_frame(swimmer_data);
-    if (swimmer_data.midline_use_body_frame)
-    {
-        target_frame = make_midline_frame(target_points_all[frame_head_index],
-                                          target_points_all[frame_tangent_index]);
+        target_points[index] = target_samples[index].position;
     }
 
     if (IBTK_MPI::getRank() != 0) return;
@@ -1559,7 +1606,8 @@ write_diagnostics(Mesh& mesh,
                   const std::string& velocity_system_name,
                   const SwimmerData& swimmer_data,
                   const int iteration_num,
-                  const double loop_time);
+                  const double loop_time,
+                  const bool write_output);
 
 int
 main(int argc, char* argv[])
@@ -1834,13 +1882,19 @@ main(int argc, char* argv[])
                        "tracking_midline_velocity_rms_over_Lf,"
                        "tracking_midline_velocity_max_over_Lf,"
                        "L_target_rel_error,L_actual_rel_error,lambda_actual_min,lambda_actual_max,"
-                       "J_min,area_error\n";
+                       "J_min,J_max,J_target_min,J_target_max,J_minus_Jtarget_rms,"
+                       "area_error,target_area_rel_error\n";
                 rigid_motion_stream
                     << "time,x_cm,y_cm,u_cm,v_cm,body_angle,pitch_rate,u_parallel,v_perp\n";
                 penalty_projection_stream
-                    << "time,Fx_raw,Fy_raw,Mz_raw,Fx_projected,Fy_projected,"
-                       "Mz_projected,penalty_power,penalty_force_L1,"
-                       "force_projection_residual,torque_projection_residual\n";
+                    << "time,Fx_raw,Fy_raw,Mz_raw,"
+                       "Fx_used,Fy_used,Mz_used,Fx_refit,Fy_refit,Mz_refit,"
+                       "power_system_used,power_target_used,"
+                       "power_system_refit,power_target_refit,"
+                       "penalty_spring_energy,penalty_damping_loss,penalty_force_L1,"
+                       "force_projection_residual_used,torque_projection_residual_used,"
+                       "force_projection_residual_refit,torque_projection_residual_refit,"
+                       "projection_translation_delta,projection_rotation_delta\n";
             }
         }
 
@@ -1871,7 +1925,8 @@ main(int argc, char* argv[])
                               velocity_system_name,
                               swimmer_data,
                               iteration_num,
-                              loop_time);
+                              loop_time,
+                              true);
         }
 
         const double loop_time_end = time_integrator->getEndTime();
@@ -1910,17 +1965,16 @@ main(int argc, char* argv[])
             {
                 TimerManager::getManager()->print(plog);
             }
-            if (dump_postproc_data &&
-                (iteration_num % postproc_data_dump_interval == 0 || last_step))
-            {
-                write_diagnostics(mesh,
-                                  equation_systems,
-                                  coords_system_name,
-                                  velocity_system_name,
-                                  swimmer_data,
-                                  iteration_num,
-                                  loop_time);
-            }
+            const bool write_postproc =
+                dump_postproc_data && (iteration_num % postproc_data_dump_interval == 0 || last_step);
+            write_diagnostics(mesh,
+                              equation_systems,
+                              coords_system_name,
+                              velocity_system_name,
+                              swimmer_data,
+                              iteration_num,
+                              loop_time,
+                              write_postproc);
         }
 
         if (IBTK_MPI::getRank() == 0)
@@ -1941,7 +1995,8 @@ write_diagnostics(Mesh& mesh,
                   const std::string& velocity_system_name,
                   const SwimmerData& swimmer_data,
                   const int iteration_num,
-                  const double loop_time)
+                  const double loop_time,
+                  const bool write_output)
 {
     const unsigned int dim = mesh.mesh_dimension();
     System& X_system = equation_systems->get_system(coords_system_name);
@@ -1970,6 +2025,7 @@ write_diagnostics(Mesh& mesh,
 
     double volume = 0.0;
     double current_area = 0.0;
+    double target_area = 0.0;
     double cm_x_integral = 0.0;
     double cm_y_integral = 0.0;
     double u_x_integral = 0.0;
@@ -1977,13 +2033,24 @@ write_diagnostics(Mesh& mesh,
     double Fx_raw = 0.0;
     double Fy_raw = 0.0;
     double Mz_raw = 0.0;
-    double Fx_projected = 0.0;
-    double Fy_projected = 0.0;
-    double Mz_projected = 0.0;
-    double penalty_power = 0.0;
+    double Fx_used = 0.0;
+    double Fy_used = 0.0;
+    double Mz_used = 0.0;
+    double Fx_refit = 0.0;
+    double Fy_refit = 0.0;
+    double Mz_refit = 0.0;
+    double power_system_used = 0.0;
+    double power_target_used = 0.0;
+    double power_system_refit = 0.0;
+    double power_target_refit = 0.0;
+    double penalty_spring_energy = 0.0;
+    double penalty_damping_loss = 0.0;
     double penalty_force_L1 = 0.0;
     double J_total_min = std::numeric_limits<double>::max();
     double J_total_max = -std::numeric_limits<double>::max();
+    double J_target_min = std::numeric_limits<double>::max();
+    double J_target_max = -std::numeric_limits<double>::max();
+    double J_minus_Jtarget_squared = 0.0;
     double tracking_2d_lab_error_squared = 0.0;
     double tracking_2d_lab_error_max = 0.0;
     double tracking_2d_lab_velocity_error_squared = 0.0;
@@ -1995,36 +2062,46 @@ write_diagnostics(Mesh& mesh,
 
     const int ml_num_output = swimmer_data.midline_num_stations;
     std::vector<double> ml_station_xi;
-    std::size_t ml_frame_head_index = 0;
-    std::size_t ml_frame_tangent_index = 0;
     std::vector<double> ml_section_weight;
     std::vector<double> ml_section_x;
     std::vector<double> ml_section_y;
     std::vector<double> ml_section_u;
     std::vector<double> ml_section_v;
+    std::vector<double> ml_target_section_x;
+    std::vector<double> ml_target_section_y;
+    std::vector<double> ml_target_section_u;
+    std::vector<double> ml_target_section_v;
     std::vector<double> ml_centerline_weight;
     std::vector<double> ml_centerline_x;
     std::vector<double> ml_centerline_y;
     std::vector<double> ml_centerline_u;
     std::vector<double> ml_centerline_v;
-    ml_station_xi.reserve(static_cast<std::size_t>(ml_num_output) + 2);
+    std::vector<double> ml_target_centerline_x;
+    std::vector<double> ml_target_centerline_y;
+    std::vector<double> ml_target_centerline_u;
+    std::vector<double> ml_target_centerline_v;
+    ml_station_xi.reserve(static_cast<std::size_t>(ml_num_output));
     for (int s = 0; s < ml_num_output; ++s)
         ml_station_xi.push_back(static_cast<double>(s) / (ml_num_output - 1));
-    ml_frame_head_index = ml_station_xi.size();
-    ml_station_xi.push_back(swimmer_data.midline_body_frame_head_xi);
-    ml_frame_tangent_index = ml_station_xi.size();
-    ml_station_xi.push_back(swimmer_data.midline_body_frame_tangent_xi);
     const std::size_t n_midline_samples = ml_station_xi.size();
     ml_section_weight.assign(n_midline_samples, 0.0);
     ml_section_x.assign(n_midline_samples, 0.0);
     ml_section_y.assign(n_midline_samples, 0.0);
     ml_section_u.assign(n_midline_samples, 0.0);
     ml_section_v.assign(n_midline_samples, 0.0);
+    ml_target_section_x.assign(n_midline_samples, 0.0);
+    ml_target_section_y.assign(n_midline_samples, 0.0);
+    ml_target_section_u.assign(n_midline_samples, 0.0);
+    ml_target_section_v.assign(n_midline_samples, 0.0);
     ml_centerline_weight.assign(n_midline_samples, 0.0);
     ml_centerline_x.assign(n_midline_samples, 0.0);
     ml_centerline_y.assign(n_midline_samples, 0.0);
     ml_centerline_u.assign(n_midline_samples, 0.0);
     ml_centerline_v.assign(n_midline_samples, 0.0);
+    ml_target_centerline_x.assign(n_midline_samples, 0.0);
+    ml_target_centerline_y.assign(n_midline_samples, 0.0);
+    ml_target_centerline_u.assign(n_midline_samples, 0.0);
+    ml_target_centerline_v.assign(n_midline_samples, 0.0);
 
     boost::multi_array<double, 2> X_node;
     boost::multi_array<double, 2> U_node;
@@ -2032,7 +2109,8 @@ write_diagnostics(Mesh& mesh,
     VectorValue<double> velocity;
     TensorValue<double> FF;
     VectorValue<double> raw_force;
-    VectorValue<double> projected_force;
+    VectorValue<double> used_force;
+    VectorValue<double> refit_force;
     const libMesh::Point torque_center = swimmer_data.penalty_projection_center;
 
     for (auto elem_it = mesh.active_local_elements_begin(); elem_it != mesh.active_local_elements_end(); ++elem_it)
@@ -2052,15 +2130,20 @@ write_diagnostics(Mesh& mesh,
             const double weight = JxW[qp];
             const double xi = unit_coordinate(reference_s(X, swimmer_data), swimmer_data);
             const double J_total = FF(0, 0) * FF(1, 1) - FF(0, 1) * FF(1, 0);
+            const double J_target = 1.0;
 
             volume += weight;
             current_area += J_total * weight;
+            target_area += J_target * weight;
             cm_x_integral += x(0) * weight;
             cm_y_integral += x(1) * weight;
             u_x_integral += velocity(0) * weight;
             u_y_integral += velocity(1) * weight;
             J_total_min = std::min(J_total_min, J_total);
             J_total_max = std::max(J_total_max, J_total);
+            J_target_min = std::min(J_target_min, J_target);
+            J_target_max = std::max(J_target_max, J_target);
+            J_minus_Jtarget_squared += (J_total - J_target) * (J_total - J_target) * weight;
 
             const TargetState lab_target = target_state(X, loop_time, swimmer_data);
             const double lab_position_error_squared =
@@ -2105,28 +2188,87 @@ write_diagnostics(Mesh& mesh,
                 std::max(tracking_2d_shape_velocity_error_max, std::sqrt(shape_velocity_error_squared));
 
             raw_penalty_force(raw_force, x, X, velocity, loop_time, swimmer_data);
-            projected_force = raw_force;
+            used_force = raw_force;
+            refit_force = raw_force;
             if (swimmer_data.prescribed_motion_mode == PrescribedMotionMode::FREE_SWIMMING)
             {
-                projected_force -= swimmer_data.penalty_projection_translation;
-                const VectorValue<double> radius = x - swimmer_data.penalty_projection_center;
-                projected_force(0) += swimmer_data.penalty_projection_rotation * radius(1);
-                projected_force(1) -= swimmer_data.penalty_projection_rotation * radius(0);
+                if (swimmer_data.penalty_projection_used_initialized)
+                {
+                    apply_penalty_projection(used_force,
+                                             x,
+                                             swimmer_data.penalty_projection_used_translation,
+                                             swimmer_data.penalty_projection_used_rotation,
+                                             swimmer_data.penalty_projection_used_center);
+                }
+                else
+                {
+                    apply_penalty_projection(used_force,
+                                             x,
+                                             swimmer_data.penalty_projection_translation,
+                                             swimmer_data.penalty_projection_rotation,
+                                             swimmer_data.penalty_projection_center);
+                }
+                if (swimmer_data.penalty_projection_refit_initialized)
+                {
+                    apply_penalty_projection(refit_force,
+                                             x,
+                                             swimmer_data.penalty_projection_refit_translation,
+                                             swimmer_data.penalty_projection_refit_rotation,
+                                             swimmer_data.penalty_projection_refit_center);
+                }
+                else
+                {
+                    apply_penalty_projection(refit_force,
+                                             x,
+                                             swimmer_data.penalty_projection_translation,
+                                             swimmer_data.penalty_projection_rotation,
+                                             swimmer_data.penalty_projection_center);
+                }
             }
             Fx_raw += raw_force(0) * weight;
             Fy_raw += raw_force(1) * weight;
             Mz_raw += ((x(0) - torque_center(0)) * raw_force(1) -
                        (x(1) - torque_center(1)) * raw_force(0)) *
                       weight;
-            Fx_projected += projected_force(0) * weight;
-            Fy_projected += projected_force(1) * weight;
-            Mz_projected += ((x(0) - torque_center(0)) * projected_force(1) -
-                             (x(1) - torque_center(1)) * projected_force(0)) *
-                            weight;
-            penalty_power += dot2(projected_force, velocity) * weight;
+            const libMesh::Point& used_center =
+                swimmer_data.penalty_projection_used_initialized ?
+                    swimmer_data.penalty_projection_used_center :
+                    swimmer_data.penalty_projection_center;
+            const libMesh::Point& refit_center =
+                swimmer_data.penalty_projection_refit_initialized ?
+                    swimmer_data.penalty_projection_refit_center :
+                    swimmer_data.penalty_projection_center;
+            Fx_used += used_force(0) * weight;
+            Fy_used += used_force(1) * weight;
+            Mz_used += ((x(0) - used_center(0)) * used_force(1) -
+                        (x(1) - used_center(1)) * used_force(0)) *
+                       weight;
+            Fx_refit += refit_force(0) * weight;
+            Fy_refit += refit_force(1) * weight;
+            Mz_refit += ((x(0) - refit_center(0)) * refit_force(1) -
+                         (x(1) - refit_center(1)) * refit_force(0)) *
+                        weight;
+            power_system_used += dot2(used_force, velocity) * weight;
+            power_target_used += dot2(used_force, lab_target.velocity) * weight;
+            power_system_refit += dot2(refit_force, velocity) * weight;
+            power_target_refit += dot2(refit_force, lab_target.velocity) * weight;
+            const double position_error_squared =
+                (lab_target.position(0) - x(0)) * (lab_target.position(0) - x(0)) +
+                (lab_target.position(1) - x(1)) * (lab_target.position(1) - x(1));
+            const double velocity_error_squared =
+                (lab_target.velocity(0) - velocity(0)) *
+                    (lab_target.velocity(0) - velocity(0)) +
+                (lab_target.velocity(1) - velocity(1)) *
+                    (lab_target.velocity(1) - velocity(1));
+            penalty_spring_energy +=
+                0.5 * swimmer_data.penalty_stiffness * position_error_squared * weight;
+            penalty_damping_loss +=
+                swimmer_data.penalty_damping * velocity_error_squared * weight;
             penalty_force_L1 += std::sqrt(dot2(raw_force, raw_force)) * weight;
 
             const double ml_eta_abs = std::abs(reference_eta(X, swimmer_data));
+            const TargetState& target_midline_state =
+                swimmer_data.midline_use_body_frame ? shape_target : lab_target;
             for (std::size_t ml_s = 0; ml_s < ml_station_xi.size(); ++ml_s)
             {
                 const double distance = std::abs(xi - ml_station_xi[ml_s]);
@@ -2137,6 +2279,10 @@ write_diagnostics(Mesh& mesh,
                 ml_section_y[ml_s] += x(1) * sk;
                 ml_section_u[ml_s] += velocity(0) * sk;
                 ml_section_v[ml_s] += velocity(1) * sk;
+                ml_target_section_x[ml_s] += target_midline_state.position(0) * sk;
+                ml_target_section_y[ml_s] += target_midline_state.position(1) * sk;
+                ml_target_section_u[ml_s] += target_midline_state.velocity(0) * sk;
+                ml_target_section_v[ml_s] += target_midline_state.velocity(1) * sk;
                 if (ml_eta_abs < swimmer_data.midline_centerline_half_thickness)
                 {
                     const double ek =
@@ -2146,13 +2292,18 @@ write_diagnostics(Mesh& mesh,
                     ml_centerline_y[ml_s] += x(1) * ek;
                     ml_centerline_u[ml_s] += velocity(0) * ek;
                     ml_centerline_v[ml_s] += velocity(1) * ek;
+                    ml_target_centerline_x[ml_s] += target_midline_state.position(0) * ek;
+                    ml_target_centerline_y[ml_s] += target_midline_state.position(1) * ek;
+                    ml_target_centerline_u[ml_s] += target_midline_state.velocity(0) * ek;
+                    ml_target_centerline_v[ml_s] += target_midline_state.velocity(1) * ek;
                 }
             }
         }
     }
 
-    const std::array<double*, 18> sums = { &volume,
+    const std::array<double*, 28> sums = { &volume,
                                            &current_area,
+                                           &target_area,
                                            &cm_x_integral,
                                            &cm_y_integral,
                                            &u_x_integral,
@@ -2160,18 +2311,29 @@ write_diagnostics(Mesh& mesh,
                                            &Fx_raw,
                                            &Fy_raw,
                                            &Mz_raw,
-                                           &Fx_projected,
-                                           &Fy_projected,
-                                           &Mz_projected,
-                                           &penalty_power,
+                                           &Fx_used,
+                                           &Fy_used,
+                                           &Mz_used,
+                                           &Fx_refit,
+                                           &Fy_refit,
+                                           &Mz_refit,
+                                           &power_system_used,
+                                           &power_target_used,
+                                           &power_system_refit,
+                                           &power_target_refit,
+                                           &penalty_spring_energy,
+                                           &penalty_damping_loss,
                                            &penalty_force_L1,
                                            &tracking_2d_lab_error_squared,
                                            &tracking_2d_lab_velocity_error_squared,
                                            &tracking_2d_shape_error_squared,
-                                           &tracking_2d_shape_velocity_error_squared };
+                                           &tracking_2d_shape_velocity_error_squared,
+                                           &J_minus_Jtarget_squared };
     for (double* value : sums) IBTK_MPI::sumReduction(value, 1);
     IBTK_MPI::minReduction(&J_total_min, 1);
     IBTK_MPI::maxReduction(&J_total_max, 1);
+    IBTK_MPI::minReduction(&J_target_min, 1);
+    IBTK_MPI::maxReduction(&J_target_max, 1);
     IBTK_MPI::maxReduction(&tracking_2d_lab_error_max, 1);
     IBTK_MPI::maxReduction(&tracking_2d_lab_velocity_error_max, 1);
     IBTK_MPI::maxReduction(&tracking_2d_shape_error_max, 1);
@@ -2181,11 +2343,19 @@ write_diagnostics(Mesh& mesh,
     IBTK_MPI::sumReduction(ml_section_y.data(), ml_section_y.size());
     IBTK_MPI::sumReduction(ml_section_u.data(), ml_section_u.size());
     IBTK_MPI::sumReduction(ml_section_v.data(), ml_section_v.size());
+    IBTK_MPI::sumReduction(ml_target_section_x.data(), ml_target_section_x.size());
+    IBTK_MPI::sumReduction(ml_target_section_y.data(), ml_target_section_y.size());
+    IBTK_MPI::sumReduction(ml_target_section_u.data(), ml_target_section_u.size());
+    IBTK_MPI::sumReduction(ml_target_section_v.data(), ml_target_section_v.size());
     IBTK_MPI::sumReduction(ml_centerline_weight.data(), ml_centerline_weight.size());
     IBTK_MPI::sumReduction(ml_centerline_x.data(), ml_centerline_x.size());
     IBTK_MPI::sumReduction(ml_centerline_y.data(), ml_centerline_y.size());
     IBTK_MPI::sumReduction(ml_centerline_u.data(), ml_centerline_u.size());
     IBTK_MPI::sumReduction(ml_centerline_v.data(), ml_centerline_v.size());
+    IBTK_MPI::sumReduction(ml_target_centerline_x.data(), ml_target_centerline_x.size());
+    IBTK_MPI::sumReduction(ml_target_centerline_y.data(), ml_target_centerline_y.size());
+    IBTK_MPI::sumReduction(ml_target_centerline_u.data(), ml_target_centerline_u.size());
+    IBTK_MPI::sumReduction(ml_target_centerline_v.data(), ml_target_centerline_v.size());
 
     std::vector<MidlineSample> ml_samples;
     const int ml_fallback_count = assemble_midline_samples(
@@ -2193,6 +2363,23 @@ write_diagnostics(Mesh& mesh,
         ml_centerline_weight, ml_centerline_x, ml_centerline_y,
         ml_centerline_u, ml_centerline_v,
         ml_station_xi, iteration_num, loop_time, swimmer_data, ml_samples);
+    std::vector<MidlineSample> ml_target_samples;
+    assemble_midline_samples(
+        ml_section_weight,
+        ml_target_section_x,
+        ml_target_section_y,
+        ml_target_section_u,
+        ml_target_section_v,
+        ml_centerline_weight,
+        ml_target_centerline_x,
+        ml_target_centerline_y,
+        ml_target_centerline_u,
+        ml_target_centerline_v,
+        ml_station_xi,
+        iteration_num,
+        loop_time,
+        swimmer_data,
+        ml_target_samples);
 
     if (volume <= 0.0) TBOX_ERROR("Cannot compute diagnostics on a zero-volume mesh.\n");
     libMesh::Point center_of_mass;
@@ -2216,14 +2403,6 @@ write_diagnostics(Mesh& mesh,
 
     std::vector<libMesh::Point> actual_points(ml_num_output);
     std::vector<libMesh::Point> target_points(ml_num_output);
-    std::vector<TargetState> target_samples(ml_station_xi.size());
-    std::vector<TargetState> target_shape_samples(ml_station_xi.size());
-    for (std::size_t station = 0; station < ml_station_xi.size(); ++station)
-    {
-        const libMesh::Point X = reference_centerline_point(ml_station_xi[station], swimmer_data);
-        target_samples[station] = target_state(X, loop_time, swimmer_data);
-        target_shape_samples[station] = target_shape_state(X, loop_time, swimmer_data);
-    }
     MidlineFrame target_frame = make_reference_midline_frame(swimmer_data);
     RigidTargetFrame target_tracking_frame = make_reference_target_frame(swimmer_data);
     if (swimmer_data.midline_use_body_frame)
@@ -2235,7 +2414,7 @@ write_diagnostics(Mesh& mesh,
     {
         const std::size_t index = static_cast<std::size_t>(station);
         actual_points[index] = ml_samples[index].position;
-        target_points[index] = target_samples[index].position;
+        target_points[index] = ml_target_samples[index].position;
     }
 
     double L_target = 0.0;
@@ -2274,7 +2453,7 @@ write_diagnostics(Mesh& mesh,
             const std::array<double, 2> actual_body =
                 body_frame_coordinates(actual_points[index], actual_frame);
             const std::array<double, 2> target_body =
-                body_frame_coordinates(target_shape_samples[index].position, target_frame);
+                body_frame_coordinates(target_points[index], target_frame);
             ex = target_body[0] - actual_body[0];
             ey = target_body[1] - actual_body[1];
 
@@ -2283,8 +2462,8 @@ write_diagnostics(Mesh& mesh,
                                                 ml_samples[index].velocity,
                                                 actual_tracking_frame);
             const std::array<double, 2> target_velocity_body =
-                deformation_velocity_components(target_shape_samples[index].position,
-                                                target_shape_samples[index].velocity,
+                deformation_velocity_components(target_points[index],
+                                                ml_target_samples[index].velocity,
                                                 target_tracking_frame);
             eu = target_velocity_body[0] - actual_velocity_body[0];
             ev = target_velocity_body[1] - actual_velocity_body[1];
@@ -2293,8 +2472,8 @@ write_diagnostics(Mesh& mesh,
         {
             ex = target_points[index](0) - actual_points[index](0);
             ey = target_points[index](1) - actual_points[index](1);
-            eu = target_samples[index].velocity(0) - ml_samples[index].velocity(0);
-            ev = target_samples[index].velocity(1) - ml_samples[index].velocity(1);
+            eu = ml_target_samples[index].velocity(0) - ml_samples[index].velocity(0);
+            ev = ml_target_samples[index].velocity(1) - ml_samples[index].velocity(1);
         }
         const double error_squared = ex * ex + ey * ey;
         tracking_error_squared += error_squared;
@@ -2320,19 +2499,54 @@ write_diagnostics(Mesh& mesh,
     const double L_target_rel_error = (L_target - swimmer_data.geometry.length) / swimmer_data.geometry.length;
     const double L_actual_rel_error = (L_actual - swimmer_data.geometry.length) / swimmer_data.geometry.length;
     const double area_error = (current_area - volume) / volume;
+    const double target_area_rel_error = (target_area - volume) / volume;
+    const double J_minus_Jtarget_rms = std::sqrt(J_minus_Jtarget_squared / volume);
     const double u_parallel = -dot2(center_velocity, actual_frame.tangent);
     const double v_perp = dot2(center_velocity, actual_frame.normal);
     const double projection_epsilon =
         100.0 * std::numeric_limits<double>::epsilon() *
         std::max(1.0, penalty_force_L1);
-    const double force_projection_residual =
-        std::sqrt(Fx_projected * Fx_projected + Fy_projected * Fy_projected) /
+    const double force_projection_residual_used =
+        std::sqrt(Fx_used * Fx_used + Fy_used * Fy_used) /
         (penalty_force_L1 + projection_epsilon);
-    const double torque_projection_residual =
-        std::abs(Mz_projected) /
+    const double torque_projection_residual_used =
+        std::abs(Mz_used) /
         (swimmer_data.geometry.length * penalty_force_L1 + projection_epsilon);
+    const double force_projection_residual_refit =
+        std::sqrt(Fx_refit * Fx_refit + Fy_refit * Fy_refit) /
+        (penalty_force_L1 + projection_epsilon);
+    const double torque_projection_residual_refit =
+        std::abs(Mz_refit) /
+        (swimmer_data.geometry.length * penalty_force_L1 + projection_epsilon);
+    const VectorValue<double>& projection_used_translation =
+        swimmer_data.penalty_projection_used_initialized ?
+            swimmer_data.penalty_projection_used_translation :
+            swimmer_data.penalty_projection_translation;
+    const VectorValue<double>& projection_refit_translation =
+        swimmer_data.penalty_projection_refit_initialized ?
+            swimmer_data.penalty_projection_refit_translation :
+            swimmer_data.penalty_projection_translation;
+    const double projection_used_rotation =
+        swimmer_data.penalty_projection_used_initialized ?
+            swimmer_data.penalty_projection_used_rotation :
+            swimmer_data.penalty_projection_rotation;
+    const double projection_refit_rotation =
+        swimmer_data.penalty_projection_refit_initialized ?
+            swimmer_data.penalty_projection_refit_rotation :
+            swimmer_data.penalty_projection_rotation;
+    const VectorValue<double> projection_translation_delta =
+        projection_refit_translation - projection_used_translation;
+    const double projection_translation_scale =
+        std::sqrt(dot2(projection_refit_translation, projection_refit_translation)) +
+        100.0 * std::numeric_limits<double>::epsilon();
+    const double projection_translation_delta_norm =
+        std::sqrt(dot2(projection_translation_delta, projection_translation_delta)) /
+        projection_translation_scale;
+    const double projection_rotation_delta =
+        std::abs(projection_refit_rotation - projection_used_rotation) /
+        (std::abs(projection_refit_rotation) + 100.0 * std::numeric_limits<double>::epsilon());
 
-    if (IBTK_MPI::getRank() == 0)
+    if (write_output && IBTK_MPI::getRank() == 0)
     {
         tracking_arclength_stream.setf(std::ios::scientific);
         rigid_motion_stream.setf(std::ios::scientific);
@@ -2353,26 +2567,41 @@ write_diagnostics(Mesh& mesh,
             << tracking_velocity_error_max / characteristic_velocity << ","
             << L_target_rel_error << "," << L_actual_rel_error << ","
             << lambda_actual_min << "," << lambda_actual_max << ","
-            << J_total_min << "," << area_error << "\n";
+            << J_total_min << "," << J_total_max << ","
+            << J_target_min << "," << J_target_max << ","
+            << J_minus_Jtarget_rms << ","
+            << area_error << "," << target_area_rel_error << "\n";
         rigid_motion_stream << loop_time << "," << center_of_mass(0) << ","
                             << center_of_mass(1) << "," << center_velocity(0) << ","
                             << center_velocity(1) << "," << body_angle << ","
                             << actual_frame_pitch_rate << "," << u_parallel << ","
                             << v_perp << "\n";
         penalty_projection_stream << loop_time << "," << Fx_raw << "," << Fy_raw << ","
-                                  << Mz_raw << "," << Fx_projected << "," << Fy_projected << ","
-                                  << Mz_projected << "," << penalty_power << ","
-                                  << penalty_force_L1 << "," << force_projection_residual << ","
-                                  << torque_projection_residual << "\n";
+                                  << Mz_raw << ","
+                                  << Fx_used << "," << Fy_used << "," << Mz_used << ","
+                                  << Fx_refit << "," << Fy_refit << "," << Mz_refit << ","
+                                  << power_system_used << "," << power_target_used << ","
+                                  << power_system_refit << "," << power_target_refit << ","
+                                  << penalty_spring_energy << "," << penalty_damping_loss << ","
+                                  << penalty_force_L1 << ","
+                                  << force_projection_residual_used << ","
+                                  << torque_projection_residual_used << ","
+                                  << force_projection_residual_refit << ","
+                                  << torque_projection_residual_refit << ","
+                                  << projection_translation_delta_norm << ","
+                                  << projection_rotation_delta << "\n";
         tracking_arclength_stream.flush();
         rigid_motion_stream.flush();
         penalty_projection_stream.flush();
     }
 
-    write_midline_output(ml_samples, ml_station_xi,
-                         ml_frame_head_index, ml_frame_tangent_index,
-                         ml_num_output, ml_fallback_count,
-                         swimmer_data, iteration_num, loop_time);
+    if (write_output)
+    {
+        write_midline_output(ml_samples, ml_target_samples, ml_station_xi,
+                             ml_num_output, ml_fallback_count,
+                             swimmer_data, iteration_num, loop_time,
+                             actual_frame, target_frame);
+    }
 
     if (!std::isfinite(J_total_min) || !std::isfinite(J_total_max) || J_total_min <= 0.0)
     {
